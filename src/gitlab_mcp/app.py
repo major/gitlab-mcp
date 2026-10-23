@@ -46,7 +46,15 @@ mcp = FastMCP(
         "Get the user's explicit APPROVE before posting notes with post_review_notes. "
         "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "
         "Do not call validate_only again. "
-        "Use update_merge_request for reviewer, assignee, and approval changes."
+        "Use update_merge_request for reviewer, assignee, and approval changes. "
+        # 🔍 Main arguments, so one tool search is enough. Client searches often cut long signatures.
+        "Main arguments: "
+        "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, view=full|headings|finding, "
+        "count_only, cursor); "
+        "post_review_notes(project, iid, head_sha, notes=[{file, line or old_line (neither for a file-level note), "
+        "body or body_path}], add_reviewers, add_assignees, validate_only); "
+        "update_merge_request(project, iid, add_reviewers, remove_reviewers, add_assignees, remove_assignees, "
+        "add_labels, remove_labels, add_blocked_by, remove_blocked_by, approve with sha, rebase)."
     ),
     lifespan=gitlab_lifespan,
 )
