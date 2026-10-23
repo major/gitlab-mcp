@@ -15,3 +15,9 @@ If GitLab has no matching version, or either snapshot is unavailable or incomple
 instead of claiming the diff is unchanged. Files removed from the current merge request diff are included with an empty
 patch and a warning because they have no current comment anchors. When a patch result includes `next_cursor`, pass it
 back with the same `since_sha` and requested paths. Cursors are rejected if those inputs or the latest head change.
+
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
