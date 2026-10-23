@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 from fastmcp import Client
 
-from gitlab_mcp.server import mcp
+from gitlab_mcp import mcp
 
 # One name per line, alphabetical, so a new tool is a one-line change.
 READ_ONLY_TOOLS = {

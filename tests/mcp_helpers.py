@@ -10,7 +10,7 @@ from typing import Any
 from fastmcp import Client, FastMCP
 lazy from mcp.types import CallToolResult
 
-from gitlab_mcp.server import mcp
+from gitlab_mcp import mcp
 
 
 async def call_tool_result(
