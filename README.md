@@ -30,6 +30,10 @@ or note bodies. It counts both states regardless of `state`, and cannot be combi
 The `ids` thread filter is available only with a single `iid`. It is rejected with batch `iids` because one thread ID
 can be ambiguous across merge requests.
 
+`state` takes one value (`open`, `resolved`, `comments`, or `all`) or a list such as `["open", "comments"]` to keep
+several kinds of thread in one call. Duplicates are ignored, `all` in a list keeps every thread, and an empty list is an
+error. A list uses the same scan, cursor, and output budget as a single value.
+
 ## Tools
 
 | Tool | Description |

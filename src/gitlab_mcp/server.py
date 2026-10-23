@@ -199,8 +199,6 @@ THREAD_HEADING_BUDGET = 30000
 THREAD_HEADING_CAP = 160
 # Discussion GIDs start with this. Output IDs are bare SHAs, so the prefix is only stripped from input.
 DISCUSSION_PREFIX = "gid://gitlab/Discussion/"
-# Maps each state filter to the thread status it keeps. "all" keeps every status.
-STATE_STATUS = {"open": "open", "resolved": "resolved", "comments": "comment"}
 
 # Total patch characters that one diff call may return. A single patch is cut to this too.
 DIFF_BUDGET = 40000
@@ -429,7 +427,15 @@ class ThreadIndex(BaseModel):
 
 # "comment" means the discussion cannot be resolved, like a plain MR comment.
 ThreadStatus = Literal["open", "resolved", "comment"]
+ThreadState = Literal["open", "resolved", "comments", "all"]
 ThreadView = Literal["full", "headings", "finding"]
+# Maps each state filter to the thread statuses it keeps. "all" keeps every status.
+STATE_STATUSES: dict[ThreadState, frozenset[ThreadStatus]] = {
+    "open": frozenset({"open"}),
+    "resolved": frozenset({"resolved"}),
+    "comments": frozenset({"comment"}),
+    "all": frozenset({"open", "resolved", "comment"}),
+}
 
 
 class Note(BaseModel):
@@ -1422,6 +1428,17 @@ def _thread_status(discussion: dict[str, Any]) -> ThreadStatus:
     return "resolved" if discussion["resolved"] else "open"
 
 
+def _thread_statuses(state: ThreadState | list[ThreadState]) -> frozenset[ThreadStatus]:
+    """Return the thread statuses a state filter keeps. A list is the union of its states, so duplicates collapse.
+
+    An empty list raises ToolError, because it would otherwise match nothing or everything by accident.
+    """
+    states = [state] if isinstance(state, str) else state
+    if not states:
+        raise ToolError("Pass at least one state.")  # noqa: TRY003
+    return frozenset(status for item in states for status in STATE_STATUSES[item])
+
+
 def _cap_note_body(body: str, max_body_chars: int = NOTE_CAP) -> str:
     """Remove a trailing review finding, then cap the remaining note body."""
     body = _strip_trailing_finding(body)
@@ -1517,7 +1534,7 @@ def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHead
 class _ThreadFilter:
     """The filters of one call. A thread must pass all of them."""
 
-    state: str
+    statuses: frozenset[ThreadStatus]
     ids: list[str] | None
     file: str | None
     author: str | None
@@ -1528,7 +1545,7 @@ class _ThreadFilter:
         if self.ids is not None:
             if thread.id not in self.ids:
                 return False
-        elif self.state != "all" and STATE_STATUS[self.state] != thread.status:
+        elif thread.status not in self.statuses:
             return False
         if self.file is not None and self.file not in (thread.path, thread.old_path):
             return False
@@ -1657,7 +1674,10 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     ctx: Context,
     project: Project,
     iid: Iid | None = None,
-    state: Literal["open", "resolved", "comments", "all"] = "open",
+    state: Annotated[
+        ThreadState | list[ThreadState],
+        Field(description="open (default), resolved, comments, or all. A list combines states, but cannot be empty."),
+    ] = "open",
     ids: Annotated[
         list[str] | None,
         Field(description="Thread IDs from threads.open. Single iid only. Ignores state."),
@@ -1719,10 +1739,13 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - Each batch result includes its own `iid`, `threads`, `next_cursor`, and `not_found_ids`. Batch cursors are not
       accepted: resume a result with a single `iid` call and that result's cursor. Every merge request gets its own
       existing scan and output budget, so batch output can use up to 20 times the single-merge-request budget.
+    - Pass a state list such as `["open", "comments"]` to combine states. Duplicates are ignored, and `all` keeps every
+      status. An empty list is an error, including in ID and count-only modes. Valid states are ignored in those modes.
     """
     if (iid is None) == (iids is None):
         raise ToolError("Pass exactly one of iid or iids.")  # noqa: TRY003
 
+    statuses = _thread_statuses(state)
     if count_only:
         if cursor is not None or ids is not None or file is not None or author is not None:
             raise ToolError("count_only cannot be combined with cursor, ids, file, or author.")  # noqa: TRY003
@@ -1730,7 +1753,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
 
     # An empty list means no IDs were given, so the state filter applies.
     wanted = _bare_ids(ids) if ids else None
-    thread_filter = _ThreadFilter(state=state, ids=wanted, file=file, author=author)
+    thread_filter = _ThreadFilter(statuses=statuses, ids=wanted, file=file, author=author)
     if iid is not None:
         client = get_client(ctx)
         start = _thread_cursor_start(cursor) if cursor else (None, 0)
