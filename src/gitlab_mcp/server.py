@@ -192,6 +192,8 @@ DIFF_PAGE_SIZE = 100
 # Bodies are small enough to bound memory and request size, including file-backed notes.
 REVIEW_NOTE_BODY_CAP = 100000
 DIFF_HUNK_PATTERN = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+DIFF_HUNK_NORMALIZE_PATTERN = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
+INVALID_SINCE_SHA_MESSAGE = "since_sha must be a full 40-character commit SHA."
 
 # A Literal is sent to the agent as an enum, so this type replaces a separate
 # "list states" tool.
@@ -397,7 +399,7 @@ class Thread(ThreadLocation):
 
 
 class ThreadHeading(BaseModel):
-    """A compact thread summary with its root note heading."""
+    """A compact thread summary with its root heading and latest fetched human note."""
 
     id: str
     status: ThreadStatus
@@ -406,6 +408,10 @@ class ThreadHeading(BaseModel):
     old_line: int = Field(default=0, exclude_if=lambda v: not v)
     by: str = Field(default="", exclude_if=lambda v: not v)
     heading: str
+    last_by: str
+    last_at: str  # Date only, YYYY-MM-DD.
+    note_count: int  # Human notes in the fetched page, not necessarily the full thread.
+    notes_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
 
 
 class ThreadList(BaseModel):
@@ -543,10 +549,12 @@ class MergeRequestDiff(BaseModel):
     """A file list or the requested patches."""
 
     head_sha: str = Field(default="", exclude_if=lambda v: not v)
+    since_version_found: bool | None = Field(default=None, exclude_if=lambda value: value is None)
     files: list[FileStat] = Field(default_factory=list, exclude_if=lambda v: not v)
     diffs: list[FileDiff] = Field(default_factory=list, exclude_if=lambda v: not v)
     next_cursor: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the scan finished.
     paths_not_found: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
+    warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
 class MergeRequestDetail(BaseModel):
@@ -1340,9 +1348,17 @@ def _to_thread(discussion: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Th
 
 
 def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHeading:
-    """Convert a thread to a summary based only on its first human note."""
-    root_note = next(note for note in discussion["notes"]["nodes"] if not note["system"])
+    """Convert a thread to a compact summary of its fetched human notes."""
+    notes = discussion["notes"]
+    human_notes = [note for note in notes["nodes"] if not note["system"]]
+    root_note = human_notes[0]
+    # GitLab can return deleted authors as null. The newest timestamp, not list order, determines the last note.
+    last_note = max(
+        human_notes,
+        key=lambda note: datetime.fromisoformat(note["createdAt"].replace("Z", "+00:00").replace("z", "+00:00")),
+    )
     author = root_note["author"]  # A deleted or banned author comes back as null.
+    last_author = last_note["author"]
     return ThreadHeading(
         id=thread.id,
         status=thread.status,
@@ -1351,6 +1367,10 @@ def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHead
         old_line=thread.old_line,
         by=author["username"] if author else "",
         heading=_thread_heading(root_note["body"]),
+        last_by=last_author["username"] if last_author else "",
+        last_at=last_note["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
+        note_count=len(human_notes),
+        notes_truncated=notes["pageInfo"]["hasNextPage"],
     )
 
 
@@ -1456,10 +1476,12 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
       unique positive values. Missing merge requests appear in `missing_iids`.
     - System notes and threads with no human notes are skipped.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
-    - In full view, `notes_truncated` means over 50 notes exist, so the `author` filter can miss a late reply.
+    - `notes_truncated` means the notes page has another page. Heading `note_count`, `last_by`, and `last_at` only
+      cover fetched human notes when this is true, and the `author` filter can miss a late reply.
     - Trailing `review-bot:finding` comments are removed.
-    - `view="headings"` returns only thread details and the root human note's first Markdown heading, or its first
-      nonempty line. Headings are capped at 160 characters. It includes no note bodies or replies.
+    - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
+      the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
+      160 characters. It includes no note bodies or replies.
     - In full view, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits body text. A
       call returns about 30000 body characters. Headings view returns about 30000 serialized characters. Continue
       with `next_cursor` using the same filters, `view`, and `max_body_chars`.
@@ -1762,8 +1784,305 @@ async def _scan_diffs(
     return diffs, _encode_cursor({"page": page, "skip": 0}), matched
 
 
+async def _scan_diff_versions(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read at most MAX_PAGES of merge request diff versions and report whether the scan finished."""
+    versions: list[dict[str, Any]] = []
+    page = 1
+    for _ in range(MAX_PAGES):
+        body, next_page = await client.get_page(
+            f"{_mr_rest_path(project, iid)}/versions",
+            per_page=DIFF_PAGE_SIZE,
+            page=page,
+        )
+        if not isinstance(body, list) or any(not isinstance(version, dict) for version in body):
+            return versions, False
+        versions.extend(body)
+        if next_page is None:
+            return versions, True
+        page = next_page
+    return versions, False
+
+
+def _version_id(version: dict[str, Any]) -> int | None:
+    """Return a usable integer diff version ID, rejecting booleans and other JSON values."""
+    value = version.get("id")
+    return value if type(value) is int and value >= 0 else None
+
+
+async def _get_version_detail(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    version_id: int,
+) -> Any:
+    """Fetch the full file snapshot for one merge request diff version."""
+    return await client.get(f"{_mr_rest_path(project, iid)}/versions/{version_id}")
+
+
+def _validate_version_snapshot(  # noqa: C901, PLR0911 - each check prevents an unsafe comparison.
+    detail: Any,
+    expected_sha: str,
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """Return validated diff entries, or a warning when GitLab did not collect a complete snapshot."""
+    if not isinstance(detail, dict):
+        return None, "GitLab returned an unusable diff version payload. No comparison was made."
+    if detail.get("overflow"):
+        return None, "GitLab marked a diff version as overflowed. No comparison was made."
+    if detail.get("state") != "collected":
+        return None, "A diff version is not fully collected. No comparison was made."
+    if detail.get("head_commit_sha") != expected_sha:
+        return None, "A diff version did not match its listed commit SHA. No comparison was made."
+    files = detail.get("diffs")
+    real_size = detail.get("real_size")
+    # GitLab documents real_size as a string. Capped counts such as "1000+" are not complete sizes.
+    if isinstance(real_size, str) and real_size.isascii() and real_size.isdecimal():
+        real_size = int(real_size)
+    if not isinstance(files, list) or type(real_size) is not int or real_size < 0 or real_size > len(files):
+        return None, "A diff version has an incomplete file list. No comparison was made."
+
+    validated: list[dict[str, Any]] = []
+    for raw in files:
+        if not isinstance(raw, dict):
+            return None, "A diff version contains an unusable file entry. No comparison was made."
+        if raw.get("collapsed") or raw.get("too_large"):
+            return None, "A diff version contains a collapsed or too-large file patch. No comparison was made."
+        if (
+            not isinstance(raw.get("old_path"), str)
+            or not isinstance(raw.get("new_path"), str)
+            or not isinstance(raw.get("diff"), str)
+            or not raw["diff"]
+        ):
+            return None, "A diff version contains an unusable file patch. No comparison was made."
+        file_entry = dict(raw)
+        for flag in ("new_file", "deleted_file", "renamed_file", "generated_file", "collapsed", "too_large"):
+            file_entry[flag] = bool(raw.get(flag, False))
+        validated.append(file_entry)
+    return validated, ""
+
+
+def _normalized_diff_signature(diff: str) -> str:
+    """Ignore only numeric hunk ranges when comparing patches from different MR-relative bases."""
+    return DIFF_HUNK_NORMALIZE_PATTERN.sub("@@ -0 +0 @@", diff)
+
+
+def _snapshot_signature(raw: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the rename origin, status, and patch signature for one destination path."""
+    return (
+        raw["old_path"],
+        raw["new_file"],
+        raw["deleted_file"],
+        raw["renamed_file"],
+        raw["generated_file"],
+        raw["collapsed"],
+        raw["too_large"],
+        _normalized_diff_signature(raw["diff"]),
+    )
+
+
+def _changed_snapshot_entries(
+    previous: list[dict[str, Any]],
+    latest: list[dict[str, Any]],
+) -> tuple[list[tuple[dict[str, Any], bool]], bool]:
+    """Select changed latest files and old-only reverted files, keyed by destination path."""
+    previous_by_path = {item["new_path"]: item for item in previous}
+    latest_by_path = {item["new_path"]: item for item in latest}
+    selected = [
+        (item, False)
+        for key, item in latest_by_path.items()
+        if key not in previous_by_path or _snapshot_signature(previous_by_path[key]) != _snapshot_signature(item)
+    ]
+    reverted = [(item, True) for key, item in previous_by_path.items() if key not in latest_by_path]
+    return selected + reverted, bool(reverted)
+
+
+def _snapshot_file_stat(raw: dict[str, Any], *, reverted: bool = False) -> FileStat:
+    """Build file-list counts and latest-snapshot anchors from one selected diff entry."""
+    patch = "" if reverted else raw["diff"]
+    additions = 0
+    deletions = 0
+    in_hunk = False
+    for line in patch.splitlines():
+        if DIFF_HUNK_PATTERN.match(line):
+            in_hunk = True
+        elif in_hunk:
+            # File headers precede hunks; +++ and --- inside a hunk are real content changes.
+            additions += line.startswith("+")
+            deletions += line.startswith("-")
+    return FileStat(
+        path=raw["new_path"],
+        additions=additions,
+        deletions=deletions,
+        new_line_ranges=_new_line_ranges(patch),
+        ranges_complete=not reverted,
+    )
+
+
+def _since_cursor_start(cursor: str, since_sha: str, wanted: list[str]) -> dict[str, Any]:
+    """Validate the since cursor inputs before requests and return its decoded payload."""
+    payload = _decode_cursor(cursor, "get_merge_request_diff")
+    if (
+        payload.get("mode") != "since"
+        or payload.get("since_sha") != since_sha
+        or payload.get("paths") != wanted
+        or not _is_int_at_least(payload.get("index"), 0)
+        or not _is_int_at_least(payload.get("version_id"), 0)
+        or not _full_sha(payload.get("head_sha"))
+    ):
+        raise InvalidCursorError("get_merge_request_diff")
+    return payload
+
+
+def _since_cursor(index: int, since_sha: str, wanted: list[str], head_sha: str, version_id: int) -> str:
+    """Encode a bounded-scan cursor tied to its inputs and the current diff version."""
+    return _encode_cursor(
+        {
+            "mode": "since",
+            "index": index,
+            "since_sha": since_sha,
+            "paths": wanted,
+            "head_sha": head_sha,
+            "version_id": version_id,
+        },
+    )
+
+
+def _scan_since_entries(  # noqa: PLR0913, PLR0917 - all values bind the resumable cursor.
+    entries: list[tuple[dict[str, Any], bool]],
+    wanted: set[str],
+    start: int,
+    since_sha: str,
+    wanted_order: list[str],
+    head_sha: str,
+    version_id: int,
+) -> tuple[list[FileDiff], str, set[str]]:
+    """Return one budgeted snapshot page and a cursor index for any remaining entries."""
+    diffs: list[FileDiff] = []
+    matched: set[str] = set()
+    total = 0
+    stop = min(len(entries), start + MAX_PAGES * DIFF_PAGE_SIZE)
+    index = start
+    while index < stop:
+        raw, reverted = entries[index]
+        index += 1
+        hits = _requested_hits(raw, wanted)
+        if not hits:
+            continue
+        file_entry = {**raw, "diff": ""} if reverted else raw
+        diff = _to_file_diff(file_entry)
+        if diffs and total + len(diff.diff) > DIFF_BUDGET:
+            index -= 1
+            return diffs, _since_cursor(index, since_sha, wanted_order, head_sha, version_id), matched
+        diffs.append(diff)
+        total += len(diff.diff)
+        matched |= hits
+    if index < len(entries):
+        return diffs, _since_cursor(index, since_sha, wanted_order, head_sha, version_id), matched
+    return diffs, "", matched
+
+
+async def _get_since_diff(  # noqa: C901, PLR0911, PLR0913, PLR0917 - keep comparison flow in one place.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    since_sha: str,
+    wanted: list[str],
+    cursor: str | None,
+) -> MergeRequestDiff:
+    """Compare two complete diff-version snapshots and return changed MR-relative files."""
+    if not _full_sha(since_sha):
+        raise ToolError(INVALID_SINCE_SHA_MESSAGE)
+    cursor_payload = _since_cursor_start(cursor, since_sha, wanted) if cursor is not None else None
+    if cursor is not None and not wanted:
+        raise InvalidCursorError("get_merge_request_diff")
+
+    versions, complete = await _scan_diff_versions(client, project, iid)
+    if not complete:
+        return MergeRequestDiff(
+            since_version_found=None,
+            warning=f"Diff version scan stopped after {MAX_PAGES} pages or returned an unusable page.",
+        )
+    if any(_version_id(version) is None or not _full_sha(version.get("head_commit_sha")) for version in versions):
+        return MergeRequestDiff(
+            since_version_found=None,
+            warning="GitLab returned diff versions without usable IDs or commit SHAs.",
+        )
+    latest_version = max(versions, key=lambda version: version["id"], default=None)
+    if latest_version is None:
+        return MergeRequestDiff(
+            since_version_found=False,
+            warning="GitLab returned no diff versions, so the requested commit could not be compared.",
+        )
+
+    latest_id = latest_version["id"]
+    latest_sha = latest_version["head_commit_sha"]
+    if cursor_payload is not None and (
+        cursor_payload["head_sha"] != latest_sha or cursor_payload["version_id"] != latest_id
+    ):
+        raise InvalidCursorError("get_merge_request_diff")
+
+    matching_versions = [version for version in versions if version["head_commit_sha"] == since_sha]
+    if not matching_versions:
+        return MergeRequestDiff(
+            head_sha=latest_sha,
+            since_version_found=False,
+            warning=f"No diff version has head commit {since_sha}; no full diff was returned.",
+        )
+    previous_version = max(matching_versions, key=lambda version: version["id"])
+    previous_id = previous_version["id"]
+
+    previous_detail = await _get_version_detail(client, project, iid, previous_id)
+    if previous_id == latest_id:
+        latest_detail = previous_detail
+    else:
+        latest_detail = await _get_version_detail(client, project, iid, latest_id)
+    previous_files, warning = _validate_version_snapshot(previous_detail, since_sha)
+    if previous_files is None:
+        return MergeRequestDiff(head_sha=latest_sha, since_version_found=True, warning=warning)
+    latest_files, warning = _validate_version_snapshot(latest_detail, latest_sha)
+    if latest_files is None:
+        return MergeRequestDiff(head_sha=latest_sha, since_version_found=True, warning=warning)
+
+    entries, has_reverted = _changed_snapshot_entries(previous_files, latest_files)
+    warning = (
+        "Files absent from the current MR diff are returned with empty patches and no valid anchors."
+        if has_reverted
+        else ""
+    )
+    if not wanted:
+        return MergeRequestDiff(
+            head_sha=latest_sha,
+            since_version_found=True,
+            files=[_snapshot_file_stat(raw, reverted=reverted) for raw, reverted in entries],
+            warning=warning,
+        )
+
+    start = cursor_payload["index"] if cursor_payload is not None else 0
+    diffs, next_cursor, matched = _scan_since_entries(
+        entries,
+        set(wanted),
+        start,
+        since_sha,
+        wanted,
+        latest_sha,
+        latest_id,
+    )
+    not_found = [path for path in wanted if path not in matched] if cursor is None and not next_cursor else []
+    return MergeRequestDiff(
+        head_sha=latest_sha,
+        since_version_found=True,
+        diffs=diffs,
+        next_cursor=next_cursor,
+        paths_not_found=not_found,
+        warning=warning,
+    )
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
-async def get_merge_request_diff(
+async def get_merge_request_diff(  # noqa: PLR0913, PLR0917 - these are the public MCP tool arguments.
     ctx: Context,
     project: Project,
     iid: Iid,
@@ -1772,6 +2091,10 @@ async def get_merge_request_diff(
         Field(description="Paths to read patches for, old or new. Omit for the file list."),
     ] = None,
     cursor: Annotated[str | None, Field(description="next_cursor from an earlier call, with the same paths.")] = None,
+    since_sha: Annotated[
+        str | None,
+        Field(description="Full commit SHA of an earlier merge request diff version to compare against."),
+    ] = None,
 ) -> MergeRequestDiff:
     """Review inline comment anchors and patches.
 
@@ -1786,9 +2109,18 @@ async def get_merge_request_diff(
     - `collapsed`: hidden as big, the web UI may show it. `too_large`: never shown. `generated`: usually skippable.
     - Up to 40000 patch characters and 5 pages per call. Cut patches have `truncated`. Next: `next_cursor`, same paths.
     - `paths_not_found` is only set after a full scan from the first page. GitLab limits can still hide a file.
+    - With `since_sha`, compare complete GitLab diff-version snapshots. Patches still use the latest MR target-side
+      base, not a commit-to-commit diff. Numeric hunk ranges are normalized only for deciding whether a patch changed.
+      `since_version_found` is a boolean when known; it is omitted with a warning if the version scan is incomplete.
+      Incomplete snapshots return a warning instead of claiming no changes. Reverted files use empty patches and no
+      valid anchors. Files are identified by destination path; current entries match only their latest old/new paths,
+      not historical rename origins. Resume with the same `since_sha` and paths; cursors are rejected when the latest
+      head changes.
     """
     client = get_client(ctx)
     wanted = list(dict.fromkeys(paths)) if paths else []
+    if since_sha is not None:
+        return await _get_since_diff(client, project, iid, since_sha, wanted, cursor)
     # Decode the cursor before any request, so a bad one fails fast. The file list ignores it.
     start = _diff_cursor_start(cursor) if wanted and cursor is not None else (1, 0)
     node = await _fetch_merge_request(client, DIFF_FILES_QUERY, project, iid)

@@ -393,8 +393,11 @@ async def test_headings_view_uses_root_markdown_heading_and_location(gitlab_env)
         author="root-author",
         position={"oldPath": "src/parser.py", "newPath": "src/parser.py", "oldLine": 18, "newLine": None},
     )
-    reply = make_note("## Reply heading\nReply body", author="reply-author")
-    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", root, reply))))
+    reply = make_note("## Reply heading\nReply body", author="reply-author", created_at="2026-10-22T09:30:00Z")
+    system_note = make_note("updated the title", system=True, author="bot", created_at="2026-10-23T09:30:00Z")
+    respx.post(GRAPHQL).mock(
+        return_value=respond(page(make_discussion("t1", root, reply, system_note, notes_have_next=True))),
+    )
 
     # Act
     data = await call_tool(view="headings")
@@ -408,8 +411,42 @@ async def test_headings_view_uses_root_markdown_heading_and_location(gitlab_env)
             "old_line": 18,
             "by": "root-author",
             "heading": "Replace parser",
+            "last_by": "reply-author",
+            "last_at": "2026-10-22",
+            "note_count": 2,
+            "notes_truncated": True,
         },
     ]
+
+
+@respx.mock
+async def test_headings_view_uses_newest_human_note_with_deleted_author(gitlab_env):
+    """A deleted latest author is empty, while trailing system notes are not counted as the latest note."""
+    # Arrange
+    root = make_note("## Root", author="root", created_at="2026-10-20T12:00:00Z")
+    newest = make_note("Reply", author=None, created_at="2026-10-22T12:00:00Z")
+    older_reply = make_note("Older reply", author="reply", created_at="2026-10-21T12:00:00Z")
+    system_note = make_note("assigned", system=True, author="bot", created_at="2026-10-23T12:00:00Z")
+    respx.post(GRAPHQL).mock(
+        return_value=respond(
+            page(make_discussion("t1", root, newest, older_reply, system_note, notes_have_next=True)),
+        ),
+    )
+
+    # Act
+    data = await call_tool(view="headings")
+
+    # Assert
+    assert data["threads"][0] == {
+        "id": "t1",
+        "status": "open",
+        "by": "root",
+        "heading": "Root",
+        "last_by": "",
+        "last_at": "2026-10-22",
+        "note_count": 3,
+        "notes_truncated": True,
+    }
 
 
 @pytest.mark.parametrize(
