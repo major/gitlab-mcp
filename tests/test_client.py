@@ -1,17 +1,25 @@
-"""Tests for the shared GitLab client: writes, error details, and GraphQL mutations 🧪.
+"""Tests for the shared GitLab client: writes, error details, GraphQL mutations, and trace prefixes 🧪.
 
 No MCP tool uses these methods yet, so the tests call the client directly.
 The HTTP layer is still mocked with respx, so no real request leaves the test.
 """
 
+import itertools
 import json
+lazy from collections.abc import AsyncIterator, Iterable
 
 import httpx
 import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError, GitLabGraphQLError
+from gitlab_mcp.client import (
+    GitLabAPIError,
+    GitLabClient,
+    GitLabConnectionError,
+    GitLabGraphQLError,
+    GitLabRedirectError,
+)
 from gitlab_mcp.config import Settings
 
 API = "https://gitlab.example.com/api/v4"
@@ -19,6 +27,8 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 NOTES_PATH = "/projects/group%2Fproject/merge_requests/2187/notes"
 NOTES_URL = f"{API}/projects/group%2Fproject/merge_requests/2187/notes"
 DETAIL_CAP = 300
+TRACE_PATH = "/projects/group%2Fproject/jobs/42/trace"
+TRACE_URL = f"{API}/projects/group%2Fproject/jobs/42/trace"
 
 
 @pytest.fixture
@@ -260,3 +270,206 @@ def test_api_error_defaults_to_no_detail():
     assert isinstance(error, ToolError)
     assert error.detail == ""
     assert str(error) == "GitLab returned HTTP 404 for /x. Not found, or the token cannot see it."
+
+
+class SpyStream(httpx.AsyncByteStream):
+    """A fake response body. It yields `chunks`, then raises `error` if one is set, and counts pulls and closes."""
+
+    def __init__(self, chunks: Iterable[bytes], error: Exception | None = None) -> None:
+        """Keep the chunks to yield and the error to raise once they run out."""
+        self.chunks = iter(chunks)
+        self.error = error
+        self.pulled = 0
+        self.closed = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        """Yield each chunk and count it, then raise the error if there is one."""
+        for chunk in self.chunks:
+            self.pulled += 1
+            yield chunk
+        if self.error:
+            raise self.error
+
+    async def aclose(self) -> None:
+        """Count the close, so tests can prove the stream was always released."""
+        self.closed += 1
+
+
+@pytest.mark.parametrize(
+    ("chunks", "max_bytes", "expected"),
+    [
+        pytest.param([b"0123456789"], 4, (b"0123", True), id="extra-byte-means-truncated"),
+        pytest.param([b"0123"], 4, (b"0123", False), id="exactly-the-limit-is-not-truncated"),
+        pytest.param([b"01"], 4, (b"01", False), id="shorter-than-the-limit"),
+        pytest.param([], 4, (b"", False), id="empty-body"),
+        pytest.param([b"he", b"llo", b" world"], 5, (b"hello", True), id="small-chunks-are-joined"),
+    ],
+)
+@respx.mock
+async def test_trace_prefix_keeps_the_first_bytes_and_flags_truncation(client, chunks, max_bytes, expected):
+    """The prefix has at most `max_bytes` bytes, and `truncated` is True only when there is more."""
+    # Arrange
+    stream = SpyStream(chunks)
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=stream))
+
+    # Act
+    result = await client.get_trace_prefix(TRACE_PATH, max_bytes=max_bytes)
+
+    # Assert
+    assert result == expected
+    assert stream.closed == 1
+
+
+@respx.mock
+async def test_trace_prefix_stops_reading_a_huge_body_early(client):
+    """A body that never ends is cut off after the first piece, so the rest is never read."""
+    # Arrange
+    stream = SpyStream(itertools.repeat(b"x" * 100_000))
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=stream))
+
+    # Act
+    result = await client.get_trace_prefix(TRACE_PATH, max_bytes=10)
+
+    # Assert
+    assert result == (b"x" * 10, True)
+    assert stream.pulled == 1
+    assert stream.closed == 1
+
+
+@respx.mock
+async def test_trace_prefix_keeps_utf8_bytes_unchanged_even_mid_character(client):
+    """The prefix is raw bytes, so a cut in the middle of a UTF-8 character is kept as it is."""
+    # Arrange
+    body = "caf\u00e9 \u2713".encode()  # The "é" is two bytes, so byte 4 is half of it.
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=SpyStream([body])))
+
+    # Act
+    result = await client.get_trace_prefix(TRACE_PATH, max_bytes=4)
+
+    # Assert
+    assert result == (body[:4], True)
+    assert result[0] == b"caf\xc3"
+
+
+@respx.mock
+async def test_trace_prefix_asks_for_plain_text_with_the_token(client):
+    """The request asks for `text/plain` and still sends the private token."""
+    # Arrange
+    route = respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=SpyStream([b"log"])))
+
+    # Act
+    await client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+
+    # Assert
+    sent = route.calls.last.request
+    assert sent.headers["Accept"] == "text/plain"
+    assert sent.headers["PRIVATE-TOKEN"] == "glpat-test"
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "hint"),
+    [
+        (403, {"message": "403 Forbidden"}, "The token does not have the scope or permission for this request."),
+        (404, {"message": "404 Not Found"}, "Not found, or the token cannot see it."),
+    ],
+    ids=["forbidden", "not-found"],
+)
+@respx.mock
+async def test_trace_prefix_error_status_raises_with_detail_and_hint(client, status, body, hint):
+    """A 403 or 404 raises the usual API error, with GitLab's detail and a friendly hint."""
+    # Arrange
+    stream = SpyStream([json.dumps(body).encode()])
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(status, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(GitLabAPIError) as info:
+        await client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+    assert str(info.value) == f"GitLab returned HTTP {status} for {TRACE_PATH}: {body['message']}. {hint}"
+    assert stream.closed == 1
+
+
+@respx.mock
+async def test_trace_prefix_error_body_is_capped_and_not_leaked(client):
+    """A huge HTML error page is read only up to the cap, and its markup stays out of the error."""
+    # Arrange
+    stream = SpyStream(itertools.repeat(b"<html>" + b"x" * 100_000))
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(500, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(GitLabAPIError) as info:
+        await client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+    assert str(info.value) == f"GitLab returned HTTP 500 for {TRACE_PATH}."
+    assert stream.pulled == 1
+    assert stream.closed == 1
+
+
+async def test_trace_prefix_does_not_follow_redirects(client):
+    """A redirect is an error, and the new location is never requested, so the token stays home."""
+    # Arrange
+    # The explicit router lets the "elsewhere" route stay uncalled without failing the test.
+    with respx.mock(assert_all_called=False) as router:
+        router.get(TRACE_URL).mock(
+            return_value=httpx.Response(302, headers={"Location": "https://attacker.example.net/trace"}),
+        )
+        elsewhere = router.get("https://attacker.example.net/trace").mock(
+            return_value=httpx.Response(200, text="secret"),
+        )
+
+        # Act / Assert
+        with pytest.raises(GitLabRedirectError, match="redirect"):
+            await client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+        assert not elsewhere.called
+
+
+@respx.mock
+async def test_trace_prefix_reports_a_connection_error_on_open(client):
+    """An unreachable instance gives the same connection error as the other methods."""
+    # Arrange
+    respx.get(TRACE_URL).mock(side_effect=httpx.ConnectError("boom"))
+
+    # Act / Assert
+    with pytest.raises(GitLabConnectionError, match=r"Could not reach https://gitlab\.example\.com: boom"):
+        await client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        pytest.param(httpx.ReadError("reset"), "Could not reach https://gitlab.example.com: reset", id="read-error"),
+        pytest.param(
+            httpx.ReadTimeout("slow"),
+            "Could not reach https://gitlab.example.com: slow",
+            id="httpx-read-timeout",
+        ),
+        pytest.param(
+            TimeoutError(),
+            "Could not reach https://gitlab.example.com: timed out after 30.0 seconds",
+            id="deadline-timeout",
+        ),
+    ],
+)
+@respx.mock
+async def test_trace_prefix_failure_while_reading_is_a_connection_error_and_closes(client, error, expected_message):
+    """A network failure or timeout in the middle of the body becomes a connection error, and the stream closes."""
+    # Arrange
+    stream = SpyStream([b"abc"], error=error)
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(GitLabConnectionError) as info:
+        await client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+    assert str(info.value) == expected_message
+    assert stream.closed == 1
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+@respx.mock
+async def test_trace_prefix_rejects_a_limit_that_is_not_positive(client, max_bytes):
+    """A zero or negative limit is a programming error, and no request is sent."""
+    # Arrange
+    route = respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=SpyStream([b"log"])))
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="max_bytes must be positive"):
+        await client.get_trace_prefix(TRACE_PATH, max_bytes=max_bytes)
+    assert not route.called

@@ -1,5 +1,7 @@
 """Thin async client for the GitLab REST API 🦊."""
 
+import asyncio
+import json
 from typing import Any, Literal
 
 import httpx
@@ -21,6 +23,15 @@ _STATUS_HINTS = {
 
 # GitLab error messages can be long. Only this much goes to the agent.
 _DETAIL_CAP = 300
+
+# Error bodies are small JSON objects. Anything bigger is not read in full.
+_ERROR_BODY_CAP = 1024
+
+# Size of each piece read from a streamed body. Small enough to stop early on big traces.
+_STREAM_CHUNK_SIZE = 4096
+
+# Statuses that are redirects. The trace read never follows them.
+_REDIRECT_STATUSES = range(300, 400)
 
 # Methods that send a body or change data. GET goes through `get` and `get_page`.
 WriteMethod = Literal["POST", "PUT", "DELETE"]
@@ -48,13 +59,37 @@ def _error_detail(response: httpx.Response) -> str:
     JSON, or has neither key, gives no detail. Trailing dots are removed so the
     error message does not end with two.
     """
+    return _detail_from_bytes(response.content)
+
+
+def _detail_from_bytes(raw: bytes) -> str:
+    """Parse GitLab's reason from raw error body bytes, using the rules in `_error_detail`.
+
+    Works on a body that was only partly read, because a cut-off body is not
+    valid JSON and so gives no detail instead of a half message.
+    """
     try:
-        body = response.json()
-    except ValueError:  # Not JSON, for example an HTML error page from a proxy.
+        body = json.loads(raw)
+    except ValueError:  # Not JSON, for example an HTML error page, or a body cut by the read cap.
         return ""
     if not isinstance(body, dict):
         return ""
     return _as_text(body.get("message") or body.get("error"))[:_DETAIL_CAP].strip().rstrip(". ")
+
+
+async def _read_capped(response: httpx.Response, limit: int) -> bytes:
+    """Read decoded body bytes until `limit + 1` are collected or the body ends.
+
+    The extra byte lets the caller tell "exactly `limit`" from "more than `limit`".
+    Chunks are cut to fit, so a huge chunk never pushes the result past `limit + 1`.
+    Call it inside the stream context, because the body is only readable there.
+    """
+    collected = bytearray()
+    async for chunk in response.aiter_bytes(chunk_size=_STREAM_CHUNK_SIZE):
+        collected += chunk[: limit + 1 - len(collected)]
+        if len(collected) > limit:
+            break  # Enough to prove truncation. The rest of the body is not read.
+    return bytes(collected)
 
 
 class GitLabConnectionError(ToolError):
@@ -77,6 +112,17 @@ class GitLabAPIError(ToolError):
             message += f": {detail}"
         hint = _STATUS_HINTS.get(status)
         super().__init__(f"{message}. {hint}" if hint else f"{message}.")
+
+
+class GitLabRedirectError(ToolError):
+    """GitLab answered with a redirect, which the client does not follow."""
+
+    def __init__(self, path: str, status: int) -> None:
+        """Say that redirects are refused, so the token is never sent to another host."""
+        super().__init__(
+            f"GitLab answered {path} with HTTP {status}, a redirect. "
+            "Redirects are not followed, so the token is not sent to another host."
+        )
 
 
 class GitLabGraphQLError(ToolError):
@@ -151,6 +197,53 @@ class GitLabClient:
         response = await self._send("GET", path, params=params)
         next_page = response.headers.get("X-Next-Page")  # Empty string on the last page.
         return response.json(), int(next_page) if next_page else None
+
+    async def get_trace_prefix(self, path: str, *, max_bytes: int) -> tuple[bytes, bool]:
+        """Stream a plain-text body from `path` and keep only its first `max_bytes` bytes 🪵.
+
+        Job traces can be huge, so the body is read in small pieces and the read
+        stops as soon as one byte past `max_bytes` shows up. The rest is never read.
+
+        Returns `(prefix, truncated)`. `prefix` is the first `max_bytes` bytes,
+        unchanged and not decoded, so a cut can split a UTF-8 character.
+        `truncated` is True only when the body is longer than `max_bytes`.
+
+        Redirects are not followed. GitLab's `PRIVATE-TOKEN` header would go to the
+        new host, so a redirect is an error.
+
+        Raises:
+            ValueError: When `max_bytes` is not positive.
+            GitLabConnectionError: When the instance cannot be reached, or the read takes longer than the timeout.
+            GitLabAPIError: When GitLab returns an error status.
+            GitLabRedirectError: When GitLab answers with a redirect.
+        """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")  # noqa: TRY003 - explain invalid input.
+        try:
+            # The overall deadline covers the whole stream. httpx's own timeouts cover each network step.
+            async with asyncio.timeout(self.settings.timeout):
+                return await self._read_trace_prefix(path, max_bytes)
+        except httpx.HTTPError as exc:
+            raise GitLabConnectionError(self.settings.url, exc) from exc
+        except TimeoutError as exc:
+            cause = TimeoutError(f"timed out after {self.settings.timeout} seconds")
+            raise GitLabConnectionError(self.settings.url, cause) from exc
+
+    async def _read_trace_prefix(self, path: str, max_bytes: int) -> tuple[bytes, bool]:
+        """Open the streamed GET, check the status, and read the prefix. The stream closes on every exit."""
+        async with self._http.stream(
+            "GET",
+            path,
+            headers={"Accept": "text/plain"},
+            follow_redirects=False,
+        ) as response:
+            if response.status_code in _REDIRECT_STATUSES:
+                raise GitLabRedirectError(path, response.status_code)
+            if response.is_error:
+                raw = await _read_capped(response, _ERROR_BODY_CAP)
+                raise GitLabAPIError(response.status_code, path, _detail_from_bytes(raw))
+            data = await _read_capped(response, max_bytes)
+        return data[:max_bytes], len(data) > max_bytes
 
     async def request(
         self,
