@@ -6,7 +6,8 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_PAGES, mcp
+from gitlab_mcp.common import MAX_PAGES
+from gitlab_mcp.server import mcp
 from mcp_helpers import call_tool as call_mcp_tool
 
 API = "https://gitlab.example.com/api/v4"
