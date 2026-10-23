@@ -2,18 +2,20 @@
 
 from typing import TYPE_CHECKING
 
-from gitlab_mcp import main
+from gitlab_mcp import main, mcp
 
 if TYPE_CHECKING:
     import pytest
 
 
-def test_main_prints_greeting(capsys: pytest.CaptureFixture[str]) -> None:
-    """The entry point writes a greeting to stdout."""
-    # Arrange: nothing to set up.
+def test_main_runs_the_mcp_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The console script starts the FastMCP server."""
+    # Arrange
+    calls: list[bool] = []
+    monkeypatch.setattr(type(mcp), "run", lambda _self: calls.append(True))
 
     # Act
     main()
 
     # Assert
-    assert capsys.readouterr().out == "Hello from gitlab-mcp!\n"
+    assert calls == [True]

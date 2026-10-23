@@ -1,8 +1,8 @@
-"""GitLab MCP server."""
+"""GitLab MCP server for fast developer workflows 🦊."""
 
-import sys
+from gitlab_mcp.server import mcp
 
 
 def main() -> None:
-    """Run the gitlab-mcp command line entry point."""
-    sys.stdout.write("Hello from gitlab-mcp!\n")
+    """Run the MCP server over stdio."""
+    mcp.run()
