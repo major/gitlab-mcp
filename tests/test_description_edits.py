@@ -1,17 +1,18 @@
 """Behavioral tests for exact-text description edits through an in-memory MCP client ✏️."""
 
 import json
-from typing import Any, Literal
+from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
 import respx
-from fastmcp import Client, FastMCP
+from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.client import GitLabClient
-from gitlab_mcp.config import Settings
-from gitlab_mcp.description_edits import DIFF_CAP, edit_merge_request_description, edit_work_item_description
+from gitlab_mcp import description_edits as description_edits_module
+from gitlab_mcp.description_edits import DIFF_CAP
+from gitlab_mcp.server import mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -19,34 +20,7 @@ IID = 7
 MR = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/7"
 WORK_ITEM_ID = "gid://gitlab/WorkItem/123"
 UPDATED = {"data": {"workItemUpdate": {"errors": [], "workItem": {"id": WORK_ITEM_ID}}}}
-TEST_APP = FastMCP("description-edit-tests")
 RESULT_BUDGET = 1000  # Characters. A big description must not inflate the result.
-
-
-@TEST_APP.tool
-async def edit_mr_description(project: str, iid: int, old_text: str, new_text: str) -> Any:
-    """Expose the merge request edit helper through an in-memory test server."""
-    client = GitLabClient(Settings.from_env())
-    try:
-        return await edit_merge_request_description(client, project, iid, old_text, new_text)
-    finally:
-        await client.aclose()
-
-
-@TEST_APP.tool
-async def edit_work_item(
-    project: str,
-    iid: int,
-    old_text: str,
-    new_text: str,
-    scope: Literal["project", "group"] = "project",
-) -> Any:
-    """Expose the work-item edit helper through an in-memory test server."""
-    client = GitLabClient(Settings.from_env())
-    try:
-        return await edit_work_item_description(client, project, iid, old_text, new_text, scope)
-    finally:
-        await client.aclose()
 
 
 @pytest.fixture
@@ -58,7 +32,7 @@ def router(gitlab_env):
 
 async def call_tool(name: str, **arguments: Any) -> dict[str, Any]:
     """Call one test tool through the MCP protocol and return its structured content."""
-    async with Client(TEST_APP) as client:
+    async with Client(mcp) as client:
         result = await client.call_tool(name, arguments)
     return result.structured_content
 
@@ -188,7 +162,9 @@ async def test_mr_edit_writes_full_description_and_returns_changed_lines(  # noq
     put = serve_merge_request(router, description)
 
     # Act
-    result = await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text=old_text, new_text=new_text)
+    result = await call_tool(
+        "edit_merge_request_description", project=PROJECT, iid=IID, old_text=old_text, new_text=new_text
+    )
 
     # Assert
     assert result["status"] == "applied"
@@ -212,7 +188,9 @@ async def test_mr_edit_with_bad_match_raises_and_writes_nothing(router, descript
 
     # Act / Assert
     with pytest.raises(ToolError, match=message) as error:
-        await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text=old_text, new_text=new_text)
+        await call_tool(
+            "edit_merge_request_description", project=PROJECT, iid=IID, old_text=old_text, new_text=new_text
+        )
     assert description not in str(error.value)
     assert put.call_count == 0
 
@@ -231,7 +209,9 @@ async def test_invalid_arguments_fail_before_any_request(router, description, ol
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text=old_text, new_text=new_text)
+        await call_tool(
+            "edit_merge_request_description", project=PROJECT, iid=IID, old_text=old_text, new_text=new_text
+        )
     assert len(router.calls) == 0
 
 
@@ -242,7 +222,7 @@ async def test_null_mr_description_is_treated_as_empty(router):
 
     # Act / Assert
     with pytest.raises(ToolError, match="not found"):
-        await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text="anything", new_text="x")
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, old_text="anything", new_text="x")
     assert put.call_count == 0
 
 
@@ -253,12 +233,59 @@ async def test_long_changed_lines_are_capped_and_flagged(router):
     serve_merge_request(router, f"start {old_text} end")
 
     # Act
-    result = await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text=old_text, new_text="B" * 5000)
+    result = await call_tool(
+        "edit_merge_request_description", project=PROJECT, iid=IID, old_text=old_text, new_text="B" * 5000
+    )
 
     # Assert
     assert len(result["changed_lines"]) == DIFF_CAP
     assert result["changed_lines"].startswith("@@ -1 +1 @@\n-start AAA")
     assert result["truncated"] is True
+
+
+async def test_mr_edit_can_skip_changed_lines(router, monkeypatch):
+    """An applied merge request edit can omit its diff without changing the write or warning."""
+    # Arrange
+    put = serve_merge_request(router, "Plan: ship")
+    changed_lines = Mock(side_effect=AssertionError("return_diff=false must not compute changed lines"))
+    monkeypatch.setattr(description_edits_module, "_changed_lines", changed_lines)
+
+    # Act
+    result = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="ship",
+        new_text="launch",
+        return_diff=False,
+    )
+
+    # Assert
+    assert result["status"] == "applied"
+    assert "changed_lines" not in result
+    assert result["truncated"] is False
+    assert "compare-and-swap" in result["warning"]
+    assert json.loads(put.calls.last.request.content) == {"description": "Plan: launch"}
+    changed_lines.assert_not_called()
+
+
+async def test_mr_edit_without_return_diff_keeps_existing_default(router):
+    """The public merge request tool returns its changed lines by default."""
+    # Arrange
+    serve_merge_request(router, "Plan: ship")
+
+    # Act
+    result = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="ship",
+        new_text="launch",
+    )
+
+    # Assert
+    assert result["changed_lines"] == "@@ -1 +1 @@\n-Plan: ship\n+Plan: launch"
+    assert result["truncated"] is False
 
 
 async def test_large_description_is_written_whole_and_result_stays_small(router):
@@ -269,7 +296,7 @@ async def test_large_description_is_written_whole_and_result_stays_small(router)
 
     # Act
     result = await call_tool(
-        "edit_mr_description", project=PROJECT, iid=IID, old_text="needle here", new_text="pinned here"
+        "edit_merge_request_description", project=PROJECT, iid=IID, old_text="needle here", new_text="pinned here"
     )
 
     # Assert
@@ -298,7 +325,14 @@ async def test_mr_write_outcome_is_applied_failed_or_unknown_and_never_retried(r
     put = serve_merge_request(router, "Plan: ship", put=put_reply)
 
     # Act
-    result = await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text="ship", new_text="launch")
+    result = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="ship",
+        new_text="launch",
+        return_diff=False,
+    )
 
     # Assert
     assert result["status"] == status
@@ -316,7 +350,7 @@ async def test_mr_read_error_raises_and_writes_nothing(router):
 
     # Act / Assert
     with pytest.raises(ToolError, match="HTTP 404"):
-        await call_tool("edit_mr_description", project=PROJECT, iid=IID, old_text="a", new_text="b")
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, old_text="a", new_text="b")
     assert put.call_count == 0
 
 
@@ -327,7 +361,7 @@ async def test_work_item_edit_writes_exact_global_id_and_full_description(router
 
     # Act
     result = await call_tool(
-        "edit_work_item",
+        "edit_work_item_description",
         project=PROJECT,
         iid=IID,
         old_text="old line",
@@ -340,6 +374,47 @@ async def test_work_item_edit_writes_exact_global_id_and_full_description(router
     assert mutation_variables(route) == [
         {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": "Plan 🦊\nKeep café\nnew line ✅"}}}
     ]
+
+
+async def test_work_item_edit_can_skip_changed_lines(router, monkeypatch):
+    """An applied work-item edit can omit its diff while preserving the mutation and warning."""
+    # Arrange
+    route = serve_work_item(router, "old line")
+    changed_lines = Mock(side_effect=AssertionError("return_diff=false must not compute changed lines"))
+    monkeypatch.setattr(description_edits_module, "_changed_lines", changed_lines)
+
+    # Act
+    result = await call_tool(
+        "edit_work_item_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="old",
+        new_text="new",
+        return_diff=False,
+    )
+
+    # Assert
+    assert result["status"] == "applied"
+    assert "changed_lines" not in result
+    assert result["truncated"] is False
+    assert "compare-and-swap" in result["warning"]
+    assert mutation_variables(route) == [
+        {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": "new line"}}}
+    ]
+    changed_lines.assert_not_called()
+
+
+async def test_work_item_edit_without_return_diff_keeps_existing_default(router):
+    """The public work-item tool returns its changed lines by default."""
+    # Arrange
+    serve_work_item(router, "old line")
+
+    # Act
+    result = await call_tool("edit_work_item_description", project=PROJECT, iid=IID, old_text="old", new_text="new")
+
+    # Assert
+    assert result["changed_lines"] == "@@ -1 +1 @@\n-old line\n+new line"
+    assert result["truncated"] is False
 
 
 @pytest.mark.parametrize(
@@ -375,7 +450,9 @@ async def test_work_item_write_outcome_is_failed_or_unknown_and_never_retried(ro
     route = serve_work_item(router, "old line", mutation=mutation)
 
     # Act
-    result = await call_tool("edit_work_item", project=PROJECT, iid=IID, old_text="old", new_text="new")
+    result = await call_tool(
+        "edit_work_item_description", project=PROJECT, iid=IID, old_text="old", new_text="new", return_diff=False
+    )
 
     # Assert
     assert result["status"] == status
@@ -397,7 +474,7 @@ async def test_work_item_bad_match_writes_nothing(router, description, old_text,
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_tool("edit_work_item", project=PROJECT, iid=IID, old_text=old_text, new_text="x")
+        await call_tool("edit_work_item_description", project=PROJECT, iid=IID, old_text=old_text, new_text="x")
     assert mutation_variables(route) == []
 
 
@@ -418,4 +495,4 @@ async def test_work_item_not_found_raises_and_writes_nothing(router):
 
     # Act / Assert
     with pytest.raises(ToolError, match="Work item #7 not found"):
-        await call_tool("edit_work_item", project=PROJECT, iid=IID, old_text="a", new_text="b")
+        await call_tool("edit_work_item_description", project=PROJECT, iid=IID, old_text="a", new_text="b")
