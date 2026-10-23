@@ -11,7 +11,14 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_PAGES, NOTE_CAP, THREAD_HEADING_BUDGET, THREAD_HEADING_CAP, mcp
+from gitlab_mcp.server import (
+    MAX_BATCH_MERGE_REQUESTS,
+    MAX_PAGES,
+    NOTE_CAP,
+    THREAD_HEADING_BUDGET,
+    THREAD_HEADING_CAP,
+    mcp,
+)
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -111,14 +118,232 @@ def thread_ids(data: dict[str, Any]) -> list[str]:
 
 async def call_tool(**arguments: Any) -> dict[str, Any]:
     """Call get_merge_request_threads through the MCP protocol and return its data."""
+    tool_arguments = {"project": PROJECT, **arguments}
+    if "iid" not in arguments and "iids" not in arguments:
+        tool_arguments["iid"] = IID
     async with Client(mcp) as client:
-        result = await client.call_tool("get_merge_request_threads", {"project": PROJECT, "iid": IID, **arguments})
+        result = await client.call_tool("get_merge_request_threads", tool_arguments)
     return result.structured_content
 
 
 def encode_cursor(raw: str) -> str:
     """Encode raw text the same way the server encodes cursors, so tests can build bad ones."""
     return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+@respx.mock
+async def test_batch_returns_threads_attributed_to_each_merge_request(gitlab_env):
+    """Batch results preserve unique request order, attribute threads, and list missing MRs."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        iid = json.loads(request.content)["variables"]["iid"]
+        if iid == "42":
+            return httpx.Response(200, json={"data": {"project": {"mergeRequest": None}}})
+        return respond(page(make_discussion(f"thread-{iid}")))
+
+    route = respx.post(GRAPHQL).mock(side_effect=handler)
+
+    # Act
+    data = await call_tool(iids=[2187, 42, 2187, 7])
+
+    # Assert
+    assert [result["iid"] for result in data["merge_requests"]] == [2187, 7]
+    assert [thread_ids(result) for result in data["merge_requests"]] == [["thread-2187"], ["thread-7"]]
+    assert data["missing_iids"] == [42]
+    assert [variables["iid"] for variables in sent_variables(route)] == ["2187", "42", "7"]
+
+
+@pytest.mark.parametrize(
+    "iids",
+    [[], [0], [-1], list(range(1, 22))],
+    ids=["empty", "zero", "negative", "over-20-unique"],
+)
+@respx.mock
+async def test_batch_rejects_invalid_iid_lists_before_network(gitlab_env, iids):
+    """Empty, non-positive, and over-limit unique IID lists do not send requests."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(iids=iids)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_batch_accepts_twenty_unique_iids(gitlab_env):
+    """The maximum number of unique batch IIDs is accepted."""
+    # Arrange
+    iids = list(range(1, MAX_BATCH_MERGE_REQUESTS + 1))
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
+
+    # Act
+    data = await call_tool(iids=iids)
+
+    # Assert
+    assert [result["iid"] for result in data["merge_requests"]] == iids
+    assert route.call_count == len(iids)
+
+
+@respx.mock
+async def test_batch_accepts_more_than_twenty_raw_duplicate_iids(gitlab_env):
+    """Repeated raw IIDs count once toward the unique IID limit."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
+
+    # Act
+    data = await call_tool(iids=[7] * 25)
+
+    # Assert
+    assert [result["iid"] for result in data["merge_requests"]] == [7]
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{"iid": IID, "iids": [42]}],
+    ids=["both"],
+)
+@respx.mock
+async def test_exactly_one_iid_argument_is_required(gitlab_env, arguments):
+    """The tool rejects calls that pass both IID modes."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="exactly one of iid or iids"):
+        await call_tool(**arguments)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_omitting_both_iid_arguments_is_rejected(gitlab_env):
+    """The raw MCP call rejects omitted IID arguments instead of using helper defaults."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
+
+    # Act / Assert
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="exactly one of iid or iids"):
+            await client.call_tool("get_merge_request_threads", {"project": PROJECT})
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_batch_rejects_cursor_before_network(gitlab_env):
+    """Batch results have independent cursors and cannot be resumed as a batch."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Batch thread calls do not accept cursor"):
+        await call_tool(iids=[42], cursor="some-cursor")
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize("failure", ["missing-project", "network"], ids=["project-error", "network-error"])
+@respx.mock
+async def test_batch_propagates_project_and_network_errors(gitlab_env, failure):
+    """Only missing merge requests are collected; project and connection failures propagate."""
+    # Arrange
+    if failure == "missing-project":
+        route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": {"project": None}}))
+    else:
+        route = respx.post(GRAPHQL).mock(side_effect=httpx.ConnectError("offline"))
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(iids=[42])
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_filters_and_headings_apply_to_every_batch_result(gitlab_env):
+    """State, file, and author filters plus compact headings are applied to each MR scan."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        iid = json.loads(request.content)["variables"]["iid"]
+        discussions = page(
+            make_discussion(
+                f"selected-{iid}",
+                make_note("## Selected heading", author="alice", position=make_position("wanted.md")),
+                resolved=True,
+            ),
+            make_discussion(
+                f"wrong-state-{iid}",
+                make_note("## Wrong state", author="alice", position=make_position("wanted.md")),
+            ),
+            make_discussion(
+                f"wrong-file-{iid}",
+                make_note("## Wrong file", author="alice", position=make_position("other.md")),
+                resolved=True,
+            ),
+            make_discussion(
+                f"wrong-author-{iid}",
+                make_note("## Wrong author", author="bob", position=make_position("wanted.md")),
+                resolved=True,
+            ),
+        )
+        return respond(discussions)
+
+    route = respx.post(GRAPHQL).mock(side_effect=handler)
+
+    # Act
+    data = await call_tool(iids=[5, 8], state="resolved", file="wanted.md", author="alice", view="headings")
+
+    # Assert
+    assert [result["iid"] for result in data["merge_requests"]] == [5, 8]
+    assert [thread_ids(result) for result in data["merge_requests"]] == [["selected-5"], ["selected-8"]]
+    assert [result["threads"][0]["heading"] for result in data["merge_requests"]] == [
+        "Selected heading",
+        "Selected heading",
+    ]
+    assert all("notes" not in result["threads"][0] for result in data["merge_requests"])
+    assert [variables["iid"] for variables in sent_variables(route)] == ["5", "8"]
+
+
+@respx.mock
+async def test_thread_ids_and_missing_ids_are_evaluated_per_merge_request(gitlab_env):
+    """The shared thread ID filter selects independently, and each MR reports its own absent IDs."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        iid = json.loads(request.content)["variables"]["iid"]
+        discussion_id = "wanted" if iid == "5" else "other"
+        return respond(page(make_discussion(discussion_id)))
+
+    respx.post(GRAPHQL).mock(side_effect=handler)
+
+    # Act
+    data = await call_tool(iids=[5, 8], ids=["wanted"])
+
+    # Assert
+    first, second = data["merge_requests"]
+    assert [result["iid"] for result in data["merge_requests"]] == [5, 8]
+    assert thread_ids(first) == ["wanted"]
+    assert "not_found_ids" not in first
+    assert second["threads"] == []
+    assert second["not_found_ids"] == ["wanted"]
+
+
+@respx.mock
+async def test_each_batch_cursor_resumes_with_a_single_merge_request_call(gitlab_env):
+    """Every MR gets its own output cursor, which resumes through the existing single-IID mode."""
+    # Arrange
+    discussions = [make_discussion(f"t{index}", *(make_note("x" * NOTE_CAP) for _ in range(3))) for index in range(3)]
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
+
+    # Act
+    first = await call_tool(iids=[5, 8])
+    resumed = [await call_tool(iid=result["iid"], cursor=result["next_cursor"]) for result in first["merge_requests"]]
+
+    # Assert
+    assert [thread_ids(result) for result in first["merge_requests"]] == [["t0", "t1"], ["t0", "t1"]]
+    assert all(result["next_cursor"] for result in first["merge_requests"])
+    assert [thread_ids(result) for result in resumed] == [["t2"], ["t2"]]
+    assert [variables["iid"] for variables in sent_variables(route)] == ["5", "8", "5", "8"]
 
 
 @respx.mock

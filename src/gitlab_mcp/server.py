@@ -416,6 +416,19 @@ class ThreadList(BaseModel):
     not_found_ids: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
 
 
+class MergeRequestThreadList(ThreadList):
+    """One merge request's thread page in a batch result."""
+
+    iid: int
+
+
+class MergeRequestThreadBatch(BaseModel):
+    """Thread pages for requested merge requests and the IIDs that were missing."""
+
+    merge_requests: list[MergeRequestThreadList]
+    missing_iids: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+
 class ThreadReplyResult(BaseModel):
     """The result of replying to or resolving one discussion thread."""
 
@@ -1412,11 +1425,12 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     return threads, _encode_cursor({"after": after, "skip": 0}), seen
 
 
+# FastMCP wraps a model union in `result`, which changes both established structured response shapes.
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument is a user-facing filter.
     ctx: Context,
     project: Project,
-    iid: Iid,
+    iid: Iid | None = None,
     state: Literal["open", "resolved", "comments", "all"] = "open",
     ids: Annotated[list[str] | None, Field(description="Thread IDs from threads.open. Ignores state.")] = None,
     file: Annotated[str | None, Field(description="Only threads on this path, old or new.")] = None,
@@ -1430,10 +1444,16 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
         str | None,
         Field(description="next_cursor from an earlier call. Repeat the filters, view, and max_body_chars."),
     ] = None,
-) -> ThreadList:
-    """Read review thread notes, with filters and a size budget. Like `glab mr note list`.
+    iids: Annotated[
+        list[PositiveIid] | None,
+        Field(description="Batch of 1 to 20 unique positive merge request IIDs. Duplicates keep first-request order."),
+    ] = None,
+) -> Any:
+    """Read review thread notes for one merge request or a batch, like `glab mr note list`.
 
     - `state`: `open` (default), `resolved`, `comments` (cannot be resolved), or `all`. `ids` ignore `state`.
+    - Pass exactly one of `iid` or `iids`. Batch `iids` are deduplicated in request order and allow at most 20
+      unique positive values. Missing merge requests appear in `missing_iids`.
     - System notes and threads with no human notes are skipped.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - In full view, `notes_truncated` means over 50 notes exist, so the `author` filter can miss a late reply.
@@ -1444,19 +1464,73 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
       call returns about 30000 body characters. Headings view returns about 30000 serialized characters. Continue
       with `next_cursor` using the same filters, `view`, and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
+    - Each batch result includes its own `iid`, `threads`, `next_cursor`, and `not_found_ids`. Batch cursors are not
+      accepted: resume a result with a single `iid` call and that result's cursor. Every merge request gets its own
+      existing scan and output budget, so batch output can use up to 20 times the single-merge-request budget.
     """
-    client = get_client(ctx)
-    start = _thread_cursor_start(cursor) if cursor else (None, 0)
+    if (iid is None) == (iids is None):
+        raise ToolError("Pass exactly one of iid or iids.")  # noqa: TRY003
+
     # An empty list means no IDs were given, so the state filter applies.
     wanted = _bare_ids(ids) if ids else None
     thread_filter = _ThreadFilter(state=state, ids=wanted, file=file, author=author)
-    threads, next_cursor, seen = await _scan_threads(client, project, iid, thread_filter, start, max_body_chars, view)
+    if iid is not None:
+        client = get_client(ctx)
+        start = _thread_cursor_start(cursor) if cursor else (None, 0)
+        threads, next_cursor, seen = await _scan_threads(
+            client,
+            project,
+            iid,
+            thread_filter,
+            start,
+            max_body_chars,
+            view,
+        )
+        # A resumed call did not read the first page, so it cannot prove an ID is missing.
+        not_found_ids: list[str] = []
+        if wanted and cursor is None and not next_cursor:
+            not_found_ids = [thread_id for thread_id in wanted if thread_id not in seen]
+        return ThreadList(threads=threads, next_cursor=next_cursor, not_found_ids=not_found_ids)
 
-    # A resumed call did not read the first page, so it cannot prove an ID is missing.
-    not_found_ids: list[str] = []
-    if wanted and cursor is None and not next_cursor:
-        not_found_ids = [thread_id for thread_id in wanted if thread_id not in seen]
-    return ThreadList(threads=threads, next_cursor=next_cursor, not_found_ids=not_found_ids)
+    if cursor is not None:
+        raise ToolError("Batch thread calls do not accept cursor. Resume with a single iid call.")  # noqa: TRY003
+    unique_iids = list(dict.fromkeys(iids or []))
+    if not unique_iids:
+        raise ToolError("Pass at least one merge request IID.")  # noqa: TRY003
+    if len(unique_iids) > MAX_BATCH_MERGE_REQUESTS:
+        raise ToolError("Pass no more than 20 unique merge request IIDs.")  # noqa: TRY003
+
+    client = get_client(ctx)
+    merge_requests: list[MergeRequestThreadList] = []
+    missing_iids: list[int] = []
+    for requested_iid in unique_iids:
+        try:
+            threads, next_cursor, seen = await _scan_threads(
+                client,
+                project,
+                requested_iid,
+                thread_filter,
+                (None, 0),
+                max_body_chars,
+                view,
+            )
+        except MergeRequestNotFoundError:
+            missing_iids.append(requested_iid)
+            continue
+
+        # Each full per-MR scan reports missing thread IDs independently.
+        not_found_ids = [thread_id for thread_id in wanted or [] if thread_id not in seen]
+        if next_cursor:
+            not_found_ids = []
+        merge_requests.append(
+            MergeRequestThreadList(
+                iid=requested_iid,
+                threads=threads,
+                next_cursor=next_cursor,
+                not_found_ids=not_found_ids,
+            ),
+        )
+    return MergeRequestThreadBatch(merge_requests=merge_requests, missing_iids=missing_iids)
 
 
 @mcp.tool(
