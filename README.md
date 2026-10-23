@@ -54,6 +54,7 @@ even when the returned content is focused or truncated.
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. Pass `names` to check which exact label names exist (`existing`/`missing`) before `create_merge_request(labels=...)`. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
 | `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
+| `update_merge_request` | Change MR fields, reviewers, assignees, blockers, or approval; rebase reports `applied`, `pending` (still running after about 10 seconds), or `failed` (for example, when the MR has conflicts). |
 
 Work-item table-cell edits support standalone pipe-delimited Markdown tables with a unique, non-empty header and a
 valid separator row. The first column is the row key. A section can limit selection to an exact ATX heading and its

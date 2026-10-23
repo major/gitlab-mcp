@@ -10,7 +10,7 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_PAGES, mcp
+from gitlab_mcp.server import MAX_PAGES, REBASE_POLL_ATTEMPTS, REBASE_POLL_DELAY, mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 MR = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187"
@@ -19,6 +19,8 @@ PROJECT = "group/project"
 PROJECT_ID = 1
 IID = 2187
 SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA, because approval needs it exact.
+NEW_SHA = "0f1e2d3c4b5a69788796a5b4c3d2e1f00fedcba9"  # The head after a rebase.
+MERGE_ERROR = "Rebase failed because the source branch changed."
 KNOWN_USERS = ("alice", "bob")
 MUTATION_PAYLOADS = ("mergeRequestSetDraft", "mergeRequestSetReviewers", "mergeRequestSetAssignees")
 GRAPHQL_MARKERS = ("users(", *MUTATION_PAYLOADS, "mergeRequest(")
@@ -514,18 +516,116 @@ async def test_people_mutations_declare_a_non_null_username_list(gitlab_env, rou
     assert "$usernames: [String!]!" in queries[0]
 
 
-async def test_rebase_is_pending_not_applied(gitlab_env, router):
-    """A rebase is accepted, so it is pending, and never applied."""
+@pytest.fixture
+def waits(monkeypatch):
+    """Record each rebase poll wait instead of sleeping ⚡, so the tests stay instant."""
+    recorded: list[float] = []
+
+    async def fake_wait(seconds: float) -> None:
+        recorded.append(seconds)
+
+    monkeypatch.setattr("gitlab_mcp.server._wait", fake_wait)
+    return recorded
+
+
+def mr_state(**fields: Any) -> dict[str, Any]:
+    """Return the REST merge request fields that the rebase flow reads.
+
+    The default is a clean MR with no rebase running.
+    """
+    return {"has_conflicts": False, "rebase_in_progress": False, "merge_error": None} | fields
+
+
+async def test_clean_rebase_is_applied_with_the_new_head_sha(gitlab_env, router, waits):
+    """A rebase that finishes inside the window is applied, and the final read reports the new head SHA."""
     # Arrange
-    routes = serve_writes(router)
+    routes = serve_writes(router, replies={"mergeRequest(": mr_body(diffRefs={"headSha": NEW_SHA})})
+    router.get(MR).mock(
+        side_effect=[
+            httpx.Response(200, json=mr_state()),  # Preflight: no conflicts.
+            httpx.Response(200, json=mr_state(rebase_in_progress=True)),  # First poll: still running.
+            httpx.Response(200, json=mr_state()),  # Second poll: finished.
+        ]
+    )
 
     # Act
     data = await call_tool(rebase=True)
 
     # Assert
     assert routes["rebase"].call_count == 1
+    assert waits == [REBASE_POLL_DELAY] * 2
+    assert data == {"applied": ["rebase"], "state": "opened", "merge_status": "mergeable", "head_sha": NEW_SHA}
+
+
+async def test_conflicted_mr_fails_without_sending_a_rebase(gitlab_env, router, waits):
+    """GitLab cannot rebase an MR with conflicts, so the rebase endpoint is never called."""
+    # Arrange
+    routes = serve_writes(router)
+    router.get(MR).mock(return_value=httpx.Response(200, json=mr_state(has_conflicts=True)))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"cannot rebase this MR because it has conflicts\. Rebase locally and push\."):
+        await call_tool(rebase=True)
+    assert routes["rebase"].call_count == 0
+    assert waits == []
+
+
+async def test_rebase_rejected_by_gitlab_reports_its_merge_error(gitlab_env, router, waits):
+    """When GitLab ends the rebase with a merge error, the step fails with that reason, and other steps still apply."""
+    # Arrange
+    serve_writes(router)
+    router.get(MR).mock(
+        side_effect=[
+            httpx.Response(200, json=mr_state()),
+            httpx.Response(200, json=mr_state(merge_error=MERGE_ERROR)),
+        ]
+    )
+
+    # Act
+    data = await call_tool(title="New title", rebase=True)
+
+    # Assert
+    assert data["applied"] == ["fields"]
+    assert data["failed"] == {"rebase": MERGE_ERROR}
+    assert "pending" not in data
+
+
+async def test_rebase_still_running_after_the_window_stays_pending(gitlab_env, router, waits):
+    """A rebase that is still running when the window ends is pending, after one preflight and one read per poll."""
+    # Arrange
+    routes = serve_writes(router)
+    reads = router.get(MR).mock(return_value=httpx.Response(200, json=mr_state(rebase_in_progress=True)))
+
+    # Act
+    data = await call_tool(rebase=True)
+
+    # Assert
+    assert routes["rebase"].call_count == 1
+    assert waits == [REBASE_POLL_DELAY] * REBASE_POLL_ATTEMPTS
+    assert reads.call_count == 1 + REBASE_POLL_ATTEMPTS
     assert data["pending"] == ["rebase"]
     assert "applied" not in data
+    assert "failed" not in data
+
+
+@pytest.mark.parametrize(
+    "failed_poll",
+    [httpx.Response(500, json={"message": "Boom"}), httpx.ConnectError("connection reset")],
+    ids=["api-error", "connection-error"],
+)
+async def test_failed_poll_keeps_the_accepted_rebase_pending(gitlab_env, router, waits, failed_poll):
+    """A failed poll stops the watch and leaves the rebase pending, because GitLab already accepted it."""
+    # Arrange
+    serve_writes(router)
+    router.get(MR).mock(side_effect=[httpx.Response(200, json=mr_state()), failed_poll])
+
+    # Act
+    data = await call_tool(rebase=True)
+
+    # Assert
+    assert data["pending"] == ["rebase"]
+    assert waits == [REBASE_POLL_DELAY]
+    assert "failed" not in data
 
 
 async def test_steps_run_in_the_documented_order(gitlab_env, router):

@@ -1,5 +1,6 @@
 """FastMCP server with GitLab tools for fast developer workflows 🚀."""
 
+import asyncio
 import base64
 import json
 import os
@@ -3269,6 +3270,9 @@ STEP_STATUS_REASONS = {
 BLOCKS_PAGE_SIZE = 100
 # Labels per page on the project labels endpoint. The largest page GitLab serves.
 PROJECT_LABELS_PAGE_SIZE = 100
+# A rebase is watched for about 10 seconds: poll this many times, waiting this long before each poll. ⏱️
+REBASE_POLL_ATTEMPTS = 5
+REBASE_POLL_DELAY = 2.0
 
 
 class MergeRequestUpdate(BaseModel):
@@ -3276,7 +3280,7 @@ class MergeRequestUpdate(BaseModel):
 
     # GitLab confirmed these changes.
     applied: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
-    # GitLab accepted these, but the work is not done yet. Rebase runs in the background.
+    # GitLab accepted these, but they were still running when the wait ended. Check get_merge_request later.
     pending: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     # The write may have reached GitLab. Check with get_merge_request. Do not retry blindly.
     unknown: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
@@ -3309,6 +3313,11 @@ class SearchAndNamesError(ToolError):
     def __init__(self) -> None:
         """Tell the agent to pass only one of the two filters."""
         super().__init__("Pass either search or names to list_labels, not both.")
+
+
+async def _wait(seconds: float) -> None:
+    """Pause for `seconds`. It is a module-level function, so tests can replace it with a no-op."""
+    await asyncio.sleep(seconds)
 
 
 class NothingToUpdateError(ToolError):
@@ -3674,9 +3683,46 @@ class _Update:
             await self.attempt("unapprove", self.client.request("POST", f"{self.path}/unapprove"))
 
     async def _rebase(self) -> None:
-        """Ask GitLab to rebase. GitLab accepts the job and works on it later, so the result is pending."""
-        if self.changes.rebase:
-            await self.attempt("rebase", self.client.request("PUT", f"{self.path}/rebase"), accepted=self.pending)
+        """Ask GitLab to rebase, then watch the job for about 10 seconds.
+
+        GitLab accepts a rebase even when it will fail later, so the conflicts flag is
+        checked first. An MR with conflicts is never sent to the rebase endpoint. 🧯
+        """
+        if not self.changes.rebase:
+            return
+        try:
+            mr = await self.client.get(self.path)
+        except ToolError as exc:
+            self.failed["rebase"] = str(exc)
+            return
+        if mr.get("has_conflicts"):
+            self.failed["rebase"] = "GitLab cannot rebase this MR because it has conflicts. Rebase locally and push."
+            return
+        await self.attempt("rebase", self.client.request("PUT", f"{self.path}/rebase"), accepted=self.pending)
+        if "rebase" in self.pending:
+            await self._watch_rebase()
+
+    async def _watch_rebase(self) -> None:
+        """Poll until GitLab finishes the rebase, or until the wait runs out.
+
+        A finished rebase moves from `pending` to `applied`, or to `failed` with GitLab's
+        `merge_error`. A failed poll leaves it pending, because GitLab already accepted the write.
+        """
+        for _ in range(REBASE_POLL_ATTEMPTS):
+            await _wait(REBASE_POLL_DELAY)
+            try:
+                mr = await self.client.get(self.path, include_rebase_in_progress=True)
+            except ToolError:
+                return
+            # A missing flag counts as still running, so an unclear answer never reads as success.
+            if mr.get("rebase_in_progress", True):
+                continue
+            self.pending.remove("rebase")
+            if mr.get("merge_error"):
+                self.failed["rebase"] = mr["merge_error"]
+            else:
+                self.applied.append("rebase")
+            return
 
 
 @mcp.tool(
@@ -3720,7 +3766,11 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     source branch. An approval can let an auto-merge that is already enabled go through.
 
     - Several changes go in one call. Each step runs even when an earlier step failed.
-    - `applied`: GitLab confirmed the change. `pending`: GitLab accepted a rebase, but it is not done yet.
+    - `applied`: GitLab confirmed the change. `pending`: the rebase was still running after about 10 seconds.
+      Check get_merge_request later. A rebase reports `applied` with the new `head_sha`,
+      or `failed` with GitLab's reason.
+    - A rebase on an MR with conflicts fails right away and is never sent, because GitLab cannot rebase it.
+      Rebase locally and push instead.
     - `unknown`: the request may have reached GitLab. Check with get_merge_request. Do not retry blindly.
     - `failed` maps each step or item to a reason. Items look like `reviewers:bob` (unknown user) or `blocked_by:12`.
     - `approve` needs `sha`, the full `head_sha` from get_merge_request. Approve in its own call, because
