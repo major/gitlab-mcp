@@ -258,7 +258,8 @@ mcp = FastMCP(
         'get_merge_request_threads(state="open") to triage, reply_to_thread(resolve=true) to respond or resolve, and '
         "edit_merge_request_description to update the description. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
-        "Use get_merge_request for descriptions, approvals, and jobs, and get_merge_request_diff for patches. "
+        "Use get_merge_request for approvals and jobs (add include_description=true for the description), "
+        "and get_merge_request_diff for patches. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
         "Get the user's explicit APPROVE before posting notes with post_review_notes. "
         "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "
@@ -1336,7 +1337,10 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         bool,
         Field(description="Include failed job IDs and names as TSV. Defaults to false to keep output compact."),
     ] = False,
-    include_description: Annotated[bool, Field(description="False skips the description to save tokens.")] = True,
+    include_description: Annotated[
+        bool,
+        Field(description="True includes the description. Defaults to false to save tokens."),
+    ] = False,
     description_limit: Annotated[
         int,
         Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
@@ -1350,7 +1354,9 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `threads.open` IDs go to get_merge_request_threads. `index_complete` false means some are missing.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
-    - `description_limit` controls description length. Zero skips it; the default is 4000 characters.
+    - The description is skipped by default. Set `include_description=true` to read it when you need it.
+    - `description_limit` controls description length when the description is included. Zero skips it; the default is
+      4000 characters.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
       the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
     """

@@ -49,7 +49,7 @@ even when the returned content is focused or truncated.
 | Tool | Description |
 | --- | --- |
 | `get_work_item` | Read work-item details, all headings, or selected sections with a full-description hash. |
-| `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. |
+| `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. `get_merge_request` skips the description unless `include_description=true`. |
 | `edit_work_item_description` | Edit a work-item description using exact text, ordered replacements, or a unique table cell. |
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. Pass `names` to check which exact label names exist (`existing`/`missing`) before `create_merge_request(labels=...)`. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
