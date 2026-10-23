@@ -21,7 +21,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 ## Layout
 
 - `src/gitlab_mcp/server.py`: the `mcp` FastMCP app, lifespan, and every `@mcp.tool`. New tools go here.
-- `src/gitlab_mcp/client.py`: `GitLabClient.get()` and `.get_page()` (REST, base `/api/v4`; `get_page` also returns `X-Next-Page`) and `.graphql()` (absolute `/api/graphql` URL). HTTP, network, and GraphQL errors become `ToolError` subclasses with friendly hints.
+- `src/gitlab_mcp/client.py`: `GitLabClient.get()` and `.get_page()` (REST, base `/api/v4`; `get_page` also returns `X-Next-Page`), `.request()` (POST/PUT/DELETE), `.graphql()` (absolute `/api/graphql` URL), and `.mutate()` (also checks `data.<field>.errors`). HTTP, network, and GraphQL errors become `ToolError` subclasses with friendly hints.
 - `src/gitlab_mcp/config.py`: `Settings.from_env()` reads `GITLAB_URL`, `GITLAB_TOKEN`, `GITLAB_TIMEOUT`.
 - Config errors must not crash the server: the lifespan stores the error and `get_client(ctx)` raises it as a `ToolError` on the next tool call.
 - When you add a tool, also add a row to the README `Tools` table.
@@ -31,7 +31,8 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 - Tool output is sent to an agent on every call, so keep it token-lean: small Pydantic models, TSV strings for lists of rows (fixed columns, so no row looks like it is missing data), dates trimmed to `YYYY-MM-DD`.
 - Tool docstrings and `Field(description=...)` are the agent-facing docs. Name the matching `glab` command in the docstring.
 - Use `Literal[...]` for enum-like args instead of a separate "list values" tool.
-- Mark read-only tools with `annotations={"readOnlyHint": True, "openWorldHint": True}`.
+- Mark read-only tools with `annotations={"readOnlyHint": True, "openWorldHint": True}`. Write tools set `readOnlyHint: False`, and `destructiveHint: True` when the change cannot be undone (see `land_merge_request`).
+- Write tools never auto-retry. A connection error during a write means the outcome is unknown, so say that instead of "failed".
 - Prefer one GraphQL query per page over many REST calls when it saves round trips. Bound client-side scans (see `MAX_PAGES`).
 
 ## Testing rules 🧪
