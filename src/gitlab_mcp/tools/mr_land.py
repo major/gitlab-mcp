@@ -1,5 +1,6 @@
 """Land tool: queue a merge, merge now, or cancel a queued merge 🚦."""
 
+from collections import Counter
 from typing import Annotated, Any, Literal
 
 from fastmcp.exceptions import ToolError
@@ -7,7 +8,7 @@ from pydantic import BaseModel, Field
 lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
-from gitlab_mcp.client import GitLabAPIError, GitLabConnectionError
+from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import Iid, Project, lower_or_empty
 from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_merge_request, mr_rest_path
 
@@ -25,9 +26,21 @@ LAND_QUERY = """
 query($fullPath: ID!, $iid: String!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
-      state detailedMergeStatus autoMergeStrategy mergeCommitSha
+      state detailedMergeStatus autoMergeStrategy mergeCommitSha targetBranch
       diffRefs { headSha }
       headPipeline { status }
+    }
+  }
+}
+"""
+
+# GraphQL's car index includes historical cars, so the position is the 1-based order among active cars,
+# the same approach as list_merge_train. Bounded to the first 100 active cars.
+TRAIN_POSITION_QUERY = """
+query($fullPath: ID!, $targetBranches: [String!]) {
+  project(fullPath: $fullPath) {
+    mergeTrains(status: ACTIVE, targetBranches: $targetBranches, first: 1) {
+      nodes { cars(activityStatus: ACTIVE, first: 100) { nodes { status mergeRequest { iid } pipeline { id } } } }
     }
   }
 }
@@ -45,7 +58,38 @@ class MergeRequestLanding(BaseModel):
     # The head SHA GitLab queued or merged. Only auto and now fill it, so cancel keeps its shorter shape.
     head_sha: str = Field(default="", exclude_if=lambda v: not v)
     pipeline_status: str = Field(default="", exclude_if=lambda v: not v)  # Head pipeline status, lowercased.
-    warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the write worked but the read did not.
+    # Only for merge_train results. Empty when the MR is not among the first 100 active cars.
+    train_position: int | None = Field(default=None, exclude_if=lambda v: v is None)  # 1-based, among active cars.
+    train_status: str = Field(default="", exclude_if=lambda v: not v)  # The car's status, lowercased, like "idle".
+    train_pipeline_id: int | None = Field(default=None, exclude_if=lambda v: v is None)  # None until a pipeline runs.
+    warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the write worked but a read did not.
+
+
+class LandItem(BaseModel):
+    """One merge request in a batch land."""
+
+    iid: Iid = Field(description="Merge request IID to land.")
+    sha: str | None = Field(
+        default=None, description="Full head SHA from get_merge_requests. Required for auto and now."
+    )
+
+
+LandBatchStatus = Literal["applied", "failed", "unknown"]
+
+
+class LandBatchItem(BaseModel):
+    """The outcome for one merge request in a batch land."""
+
+    iid: int
+    status: LandBatchStatus
+    landing: MergeRequestLanding | None = Field(default=None, exclude_if=lambda v: v is None)
+    warning: str = Field(default="", exclude_if=lambda v: not v)  # The error message when the land did not apply.
+
+
+class LandBatchResult(BaseModel):
+    """Ordered outcomes for a batch land."""
+
+    results: list[LandBatchItem]
 
 
 class ShaRequiredError(ToolError):
@@ -62,6 +106,15 @@ class CancelOptionsError(ToolError):
     def __init__(self) -> None:
         """Tell the agent which arguments to drop."""
         super().__init__("Mode 'cancel' takes only project and iid. Drop sha, squash, and remove_source_branch.")
+
+
+class DuplicateIidError(ToolError):
+    """The same merge request appeared more than once in one batch."""
+
+    def __init__(self, iids: list[int]) -> None:
+        """Name the repeated IIDs, so the agent can drop the extra entries."""
+        repeated = ", ".join(str(iid) for iid in iids)
+        super().__init__(f"Each merge request may appear once in a batch. Repeated IIDs: {repeated}.")
 
 
 class OutcomeUnknownError(ToolError):
@@ -92,6 +145,23 @@ def _check_land_args(mode: LandMode, sha: str | None, squash: bool | None, remov
             raise CancelOptionsError
     elif not sha:
         raise ShaRequiredError(mode)
+
+
+def _check_batch_args(
+    mode: LandMode,
+    items: list[LandItem],
+    squash: bool | None,
+    remove_source_branch: bool | None,
+) -> None:
+    """Refuse a whole batch before its first write.
+
+    A repeated IID is refused too, because two writes to one MR in a batch would be unclear.
+    """
+    repeated = sorted(iid for iid, count in Counter(item.iid for item in items).items() if count > 1)
+    if repeated:
+        raise DuplicateIidError(repeated)
+    for item in items:
+        _check_land_args(mode, item.sha, squash, remove_source_branch)
 
 
 def _merge_body(
@@ -145,6 +215,86 @@ def _to_landing(mode: LandMode, node: dict[str, Any]) -> MergeRequestLanding:
     return MergeRequestLanding(**fields)
 
 
+def _train_fields(data: dict[str, Any], iid: int) -> dict[str, Any]:
+    """Find this MR's car in a TRAIN_POSITION_QUERY response and return its train fields.
+
+    Returns an empty dict when the MR is not among the active cars of the response. A response with no
+    train list counts as no train, so the fields are left out.
+    """
+    project = data["project"] or {}
+    trains = (project.get("mergeTrains") or {}).get("nodes") or []
+    cars = trains[0]["cars"]["nodes"] if trains else []
+    # GraphQL IIDs are strings, so the comparison uses str(iid).
+    for position, car in enumerate(cars, start=1):
+        if car["mergeRequest"]["iid"] == str(iid):
+            pipeline = car["pipeline"]
+            return {
+                "train_position": position,
+                "train_status": lower_or_empty(car["status"]),
+                # The pipeline GID ends in its number, like gid://gitlab/Ci::Pipeline/731.
+                "train_pipeline_id": int(pipeline["id"].rsplit("/", 1)[-1]) if pipeline else None,
+            }
+    return {}
+
+
+async def _with_train_position(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    target_branch: str,
+    landing: MergeRequestLanding,
+) -> MergeRequestLanding:
+    """Add where the MR sits in its merge train. The land already worked, so a failed read only adds a warning."""
+    try:
+        data = await client.graphql(TRAIN_POSITION_QUERY, {"fullPath": project, "targetBranches": [target_branch]})
+    except ToolError:
+        return landing.model_copy(
+            update={"warning": "The merge train position could not be read. Check list_merge_train."}
+        )
+    return landing.model_copy(update=_train_fields(data, iid))
+
+
+async def _land_one(  # noqa: PLR0913, PLR0917 - each argument is one land option.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    sha: str | None,
+    mode: LandMode,
+    squash: bool | None,
+    remove_source_branch: bool | None,
+) -> MergeRequestLanding:
+    """Send one land write, then read the MR back. Raises the write's errors, and never retries a write.
+
+    The caller checks the arguments first. A failed read after an accepted write returns `pending` with a warning,
+    so a read problem never looks like a failed merge. 🧾
+    """
+    path = mr_rest_path(project, iid)
+    try:
+        if mode == "cancel":
+            await client.request("POST", f"{path}/cancel_merge_when_pipeline_succeeds")
+        else:
+            await client.request("PUT", f"{path}/merge", json=_merge_body(mode, sha, squash, remove_source_branch))
+    except GitLabConnectionError as exc:
+        # The request may have reached GitLab before the connection failed, so the outcome is unknown.
+        raise OutcomeUnknownError(exc) from exc
+    except GitLabAPIError as exc:
+        if exc.status not in REFUSED_STATUSES:
+            raise
+        raise MergeRefusedError(exc) from exc
+
+    try:
+        node = await fetch_merge_request(client, LAND_QUERY, project, iid)
+    except ToolError:
+        return MergeRequestLanding(
+            result="pending",
+            warning="GitLab accepted the request, but its state could not be read. Check get_merge_request.",
+        )
+    landing = _to_landing(mode, node)
+    if landing.result == "merge_train":
+        return await _with_train_position(client, project, iid, node["targetBranch"], landing)
+    return landing
+
+
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
 async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a user-facing option.
     ctx: Context,
@@ -169,30 +319,57 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
     - Get `sha` from get_merge_request. GitLab refuses the merge with 409 when the head has moved.
     - `result`: `merge_train`, `auto_merge`, `merged`, `cancelled`, or `pending`. Use get_merge_request to see blockers.
     - `auto` and `now` also return `head_sha` and `pipeline_status`, so you can confirm which commit was queued.
+    - For `merge_train` results, `train_position` (1-based among active cars), `train_status`, and
+      `train_pipeline_id` say where the MR sits in its train. They are left out when the MR is not found there.
     - A refused merge (405, 406, 409, 422) says to check blockers. Never retry a failed write without checking first.
     """
     _check_land_args(mode, sha, squash, remove_source_branch)
-    client = get_client(ctx)
-    path = mr_rest_path(project, iid)
-    try:
-        if mode == "cancel":
-            await client.request("POST", f"{path}/cancel_merge_when_pipeline_succeeds")
-        else:
-            await client.request("PUT", f"{path}/merge", json=_merge_body(mode, sha, squash, remove_source_branch))
-    except GitLabConnectionError as exc:
-        # The request may have reached GitLab before the connection failed, so the outcome is unknown.
-        raise OutcomeUnknownError(exc) from exc
-    except GitLabAPIError as exc:
-        if exc.status not in REFUSED_STATUSES:
-            raise
-        raise MergeRefusedError(exc) from exc
+    return await _land_one(get_client(ctx), project, iid, sha, mode, squash, remove_source_branch)
 
-    # The write was accepted, so a failed read must not look like a failed merge. 🧾
+
+async def _land_batch_item(  # noqa: PLR0913, PLR0917 - each argument is one land option.
+    client: GitLabClient,
+    project: str,
+    item: LandItem,
+    mode: LandMode,
+    squash: bool | None,
+    remove_source_branch: bool | None,
+) -> LandBatchItem:
+    """Land one batch item and turn its outcome or error into a compact row. Errors never stop the batch."""
     try:
-        node = await fetch_merge_request(client, LAND_QUERY, project, iid)
-    except ToolError:
-        return MergeRequestLanding(
-            result="pending",
-            warning="GitLab accepted the request, but its state could not be read. Check get_merge_request.",
-        )
-    return _to_landing(mode, node)
+        landing = await _land_one(client, project, item.iid, item.sha, mode, squash, remove_source_branch)
+    except OutcomeUnknownError as exc:
+        return LandBatchItem(iid=item.iid, status="unknown", warning=str(exc))
+    except ToolError as exc:
+        return LandBatchItem(iid=item.iid, status="failed", warning=str(exc))
+    return LandBatchItem(iid=item.iid, status="applied", landing=landing)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
+async def land_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a user-facing option.
+    ctx: Context,
+    project: Project,
+    items: Annotated[
+        list[LandItem],
+        Field(
+            min_length=1, max_length=20, description="One to 20 merge requests with their full head SHA, in land order."
+        ),
+    ],
+    mode: Annotated[LandMode, Field(description="auto (default), now, or cancel. Applies to every item.")] = "auto",
+    squash: Annotated[bool | None, Field(description="Squash the commits. Omit for the project default.")] = None,
+    remove_source_branch: Annotated[
+        bool | None,
+        Field(description="Delete the source branch after merging. Omit for the project default."),
+    ] = None,
+) -> LandBatchResult:
+    """Merge or cancel up to 20 merge requests, in order. Like `glab mr merge` for several MRs.
+
+    - Get each `sha` from get_merge_requests. `mode`, `squash`, and `remove_source_branch` apply to every item.
+    - Items run in order. A failed item does not stop later items, and writes are never retried.
+    - Check each `status` before you retry. Never retry an `unknown` outcome without checking get_merge_request first.
+    - Bad arguments and repeated IIDs are refused before the first write, so nothing is sent.
+    """
+    _check_batch_args(mode, items, squash, remove_source_branch)
+    client = get_client(ctx)
+    results = [await _land_batch_item(client, project, item, mode, squash, remove_source_branch) for item in items]
+    return LandBatchResult(results=results)
