@@ -1,6 +1,7 @@
 """Behavioral tests for the work-item GraphQL helpers 🧪."""
 
 import base64
+import hashlib
 import json
 from typing import Any, Literal, cast
 
@@ -247,6 +248,7 @@ async def test_project_details_map_widgets_and_explicit_completeness(gitlab_env)
         "namespace_path": PROJECT,
         "url": "https://gitlab.example.com/group/project/-/work_items/42",
         "description": "A long description",
+        "description_hash": hashlib.sha256(b"A long description").hexdigest(),
         "labels": ["docs"],
         "labels_complete": True,
         "assignees": ["mhayden"],
