@@ -73,6 +73,7 @@ query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeJobs
     mergeRequest(iid: $iid) {
       iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
       author { username }
+      mergedAt mergeUser { username }
       diffRefs { headSha }
       detailedMergeStatus shouldBeRebased conflicts
       approved approvedBy { nodes { username } }
@@ -101,6 +102,7 @@ COMPACT_MERGE_REQUEST_FRAGMENT = """
 fragment CompactMergeRequest on MergeRequest {
   iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
   author { username }
+  mergedAt mergeUser { username }
   diffRefs { headSha }
   detailedMergeStatus shouldBeRebased conflicts
   approved approvedBy { nodes { username } }
@@ -688,6 +690,8 @@ class MergeRequestDetail(BaseModel):
     state: str
     draft: bool = Field(default=False, exclude_if=lambda v: not v)
     author: str = Field(default="", exclude_if=lambda v: not v)
+    merged_at: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    merged_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
     source_branch: str
     target_branch: str
     head_sha: str = Field(default="", exclude_if=lambda v: not v)
@@ -715,6 +719,8 @@ class CompactMergeRequest(BaseModel):
     state: str
     draft: bool = Field(default=False, exclude_if=lambda v: not v)
     author: str = Field(default="", exclude_if=lambda v: not v)
+    merged_at: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    merged_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
     source_branch: str
     target_branch: str
     head_sha: str = Field(default="", exclude_if=lambda v: not v)
@@ -1165,6 +1171,15 @@ def _head_sha(diff_refs: dict[str, Any] | None) -> str:
     return diff_refs["headSha"] if diff_refs else ""
 
 
+def _merged_metadata(node: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return date-only merge metadata for merged requests with available values."""
+    if node["state"] != "merged":
+        return None, None
+    merged_at = node.get("mergedAt")
+    merge_user = node.get("mergeUser")
+    return merged_at[:10] if merged_at else None, merge_user.get("username") if merge_user else None
+
+
 def _to_detail(
     node: dict[str, Any],
     *,
@@ -1179,6 +1194,7 @@ def _to_detail(
     author = node["author"]
     # headPipeline can be null, so check before reading it.
     pipeline = node["headPipeline"]
+    merged_at, merged_by = _merged_metadata(node)
     description, description_truncated = _cap_description(
         node.get("description") if include_description else None,
         description_limit,
@@ -1187,6 +1203,8 @@ def _to_detail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
         state=node["state"],
+        merged_at=merged_at,
+        merged_by=merged_by,
         draft=node["draft"],
         author=author["username"] if author else "",
         source_branch=node["sourceBranch"],
@@ -1218,6 +1236,7 @@ def _to_compact_detail(
     author = node["author"]
     # headPipeline can be null, so check before reading it.
     pipeline = node["headPipeline"]
+    merged_at, merged_by = _merged_metadata(node)
     description, description_truncated = _cap_description(
         node.get("description") if include_description else None,
         description_limit,
@@ -1226,6 +1245,8 @@ def _to_compact_detail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
         state=node["state"],
+        merged_at=merged_at,
+        merged_by=merged_by,
         draft=node["draft"],
         author=author["username"] if author else "",
         source_branch=node["sourceBranch"],

@@ -40,6 +40,7 @@ error. A list uses the same scan, cursor, and output budget as a single value.
 
 | Tool | Description |
 | --- | --- |
+| `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. |
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
 | `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
