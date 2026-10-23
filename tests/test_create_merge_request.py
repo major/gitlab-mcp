@@ -9,7 +9,8 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_CREATE_ASSIGNEES, mcp
+from gitlab_mcp.server import mcp
+from gitlab_mcp.tools.mr_create import MAX_CREATE_ASSIGNEES
 from mcp_helpers import call_tool as call_mcp_tool
 
 API = "https://gitlab.example.com/api/v4"
