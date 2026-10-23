@@ -121,12 +121,13 @@ def _unknown_result(exc: ToolError) -> DescriptionEditResult:
     return DescriptionEditResult(status="unknown", warning=f"{str(exc).rstrip('.')}. {UNKNOWN_WARNING}")
 
 
-async def _write_edit(write: Awaitable[object], before: str, after: str) -> DescriptionEditResult:
+async def _write_edit(write: Awaitable[object], before: str, after: str, return_diff: bool) -> DescriptionEditResult:
     """Send one write once and turn its outcome into a result. Writes are never retried.
 
     A network error or a 5xx can happen after GitLab saved the change, so those
     are `unknown`. A 4xx or a GraphQL payload error means GitLab refused the
-    change, so it is `failed`.
+    change, so it is `failed`. When `return_diff` is false, the changed lines are
+    not computed.
     """
     try:
         await write
@@ -138,7 +139,7 @@ async def _write_edit(write: Awaitable[object], before: str, after: str) -> Desc
         return DescriptionEditResult(status="failed", warning=str(exc))
     except GitLabGraphQLError as exc:
         return DescriptionEditResult(status="failed", warning=str(exc))
-    changed, truncated = _changed_lines(before, after)
+    changed, truncated = _changed_lines(before, after) if return_diff else ("", False)
     return DescriptionEditResult(
         status="applied",
         changed_lines=changed,
@@ -147,17 +148,18 @@ async def _write_edit(write: Awaitable[object], before: str, after: str) -> Desc
     )
 
 
-async def edit_merge_request_description(
+async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argument is part of the helper API.
     client: GitLabClient,
     project: str,
     iid: int,
     old_text: str,
     new_text: str,
+    return_diff: bool = True,
 ) -> DescriptionEditResult:
     """Replace one exact match of `old_text` in a merge request's description.
 
     The full description is read first, so nothing is cut before the write. A null
-    description counts as empty.
+    description counts as empty. Set `return_diff` to false to omit changed lines.
 
     Raises:
         ToolError: Before any write, when `old_text` is empty, equals `new_text`,
@@ -168,7 +170,7 @@ async def edit_merge_request_description(
     merge_request = await client.get(path)
     before = merge_request.get("description") or ""
     after = _replace_exactly_once(before, old_text, new_text)
-    return await _write_edit(client.request("PUT", path, json={"description": after}), before, after)
+    return await _write_edit(client.request("PUT", path, json={"description": after}), before, after, return_diff)
 
 
 async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument is part of the tool API.
@@ -178,11 +180,13 @@ async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument 
     old_text: str,
     new_text: str,
     scope: WorkItemScope = "project",
+    return_diff: bool = True,
 ) -> DescriptionEditResult:
     """Replace one exact match of `old_text` in a work item's description.
 
     The work-item global ID and the full description come from
-    `read_work_item_for_edit`, so nothing is cut before the write.
+    `read_work_item_for_edit`, so nothing is cut before the write. Set
+    `return_diff` to false to omit changed lines.
 
     Raises:
         ToolError: Before any write, when `old_text` is empty, equals `new_text`,
@@ -193,4 +197,4 @@ async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument 
     after = _replace_exactly_once(source.description, old_text, new_text)
     variables = {"input": {"id": source.id, "descriptionWidget": {"description": after}}}
     write = client.mutate(WORK_ITEM_UPDATE_MUTATION, variables, "workItemUpdate")
-    return await _write_edit(write, source.description, after)
+    return await _write_edit(write, source.description, after, return_diff)

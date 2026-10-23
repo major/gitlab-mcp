@@ -3728,21 +3728,24 @@ async def list_work_item_notes(  # noqa: PLR0913, PLR0917 - each argument is a u
 @mcp.tool(
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
 )
-async def edit_merge_request_description(
+async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argument is a user-facing edit option.
     ctx: Context,
     project: Project,
     iid: Iid,
     old_text: Annotated[str, Field(description="Text that must appear exactly once in the description.")],
     new_text: Annotated[str, Field(description="Replacement text. Empty text deletes the match.")],
+    return_diff: Annotated[bool, Field(description="False omits changed lines. Defaults to true.")] = True,
 ) -> _description_edits.DescriptionEditResult:
     """Replace one exact text match, like a guarded `glab api --method PUT projects/:id/merge_requests/:iid`.
 
     The full description is read and written, and replacement cannot be automatically undone. `old_text` must match
     exactly once, including overlapping matches. GitLab has no compare-and-swap, so a concurrent edit may be
     overwritten. Require explicit user `APPROVE` before writing. Writes are never retried. `status` is `applied`,
-    `failed`, or `unknown`; re-read before retrying unknown.
+    `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit changed lines.
     """
-    return await _description_edits.edit_merge_request_description(get_client(ctx), project, iid, old_text, new_text)
+    return await _description_edits.edit_merge_request_description(
+        get_client(ctx), project, iid, old_text, new_text, return_diff
+    )
 
 
 @mcp.tool(
@@ -3755,6 +3758,7 @@ async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument 
     old_text: Annotated[str, Field(description="Text that must appear exactly once in the description.")],
     new_text: Annotated[str, Field(description="Replacement text. Empty text deletes the match.")],
     scope: _work_items.WorkItemScope = "project",
+    return_diff: Annotated[bool, Field(description="False omits changed lines. Defaults to true.")] = True,
 ) -> _description_edits.DescriptionEditResult:
     """Replace one exact text match with the `glab api graphql` WorkItemUpdate equivalent.
 
@@ -3763,6 +3767,8 @@ async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument 
     exactly once, including overlapping matches. The replacement cannot be automatically undone. GitLab has no
     compare-and-swap, so a concurrent edit may be overwritten. Require explicit user `APPROVE` before writing. Writes
     are never retried. `status` is `applied`,
-    `failed`, or `unknown`; re-read before retrying unknown.
+    `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit changed lines.
     """
-    return await _description_edits.edit_work_item_description(get_client(ctx), project, iid, old_text, new_text, scope)
+    return await _description_edits.edit_work_item_description(
+        get_client(ctx), project, iid, old_text, new_text, scope, return_diff
+    )
