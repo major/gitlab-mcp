@@ -17,8 +17,7 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
 DIFFS_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187/diffs"
-HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA from GitLab. Output keeps the first 12 characters.
-SHORT_HEAD_SHA = "6096f2d5a1b2"
+HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA. Write tools need it exact, so output keeps all of it.
 HEAD_REFS = {"headSha": HEAD_SHA}
 BIG = "x" * 15000  # Three of these do not fit in one DIFF_BUDGET, but two do.
 DEFAULT_DIFF = "@@ -1 +1 @@\n-old\n+new\n"
@@ -145,7 +144,7 @@ async def test_file_list_mode_maps_diff_stats_and_head_sha(gitlab_env, arguments
     assert sent_variables(graphql) == [{"fullPath": PROJECT, "iid": str(IID)}]
     assert [call.request.url.path for call in respx.calls] == ["/api/graphql"]
     assert data == {
-        "head_sha": SHORT_HEAD_SHA,
+        "head_sha": HEAD_SHA,
         "files": [
             {"path": "a.py", "additions": 3, "deletions": 1},
             {"path": "docs/b.md", "additions": 0, "deletions": 7},
@@ -157,7 +156,7 @@ async def test_file_list_mode_maps_diff_stats_and_head_sha(gitlab_env, arguments
     ("diff_refs", "stats", "expected"),
     [
         (None, None, {}),  # GitLab has no head SHA and no stats, so both fields are left out.
-        (HEAD_REFS, None, {"head_sha": SHORT_HEAD_SHA}),
+        (HEAD_REFS, None, {"head_sha": HEAD_SHA}),
     ],
 )
 @respx.mock
@@ -225,7 +224,7 @@ async def test_path_matches_new_or_old_path(gitlab_env, requested, expected_path
     # Assert
     assert paths_of(data) == expected_paths
     assert data.get("paths_not_found", []) == expected_not_found
-    assert data["head_sha"] == SHORT_HEAD_SHA
+    assert data["head_sha"] == HEAD_SHA
 
 
 @pytest.mark.parametrize(

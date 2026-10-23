@@ -14,8 +14,7 @@ from gitlab_mcp.server import DESCRIPTION_CAP, THREAD_INDEX_CAP, mcp
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
-HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA from GitLab. Output keeps the first 12 characters.
-SHORT_HEAD_SHA = "6096f2d5a1b2"
+HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA. Write tools need it exact, so output keeps all of it.
 POSITION = {"oldPath": "docs/sop.md", "newPath": "docs/sop.md", "oldLine": None, "newLine": 212}
 RENAMED_POSITION = {"oldPath": "docs/old.md", "newPath": "docs/new.md", "oldLine": None, "newLine": 3}
 DELETED_LINE_POSITION = {"oldPath": "docs/sop.md", "newPath": "docs/sop.md", "oldLine": 40, "newLine": None}
@@ -131,7 +130,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "author": "bkearney",
         "source_branch": "feat/rebuild",
         "target_branch": "main",
-        "head_sha": SHORT_HEAD_SHA,
+        "head_sha": HEAD_SHA,
         "description": "Adds the rebuild flag.",
         "merge_status": "discussions_not_resolved",
         "should_be_rebased": True,

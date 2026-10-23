@@ -115,8 +115,6 @@ THREAD_CUT_MARKER = " [truncated]"
 THREAD_BODY_BUDGET = 30000
 # Discussion GIDs start with this. Output IDs are bare SHAs, so the prefix is only stripped from input.
 DISCUSSION_PREFIX = "gid://gitlab/Discussion/"
-# head_sha is cut to this many characters in output. Twelve is enough to find a commit.
-SHORT_SHA = 12
 # Maps each state filter to the thread status it keeps. "all" keeps every status.
 STATE_STATUS = {"open": "open", "resolved": "resolved", "comments": "comment"}
 
@@ -606,9 +604,12 @@ async def _fetch_merge_request(
     return node
 
 
-def _short_head_sha(diff_refs: dict[str, Any] | None) -> str:
-    """Return the first `SHORT_SHA` characters of the head commit. Null diffRefs means unknown, so it is empty."""
-    return diff_refs["headSha"][:SHORT_SHA] if diff_refs else ""
+def _head_sha(diff_refs: dict[str, Any] | None) -> str:
+    """Return the full head commit SHA. Null diffRefs means unknown, so it is empty.
+
+    The full SHA is kept on purpose. Write tools send it back as a guard, and GitLab compares it exactly.
+    """
+    return diff_refs["headSha"] if diff_refs else ""
 
 
 def _to_detail(node: dict[str, Any], *, include_description: bool) -> MergeRequestDetail:
@@ -629,7 +630,7 @@ def _to_detail(node: dict[str, Any], *, include_description: bool) -> MergeReque
         author=author["username"] if author else "",
         source_branch=node["sourceBranch"],
         target_branch=node["targetBranch"],
-        head_sha=_short_head_sha(node["diffRefs"]),
+        head_sha=_head_sha(node["diffRefs"]),
         description=description,
         description_truncated=description_truncated,
         merge_status=_lower(node["detailedMergeStatus"]),
@@ -979,7 +980,7 @@ async def get_merge_request_diff(
     # Decode the cursor before any request, so a bad one fails fast. The file list ignores it.
     start = _diff_cursor_start(cursor) if wanted and cursor is not None else (1, 0)
     node = await _fetch_merge_request(client, DIFF_FILES_QUERY, project, iid)
-    head_sha = _short_head_sha(node["diffRefs"])
+    head_sha = _head_sha(node["diffRefs"])
 
     if not wanted:
         return MergeRequestDiff(head_sha=head_sha, files=_to_file_stats(node["diffStats"]))

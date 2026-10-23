@@ -8,7 +8,7 @@ and self-managed GitLab, and it talks to the REST API directly, so you do
 
 | Variable         | Required | Default              | Notes                                         |
 | ---------------- | -------- | -------------------- | --------------------------------------------- |
-| `GITLAB_TOKEN`   | yes      |                      | Access token with `read_api` or `api` scope   |
+| `GITLAB_TOKEN`   | yes      |                      | `read_api` for read tools, `api` for write    |
 | `GITLAB_URL`     | no       | `https://gitlab.com` | Instance URL; a trailing `/api/v4` is fine    |
 | `GITLAB_TIMEOUT` | no       | `30`                 | Request timeout in seconds                    |
 
