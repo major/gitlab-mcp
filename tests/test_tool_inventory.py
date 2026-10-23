@@ -80,6 +80,50 @@ async def test_server_instructions_describe_the_review_workflow(gitlab_env):
     assert "explicit APPROVE before posting" in instructions
 
 
+async def test_server_instructions_list_real_main_arguments(gitlab_env):
+    """Every argument named in the instructions' main-argument summary exists on its tool."""
+    # Arrange
+    summary_args = {
+        "get_merge_request_threads": {"project", "iid", "iids", "state", "view", "count_only", "cursor"},
+        "post_review_notes": {"project", "iid", "head_sha", "notes", "add_reviewers", "add_assignees", "validate_only"},
+        "update_merge_request": {
+            "project",
+            "iid",
+            "add_reviewers",
+            "remove_reviewers",
+            "add_assignees",
+            "remove_assignees",
+            "add_labels",
+            "remove_labels",
+            "add_blocked_by",
+            "remove_blocked_by",
+            "approve",
+            "sha",
+            "rebase",
+        },
+    }
+
+    # Act
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        instructions = client.instructions or ""
+
+    # Assert
+    for name, args in summary_args.items():
+        assert f"{name}(" in instructions
+        assert args <= set(tools[name].input_schema["properties"])
+
+
+def _schema_property_names(schema: object) -> set[str]:
+    """Collect every property name in a JSON schema, including nested item and `$defs` schemas."""
+    if isinstance(schema, list):
+        return {name for item in schema for name in _schema_property_names(item)}
+    if not isinstance(schema, dict):
+        return set()
+    names = set(schema.get("properties", {}))
+    return names | {name for value in schema.values() for name in _schema_property_names(value)}
+
+
 async def test_server_instruction_tool_references_are_registered(gitlab_env):
     """Every named tool in the server instructions exists in the registered catalog."""
     # Arrange / Act
@@ -89,11 +133,9 @@ async def test_server_instruction_tool_references_are_registered(gitlab_env):
 
     assert instructions is not None
     registered_names = {tool.name for tool in listed}
-    # Argument names such as validate_only and include_description are not tool names.
-    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - {
-        "validate_only",
-        "include_description",
-    }
+    # Argument names such as validate_only, and nested ones such as old_line inside notes, are not tool names.
+    argument_names = {name for tool in listed for name in _schema_property_names(tool.input_schema)}
+    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - argument_names
 
     # Assert
     assert referenced_names <= registered_names, (
