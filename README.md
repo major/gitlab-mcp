@@ -46,6 +46,7 @@ Example MCP client config:
 | `get_merge_request_threads` | `glab mr note list` / `glab mr view --comments` | `{"threads", "next_cursor", "not_found_ids"}`                        |
 | `reply_to_thread`           | `glab mr note create --reply` / `glab mr note resolve` | Reply, resolve-only, or reply then resolve; `{"thread_id", "note_id?", "resolved?", "warning?"}` |
 | `get_merge_request_diff`    | `glab mr diff`                                  | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}` |
+| `post_review_notes`         | GitLab diff discussion API                      | Per-note `posted`, `failed`, `unknown`, `unverified`, or `unattempted` status |
 | `land_merge_request`        | `glab mr merge`                                 | `{"result", "state", "merge_status", ...}`                           |
 | `update_merge_request`      | `glab mr update` / `approve` / `rebase`         | `{"applied", "pending", "unknown", "failed", ...}`                   |
 
@@ -57,6 +58,38 @@ Get user approval before posting a reply or resolving a thread. Replying and
 resolving are two GitLab writes. If a reply succeeds but resolution fails, the
 result includes a warning. Check the thread before retrying, and do not repost
 the reply.
+
+For a compact unresolved thread index, use
+`get_merge_request_threads(project="group/project", iid=36, state="open", view="headings")`.
+Read selected threads with `ids=["<thread ID>"]` and `view="full"`.
+Full thread IDs select exact threads and override `state`. When
+continuing with a cursor, repeat the same filters, `view`, and `max_body_chars`. A thread heading is its
+first Markdown heading, or its first nonempty line if there is no heading,
+limited to 160 characters.
+
+`update_merge_request(add_reviewers=["username"])` appends reviewers and keeps
+existing reviewers. Do not use `PUT reviewer_ids` to append reviewers, because it
+can replace the existing list.
+
+`post_review_notes` posts inline review notes. Pass
+`post_review_notes(project="group/project", iid=36, head_sha="<full SHA>",
+notes=[{"file": "src/file.py", "line": 12, "body_path": "/absolute/path/note.txt"}])`.
+Use the full 40-character `head_sha` from the diff you reviewed, and post no
+more than 20 notes per call. `file` must be an old or new diff path. Supply
+exactly one of `line` or `old_line`, and exactly one of inline `body` or
+`body_path`. A body file must be an absolute, server-local path to a regular
+UTF-8 file no larger than 100000 bytes. Use `body` for inline text instead.
+
+All notes are preflighted before any writes. Diff paths are checked across all
+available pages, up to five. If GitLab reports more pages at that limit, the
+scan is incomplete and no notes are posted. Scanning all available pages also
+checks for duplicate old or new path matches. The tool rechecks the diff head
+before posting, but this is not atomic with the writes. Notes are posted
+sequentially, and the first failure stops the call. Results report each note's
+status (`posted`, `failed`, `unknown`, `unverified`, or `unattempted`) and its
+GitLab ID and position when available. Get explicit user `APPROVE` before
+posting. Never blindly retry `unknown` or `unverified` notes, and do not repost
+notes already marked `posted`.
 
 `list_merge_requests` needs a token with the `read_api` scope. Pass `project`
 as the full path, like `group/subgroup/project`, not the numeric ID or the

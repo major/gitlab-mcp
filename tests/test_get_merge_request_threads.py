@@ -11,11 +11,14 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_PAGES, NOTE_CAP, mcp
+from gitlab_mcp.server import MAX_PAGES, NOTE_CAP, THREAD_HEADING_BUDGET, THREAD_HEADING_CAP, mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
+HEADING_THREADS_PER_PAGE = 50
+HEADING_PAGE_COUNT = 4
+HEADING_THREAD_COUNT = HEADING_THREADS_PER_PAGE * HEADING_PAGE_COUNT
 
 
 def gid(thread_id: str) -> str:
@@ -154,6 +157,136 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
             },
         ],
     }
+
+
+@respx.mock
+async def test_headings_view_uses_root_markdown_heading_and_location(gitlab_env):
+    """Headings view returns the root note summary without bodies or replies."""
+    # Arrange
+    root = make_note(
+        "Introduction\n\n## Replace parser ###\nDetails\n<!-- review-bot:finding hidden detail -->",
+        author="root-author",
+        position={"oldPath": "src/parser.py", "newPath": "src/parser.py", "oldLine": 18, "newLine": None},
+    )
+    reply = make_note("## Reply heading\nReply body", author="reply-author")
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", root, reply))))
+
+    # Act
+    data = await call_tool(view="headings")
+
+    # Assert
+    assert data["threads"] == [
+        {
+            "id": "t1",
+            "status": "open",
+            "path": "src/parser.py",
+            "old_line": 18,
+            "by": "root-author",
+            "heading": "Replace parser",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("  \n First useful line \nAnother line", "First useful line"),
+        ("# " + "x" * 180, "x" * 160),
+        ("<!-- review-bot:finding only marker -->", ""),
+    ],
+    ids=["first-nonempty-line", "heading-cap", "stripped-review-marker"],
+)
+@respx.mock
+async def test_headings_view_falls_back_and_caps_heading(gitlab_env, body, expected):
+    """Without a Markdown heading, headings view uses the first nonempty line and caps it."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", make_note(body)))))
+
+    # Act
+    data = await call_tool(view="headings")
+
+    # Assert
+    assert data["threads"][0]["heading"] == expected
+
+
+@respx.mock
+async def test_headings_view_keeps_default_open_state_filter(gitlab_env):
+    """Open state still excludes resolved, plain-comment, and system-only discussions in headings view."""
+    # Arrange
+    respx.post(GRAPHQL).mock(
+        return_value=respond(
+            page(
+                make_discussion("open"),
+                make_discussion("resolved", resolved=True),
+                make_discussion("comment", resolvable=False),
+                make_discussion("system", make_note(system=True)),
+            ),
+        ),
+    )
+
+    # Act
+    data = await call_tool(state="open", view="headings")
+
+    # Assert
+    assert thread_ids(data) == ["open"]
+
+
+@respx.mock
+async def test_headings_view_reduces_serialized_size_by_at_least_seventy_percent(gitlab_env):
+    """Compact root headings omit large reply bodies and substantially reduce output size."""
+    # Arrange
+    notes = [make_note(f"## Root summary\n{'x' * 5000}", author="root")]
+    notes.extend(make_note(f"Reply {'y' * 5000}", author="reply") for _ in range(11))
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("large", *notes))))
+
+    # Act
+    full = await call_tool()
+    headings = await call_tool(view="headings")
+
+    # Assert
+    full_size = len(json.dumps(full["threads"], separators=(",", ":")))
+    headings_size = len(json.dumps(headings["threads"], separators=(",", ":")))
+    assert headings_size * 10 <= full_size * 3
+    assert headings["threads"][0]["heading"] == "Root summary"
+    assert "notes" not in headings["threads"][0]
+
+
+@respx.mock
+async def test_headings_view_budget_cursor_resumes_without_gaps(gitlab_env):
+    """The compact output budget returns a cursor and resumes at the exact next thread."""
+    # Arrange
+    discussions = [
+        make_discussion(f"t{index}", make_note("# " + str(index).ljust(180, "x")))
+        for index in range(HEADING_THREAD_COUNT)
+    ]
+    pages = {
+        None if page_index == 0 else f"c{page_index}": page(
+            *discussions[page_index * HEADING_THREADS_PER_PAGE : (page_index + 1) * HEADING_THREADS_PER_PAGE],
+            has_next=page_index < HEADING_PAGE_COUNT - 1,
+            end_cursor=f"c{page_index + 1}",
+        )
+        for page_index in range(HEADING_PAGE_COUNT)
+    }
+    route = respx.post(GRAPHQL).mock(side_effect=serve(pages))
+
+    # Act
+    gathered: list[str] = []
+    cursor = None
+    calls = 0
+    while True:
+        data = await call_tool(view="headings", cursor=cursor)
+        calls += 1
+        assert len(json.dumps(data["threads"], separators=(",", ":"))) <= THREAD_HEADING_BUDGET
+        gathered.extend(thread_ids(data))
+        if not data.get("next_cursor"):
+            break
+        cursor = data["next_cursor"]
+
+    # Assert
+    assert calls > 1
+    assert len(requested_afters(route)) > HEADING_PAGE_COUNT
+    assert gathered == [f"t{index}" for index in range(HEADING_THREAD_COUNT)]
+    assert all(len(thread["heading"]) <= THREAD_HEADING_CAP for thread in data["threads"])
 
 
 @respx.mock

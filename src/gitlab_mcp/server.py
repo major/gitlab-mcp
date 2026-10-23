@@ -2,16 +2,19 @@
 
 import base64
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal
+from pathlib import Path
+from typing import Annotated, Any, Literal, NoReturn
 from urllib.parse import quote
 lazy from collections.abc import AsyncIterator, Awaitable, Sequence
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.config import ConfigError, Settings
@@ -155,6 +158,10 @@ THREAD_CUT_MARKER = " [truncated]"
 REVIEW_BOT_FINDING_PATTERN = re.compile(r"<!-- review-bot:finding\s(?:(?!-->|<!--).)*-->\s*$", re.DOTALL)
 # Total characters of note bodies that one thread call may return. Keeps one tool result small.
 THREAD_BODY_BUDGET = 30000
+# Serialized character budget for compact heading results.
+THREAD_HEADING_BUDGET = 30000
+# Headings are capped so one unusually long note cannot dominate a compact result.
+THREAD_HEADING_CAP = 160
 # Discussion GIDs start with this. Output IDs are bare SHAs, so the prefix is only stripped from input.
 DISCUSSION_PREFIX = "gid://gitlab/Discussion/"
 # Maps each state filter to the thread status it keeps. "all" keeps every status.
@@ -164,6 +171,9 @@ STATE_STATUS = {"open": "open", "resolved": "resolved", "comments": "comment"}
 DIFF_BUDGET = 40000
 # Files per page of the REST diffs endpoint, the largest page GitLab serves.
 DIFF_PAGE_SIZE = 100
+# Bodies are small enough to bound memory and request size, including file-backed notes.
+REVIEW_NOTE_BODY_CAP = 100000
+DIFF_HUNK_PATTERN = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 # A Literal is sent to the agent as an enum, so this type replaces a separate
 # "list states" tool.
@@ -339,6 +349,7 @@ class ThreadIndex(BaseModel):
 
 # "comment" means the discussion cannot be resolved, like a plain MR comment.
 ThreadStatus = Literal["open", "resolved", "comment"]
+ThreadView = Literal["full", "headings"]
 
 
 class Note(BaseModel):
@@ -358,10 +369,22 @@ class Thread(ThreadLocation):
     notes_truncated: bool = Field(default=False, exclude_if=lambda v: not v)  # More than 50 notes exist.
 
 
+class ThreadHeading(BaseModel):
+    """A compact thread summary with its root note heading."""
+
+    id: str
+    status: ThreadStatus
+    path: str = Field(default="", exclude_if=lambda v: not v)
+    line: int = Field(default=0, exclude_if=lambda v: not v)
+    old_line: int = Field(default=0, exclude_if=lambda v: not v)
+    by: str = Field(default="", exclude_if=lambda v: not v)
+    heading: str
+
+
 class ThreadList(BaseModel):
     """One page of threads."""
 
-    threads: list[Thread]
+    threads: list[Thread | ThreadHeading]
     next_cursor: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the scan finished.
     not_found_ids: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
 
@@ -406,6 +429,66 @@ class FileDiff(BaseModel):
     generated: bool = Field(default=False, exclude_if=lambda v: not v)
     collapsed: bool = Field(default=False, exclude_if=lambda v: not v)
     too_large: bool = Field(default=False, exclude_if=lambda v: not v)
+
+
+def _raise_review_preflight_error(message: str, *, cause: BaseException | None = None) -> NoReturn:
+    """Stop review-note processing with a caller-facing validation reason."""
+    if cause is None:
+        raise ValueError(message)
+    raise ValueError(message) from cause
+
+
+class ReviewNote(BaseModel):
+    """One note to post on a changed line in a merge request."""
+
+    file: str = Field(min_length=1, description="Exact old or new path in the merge request diff.")
+    line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
+        default=None,
+        description="Positive line number on the new side. Set this or old_line, but not both.",
+    )
+    old_line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
+        default=None,
+        description="Positive line number on the old side. Set this or line, but not both.",
+    )
+    body: str | None = Field(
+        default=None,
+        description="Nonblank inline text, up to 100000 UTF-8 bytes. Set this or body_path, but not both.",
+    )
+    body_path: str | None = Field(
+        default=None,
+        description="Absolute server-local UTF-8 file path, up to 100000 bytes. Set this or body, but not both.",
+    )
+
+    @model_validator(mode="after")
+    def validate_sources_and_location(self) -> ReviewNote:
+        """Require exactly one line side and exactly one body source."""
+        if not self.file.strip():
+            _raise_review_preflight_error("file must not be blank")
+        if (self.line is None) == (self.old_line is None):
+            _raise_review_preflight_error("Set exactly one of line or old_line")
+        if (self.body is None) == (self.body_path is None):
+            _raise_review_preflight_error("Set exactly one of body or body_path")
+        return self
+
+
+ReviewNoteStatus = Literal["posted", "failed", "unknown", "unverified", "unattempted"]
+
+
+class ReviewNotePostResult(BaseModel):
+    """The outcome for one note in a sequential review-note batch."""
+
+    index: int
+    status: ReviewNoteStatus
+    note_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    discussion_id: str = Field(default="", exclude_if=lambda value: not value)
+    position: dict[str, str | int] = Field(default_factory=dict, exclude_if=lambda value: not value)
+
+
+class PostReviewNotesResult(BaseModel):
+    """One bounded result per requested note and a reason when the batch stops."""
+
+    results: list[ReviewNotePostResult]
+    warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
 class MergeRequestDiff(BaseModel):
@@ -1032,14 +1115,29 @@ def _thread_status(discussion: dict[str, Any]) -> ThreadStatus:
 
 def _cap_note_body(body: str, max_body_chars: int = NOTE_CAP) -> str:
     """Remove a trailing review finding, then cap the remaining note body."""
-    finding = REVIEW_BOT_FINDING_PATTERN.search(body)
-    if finding:
-        body = body[: finding.start()].rstrip()
+    body = _strip_trailing_finding(body)
     if max_body_chars == 0:
         return ""
     if len(body) <= max_body_chars:
         return body
     return body[:max_body_chars] + THREAD_CUT_MARKER
+
+
+def _strip_trailing_finding(body: str) -> str:
+    """Remove a well-formed trailing review-bot finding marker from a note body."""
+    finding = REVIEW_BOT_FINDING_PATTERN.search(body)
+    return body[: finding.start()].rstrip() if finding else body
+
+
+def _thread_heading(body: str) -> str:
+    """Return the first Markdown heading, or the first nonempty line, capped at 160 characters."""
+    body = _strip_trailing_finding(body)
+    markdown_heading = re.search(r"(?m)^[ \t]{0,3}#{1,6}(?:[ \t]+|$)(.*)$", body)
+    if markdown_heading:
+        heading = re.sub(r"[ \t]+#+[ \t]*$", "", markdown_heading.group(1)).strip()
+        if heading:
+            return heading[:THREAD_HEADING_CAP]
+    return next((line.strip()[:THREAD_HEADING_CAP] for line in body.splitlines() if line.strip()), "")
 
 
 def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Note:
@@ -1069,6 +1167,21 @@ def _to_thread(discussion: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Th
         # GitLab only returns the first 50 notes, so more may exist.
         notes_truncated=notes["pageInfo"]["hasNextPage"],
         **_position_fields(human[0]["position"]),
+    )
+
+
+def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHeading:
+    """Convert a thread to a summary based only on its first human note."""
+    root_note = next(note for note in discussion["notes"]["nodes"] if not note["system"])
+    author = root_note["author"]  # A deleted or banned author comes back as null.
+    return ThreadHeading(
+        id=thread.id,
+        status=thread.status,
+        path=thread.path,
+        line=thread.line,
+        old_line=thread.old_line,
+        by=author["username"] if author else "",
+        heading=_thread_heading(root_note["body"]),
     )
 
 
@@ -1102,7 +1215,8 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     thread_filter: _ThreadFilter,
     start: tuple[str | None, int],
     max_body_chars: int = NOTE_CAP,
-) -> tuple[list[Thread], str, set[str]]:
+    view: ThreadView = "full",
+) -> tuple[list[Thread | ThreadHeading], str, set[str]]:
     """Read discussion pages from `start` and collect the matching threads.
 
     The scan stops at the budget, at `MAX_PAGES`, or at the last page. Returns
@@ -1110,9 +1224,9 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     and every discussion ID that was read, matching or not.
     """
     after, skip = start
-    threads: list[Thread] = []
+    threads: list[Thread | ThreadHeading] = []
     seen: set[str] = set()
-    body_chars = 0
+    output_size = 2 if view == "headings" else 0  # Count the serialized list brackets.
     for _ in range(MAX_PAGES):
         node = await _fetch_merge_request(client, THREADS_QUERY, project, iid, after=after)
         connection = node["discussions"]
@@ -1122,12 +1236,18 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
             thread = _to_thread(nodes[index], max_body_chars=max_body_chars)
             if thread is None or not thread_filter.matches(thread):
                 continue
-            size = sum(len(note.body) for note in thread.notes)
+            output_thread = thread if view == "full" else _to_thread_heading(nodes[index], thread)
+            size = (
+                sum(len(note.body) for note in thread.notes)
+                if view == "full"
+                else len(output_thread.model_dump_json()) + (1 if threads else 0)
+            )
+            budget = THREAD_BODY_BUDGET if view == "full" else THREAD_HEADING_BUDGET
             # Always return at least one thread, even when that thread alone is over budget.
-            if threads and body_chars + size > THREAD_BODY_BUDGET:
+            if threads and output_size + size > budget:
                 return threads, _encode_cursor({"after": after, "skip": index}), seen
-            threads.append(thread)
-            body_chars += size
+            threads.append(output_thread)
+            output_size += size
         page_info = connection["pageInfo"]
         if not page_info["hasNextPage"]:
             return threads, "", seen
@@ -1145,13 +1265,14 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     ids: Annotated[list[str] | None, Field(description="Thread IDs from threads.open. Ignores state.")] = None,
     file: Annotated[str | None, Field(description="Only threads on this path, old or new.")] = None,
     author: Annotated[str | None, Field(description="Only threads with a note by this user.")] = None,
+    view: Annotated[ThreadView, Field(description="`full` notes, or compact root-note `headings`.")] = "full",
     max_body_chars: Annotated[
         int,
         Field(ge=0, le=NOTE_CAP, description="Maximum body characters per note. Zero omits bodies."),
     ] = NOTE_CAP,
     cursor: Annotated[
         str | None,
-        Field(description="next_cursor from an earlier call. Repeat the filters and max_body_chars."),
+        Field(description="next_cursor from an earlier call. Repeat the filters, view, and max_body_chars."),
     ] = None,
 ) -> ThreadList:
     """Read review thread notes, with filters and a size budget. Like `glab mr note list`.
@@ -1159,10 +1280,13 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     - `state`: `open` (default), `resolved`, `comments` (cannot be resolved), or `all`. `ids` ignore `state`.
     - System notes and threads with no human notes are skipped.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
-    - `notes_truncated`: over 50 notes, so `author` can miss a late reply.
+    - In full view, `notes_truncated` means over 50 notes exist, so the `author` filter can miss a late reply.
     - Trailing `review-bot:finding` comments are removed.
-    - Note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits body text. A call returns
-      about 30000 body characters. Continue with `next_cursor` using the same filters and `max_body_chars`.
+    - `view="headings"` returns only thread details and the root human note's first Markdown heading, or its first
+      nonempty line. Headings are capped at 160 characters. It includes no note bodies or replies.
+    - In full view, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits body text. A
+      call returns about 30000 body characters. Headings view returns about 30000 serialized characters. Continue
+      with `next_cursor` using the same filters, `view`, and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
     """
     client = get_client(ctx)
@@ -1170,7 +1294,7 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     # An empty list means no IDs were given, so the state filter applies.
     wanted = _bare_ids(ids) if ids else None
     thread_filter = _ThreadFilter(state=state, ids=wanted, file=file, author=author)
-    threads, next_cursor, seen = await _scan_threads(client, project, iid, thread_filter, start, max_body_chars)
+    threads, next_cursor, seen = await _scan_threads(client, project, iid, thread_filter, start, max_body_chars, view)
 
     # A resumed call did not read the first page, so it cannot prove an ID is missing.
     not_found_ids: list[str] = []
@@ -1388,6 +1512,400 @@ async def get_merge_request_diff(
     # A resumed call did not read the first page, so it cannot prove a path is missing.
     not_found = [path for path in wanted if path not in matched] if cursor is None and not next_cursor else []
     return MergeRequestDiff(head_sha=head_sha, diffs=diffs, next_cursor=next_cursor, paths_not_found=not_found)
+
+
+def _full_sha(value: Any) -> bool:
+    """Return whether a value is exactly a 40-character hexadecimal commit SHA."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+
+
+def _unattempted_review_notes(count: int, warning: str) -> PostReviewNotesResult:
+    """Build a result row for every note when preflight stops before posting."""
+    return PostReviewNotesResult(
+        results=[ReviewNotePostResult(index=index, status="unattempted") for index in range(count)],
+        warning=warning[:500],
+    )
+
+
+def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
+    """Read and validate every note body before the tool sends any GitLab request."""
+    bodies: list[str] = []
+    for index, note in enumerate(notes):
+        if note.body is not None:
+            body = note.body
+            size = len(body.encode("utf-8"))
+        else:
+            path = Path(note.body_path or "")
+            if not path.is_absolute():
+                _raise_review_preflight_error(f"note {index} body_path must be an absolute server-local path")
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    _raise_review_preflight_error(f"note {index} body_path must point to a regular file")
+                with os.fdopen(descriptor, "rb") as source:
+                    descriptor = -1
+                    encoded = source.read(REVIEW_NOTE_BODY_CAP + 1)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if len(encoded) > REVIEW_NOTE_BODY_CAP:
+                _raise_review_preflight_error(f"note {index} body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
+            try:
+                body = encoded.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                _raise_review_preflight_error(f"note {index} body_path is not valid UTF-8", cause=exc)
+            size = len(encoded)
+        if not body.strip():
+            _raise_review_preflight_error(f"note {index} body must not be blank")
+        if size > REVIEW_NOTE_BODY_CAP:
+            _raise_review_preflight_error(f"note {index} body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
+        bodies.append(body)
+    return bodies
+
+
+async def _get_review_diff_refs(client: GitLabClient, project: str, iid: int) -> dict[str, str]:
+    """Read the REST merge request SHA and the three diff reference SHAs."""
+    merge_request = await client.get(_mr_rest_path(project, iid))
+    if not isinstance(merge_request, dict):
+        _raise_review_preflight_error("GitLab returned an invalid merge request response")
+    refs = merge_request.get("diff_refs")
+    if not isinstance(refs, dict):
+        _raise_review_preflight_error("GitLab did not return merge request diff_refs")
+    state = {
+        "sha": merge_request.get("sha"),
+        "base_sha": refs.get("base_sha"),
+        "start_sha": refs.get("start_sha"),
+        "head_sha": refs.get("head_sha"),
+    }
+    if not all(_full_sha(value) for value in state.values()):
+        _raise_review_preflight_error("GitLab did not return full SHA values for the merge request and diff_refs")
+    return {key: str(value).lower() for key, value in state.items()}
+
+
+def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:  # noqa: C901, PLR0912 - unified diff parsing has distinct line cases.
+    """Parse unified diff hunks into line kinds and their old/new coordinates."""
+    positions: list[tuple[str, int | None, int | None]] = []
+    old_line = new_line = old_remaining = new_remaining = 0
+    in_hunk = False
+    saw_hunk = False
+
+    for content in diff.removesuffix("\n").split("\n"):
+        if content.startswith("@@"):
+            if in_hunk and (old_remaining or new_remaining):
+                _raise_review_preflight_error("diff has an incomplete unified hunk")
+            match = DIFF_HUNK_PATTERN.match(content)
+            if match is None:
+                _raise_review_preflight_error("diff contains an invalid unified hunk header")
+            old_line = int(match.group(1))
+            old_remaining = int(match.group(2) or 1)
+            new_line = int(match.group(3))
+            new_remaining = int(match.group(4) or 1)
+            in_hunk = saw_hunk = True
+            continue
+        if not in_hunk or content.startswith("\\"):
+            continue
+        if content.startswith(" "):
+            if old_remaining < 1 or new_remaining < 1:
+                _raise_review_preflight_error("diff contains more context lines than its hunk header")
+            positions.append(("context", old_line, new_line))
+            old_line += 1
+            new_line += 1
+            old_remaining -= 1
+            new_remaining -= 1
+        elif content.startswith("+"):
+            if new_remaining < 1:
+                _raise_review_preflight_error("diff contains more added lines than its hunk header")
+            positions.append(("added", None, new_line))
+            new_line += 1
+            new_remaining -= 1
+        elif content.startswith("-"):
+            if old_remaining < 1:
+                _raise_review_preflight_error("diff contains more removed lines than its hunk header")
+            positions.append(("removed", old_line, None))
+            old_line += 1
+            old_remaining -= 1
+        else:
+            _raise_review_preflight_error("diff contains an invalid line inside a unified hunk")
+
+    if in_hunk and (old_remaining or new_remaining):
+        _raise_review_preflight_error("diff has an incomplete unified hunk")
+    if not saw_hunk or not positions:
+        _raise_review_preflight_error("diff has no usable unified patch")
+    return positions
+
+
+def _review_position(raw: dict[str, Any], note: ReviewNote) -> dict[str, str | int | None]:
+    """Find the requested old- or new-side line in a file's unified patch."""
+    if raw.get("collapsed") or raw.get("too_large"):
+        _raise_review_preflight_error(f"diff for {note.file!r} is collapsed or too large to position safely")
+    diff = raw.get("diff")
+    if not isinstance(diff, str) or not diff:
+        _raise_review_preflight_error(f"diff for {note.file!r} has no usable patch")
+    locations = _diff_line_positions(diff)
+    matches = []
+    for kind, old_line, new_line in locations:
+        if note.line is not None and new_line == note.line and kind in ("added", "context"):
+            matches.append((old_line, new_line))
+        if note.old_line is not None and old_line == note.old_line and kind in ("removed", "context"):
+            matches.append((old_line, new_line))
+    if len(matches) != 1:
+        side = "new" if note.line is not None else "old"
+        line = note.line if note.line is not None else note.old_line
+        if matches:
+            _raise_review_preflight_error(f"line {line} on the {side} side is ambiguous in {note.file!r}")
+        _raise_review_preflight_error(f"line {line} on the {side} side is not a usable diff line in {note.file!r}")
+    old_path, new_path = raw.get("old_path"), raw.get("new_path")
+    if not isinstance(old_path, str) or not isinstance(new_path, str):
+        _raise_review_preflight_error(f"diff paths for {note.file!r} are invalid")
+    old_line, new_line = matches[0]
+    return {
+        "position_type": "text",
+        "old_path": old_path,
+        "new_path": new_path,
+        "old_line": old_line,
+        "new_line": new_line,
+    }
+
+
+async def _scan_review_paths(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    requested_paths: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Collect requested old/new paths from at most MAX_PAGES REST diff pages."""
+    path_matches: dict[str, list[dict[str, Any]]] = {path: [] for path in requested_paths}
+    page = 1
+    for _ in range(MAX_PAGES):
+        files, next_page = await _fetch_diff_page(client, project, iid, page)
+        for raw in files:
+            if not isinstance(raw, dict):
+                continue
+            for path in requested_paths:
+                if path in (raw.get("old_path"), raw.get("new_path")):
+                    path_matches[path].append(raw)
+        if next_page is None:
+            break
+        page = next_page
+
+    if next_page is not None:
+        _raise_review_preflight_error(f"Diff path scan is incomplete after {MAX_PAGES} pages. No notes were posted.")
+
+    missing = sorted(path for path, matches in path_matches.items() if not matches)
+    if missing:
+        _raise_review_preflight_error(
+            f"Diff preflight could not find requested path(s) within {MAX_PAGES} pages: {', '.join(missing)}"
+        )
+    ambiguous = sorted(path for path, matches in path_matches.items() if len(matches) != 1)
+    if ambiguous:
+        _raise_review_preflight_error(f"Diff preflight found ambiguous requested path(s): {', '.join(ambiguous)}")
+    return path_matches
+
+
+async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the preflight contract.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    head_sha: str,
+    notes: list[ReviewNote],
+    bodies: list[str],
+) -> tuple[list[tuple[str, dict[str, str | int | None]]], dict[str, str], str]:
+    """Validate every requested path and coordinate against a stable preflight snapshot."""
+    try:
+        refs = await _get_review_diff_refs(client, project, iid)
+        if refs["sha"] != head_sha.lower() or refs["head_sha"] != head_sha.lower():
+            return [], {}, "The supplied head_sha is stale. No notes were posted."
+        paths = await _scan_review_paths(client, project, iid, {note.file for note in notes})
+        prepared = [
+            (body, _review_position(paths[note.file][0], note)) for note, body in zip(notes, bodies, strict=True)
+        ]
+        current_refs = await _get_review_diff_refs(client, project, iid)
+        if current_refs != refs:
+            return [], {}, "The merge request or its diff refs changed during preflight. No notes were posted."
+    except (ToolError, OSError, ValueError, KeyError, TypeError) as exc:
+        return [], {}, f"Review-note preflight failed: {exc}. No notes were posted."
+    return prepared, refs, ""
+
+
+def _review_response_ids(response: Any) -> tuple[str, int | None, dict[str, Any] | None]:
+    """Extract IDs and the created root note position when the response has them."""
+    if not isinstance(response, dict):
+        return "", None, None
+    raw_discussion_id = response.get("id")
+    discussion_id = (
+        str(raw_discussion_id) if type(raw_discussion_id) is int or isinstance(raw_discussion_id, str) else ""
+    )
+    notes = response.get("notes")
+    if not isinstance(notes, list) or not notes or not isinstance(notes[0], dict):
+        return discussion_id, None, None
+    root = notes[0]
+    raw_note_id = root.get("id")
+    note_id = raw_note_id if type(raw_note_id) is int else None
+    position = root.get("position")
+    return discussion_id, note_id, position if isinstance(position, dict) else None
+
+
+def _review_response_position(
+    actual: dict[str, Any] | None,
+) -> dict[str, str | int]:
+    """Return the non-null fields of a response position in compact form."""
+    if actual is None:
+        return {}
+    keys = ("position_type", "base_sha", "start_sha", "head_sha", "old_path", "new_path", "old_line", "new_line")
+    return {
+        key: actual[key]
+        for key in keys
+        if key in actual and actual[key] is not None and isinstance(actual[key], (str, int))
+    }
+
+
+def _review_response_matches(
+    actual: dict[str, Any] | None,
+    expected: dict[str, str | int | None],
+) -> bool:
+    """Check that GitLab placed the note at the requested refs, paths, and coordinates."""
+    if actual is None:
+        return False
+    keys = ("position_type", "base_sha", "start_sha", "head_sha", "old_path", "new_path", "old_line", "new_line")
+    return all(
+        actual.get(key) is None
+        if expected.get(key) is None
+        else type(actual.get(key)) is type(expected[key]) and actual.get(key) == expected[key]
+        for key in keys
+    )
+
+
+async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument identifies one requested write.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    index: int,
+    body: str,
+    position: dict[str, str | int | None],
+) -> tuple[ReviewNotePostResult, str]:
+    """Post one note and verify the position returned for its created discussion."""
+    try:
+        response = await client.request(
+            "POST",
+            f"{_mr_rest_path(project, iid)}/discussions",
+            json={"body": body, "position": position},
+        )
+    except GitLabAPIError as exc:
+        if exc.status >= 500 or exc.status == 408:  # noqa: PLR2004 - these statuses can hide a committed write.
+            return (
+                ReviewNotePostResult(index=index, status="unknown"),
+                f"The post outcome is unknown: {exc} Check GitLab before retrying.",
+            )
+        return (
+            ReviewNotePostResult(index=index, status="failed"),
+            f"GitLab rejected the post: {exc} Check the item before retrying.",
+        )
+    except GitLabConnectionError as exc:
+        return (
+            ReviewNotePostResult(index=index, status="unknown"),
+            f"The post outcome is unknown: {exc} Check GitLab before retrying.",
+        )
+    except (TypeError, ValueError) as exc:
+        return (
+            ReviewNotePostResult(index=index, status="unverified"),
+            (
+                f"GitLab may have created the note, but its response could not be verified: {exc} Check GitLab "
+                "before retrying."
+            ),
+        )
+
+    discussion_id, note_id, actual_position = _review_response_ids(response)
+    compact_position = _review_response_position(actual_position)
+    if not discussion_id or note_id is None:
+        reason = "GitLab's successful response was missing the discussion or note ID."
+    elif not _review_response_matches(actual_position, position):
+        reason = "GitLab's returned position did not match the request."
+    else:
+        reason = ""
+    return (
+        ReviewNotePostResult(
+            index=index,
+            status="unverified" if reason else "posted",
+            note_id=note_id,
+            discussion_id=discussion_id,
+            position=compact_position,
+        ),
+        f"The post may have succeeded. {reason} Check GitLab before retrying." if reason else "",
+    )
+
+
+async def _post_review_note_batch(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    prepared: list[tuple[str, dict[str, str | int | None]]],
+    refs: dict[str, str],
+) -> PostReviewNotesResult:
+    """Post prepared notes one at a time and stop at the first unverified outcome."""
+    results: list[ReviewNotePostResult] = []
+    warning = ""
+    for index, (body, location) in enumerate(prepared):
+        position: dict[str, str | int | None] = {
+            **location,
+            "base_sha": refs["base_sha"],
+            "start_sha": refs["start_sha"],
+            "head_sha": refs["head_sha"],
+        }
+        result, reason = await _post_one_review_note(client, project, iid, index, body, position)
+        results.append(result)
+        if reason:
+            warning = f"Stopped at note index {index} ({result.status}): {reason} Later notes were not attempted."
+            if result.status in ("unknown", "unverified"):
+                warning += " Do not retry this note until its outcome is checked."
+            results.extend(
+                ReviewNotePostResult(index=later_index, status="unattempted")
+                for later_index in range(index + 1, len(prepared))
+            )
+            break
+    return PostReviewNotesResult(results=results, warning=warning[:500])
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def post_review_notes(
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    head_sha: Annotated[str, Field(description="Full 40-character head SHA from get_merge_request_diff.")],
+    notes: Annotated[list[ReviewNote], Field(min_length=1, max_length=20)],
+) -> PostReviewNotesResult:
+    """Post validated inline review notes as a sequential, bounded batch.
+
+    Like `glab mr note create`, but creates diff discussions. Require the user's explicit `APPROVE` before posting.
+    `head_sha` must be the full SHA from `get_merge_request_diff`. A `body_path` is an absolute path on this server,
+    which is useful with stdio but is not a path on the agent's computer. All bodies, diff lines, and paths are
+    checked before the first post. A second head check is preflight only, not an atomic lock, because GitLab has no
+    expected-head guard for discussion creation. Writes are sequential and never retried. Check every result before
+    deciding what to do next.
+    """
+    if not _full_sha(head_sha):
+        return _unattempted_review_notes(
+            len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
+        )
+    try:
+        bodies = _read_review_note_bodies(notes)
+    except (OSError, ValueError) as exc:
+        return _unattempted_review_notes(len(notes), f"Body preflight failed: {exc}. No notes were posted.")
+
+    try:
+        client = get_client(ctx)
+    except ToolError as exc:
+        return _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted.")
+    prepared, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, bodies)
+    if warning:
+        return _unattempted_review_notes(len(notes), warning)
+    return await _post_review_note_batch(client, project, iid, prepared, refs)
 
 
 # How a land request is sent. "auto" queues the merge, "now" merges right away, "cancel" undoes a queued merge.

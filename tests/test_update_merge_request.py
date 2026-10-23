@@ -240,6 +240,29 @@ async def test_usernames_are_checked_once_and_unknown_ones_are_left_out(gitlab_e
     assert data["failed"] == {"reviewers:carol": "unknown user", "assignees:ghost": "unknown user"}
 
 
+async def test_add_reviewers_uses_append_without_reading_or_replacing_reviewers(gitlab_env, router):
+    """Adding reviewers uses APPEND and does not read or replace the reviewer list."""
+    # Arrange
+    routes = serve_writes(router)
+
+    # Act
+    data = await call_tool(add_reviewers=["alice", "alice", "bob"])
+
+    # Assert
+    assert graphql_calls(routes["graphql"], "users(") == [{"usernames": ["alice", "bob"]}]
+    assert graphql_calls(routes["graphql"], "mergeRequestSetReviewers") == [
+        {"projectPath": PROJECT, "iid": str(IID), "usernames": ["alice", "alice", "bob"], "mode": "APPEND"}
+    ]
+    assert graphql_calls(routes["graphql"], "mergeRequest(") == [{"fullPath": PROJECT, "iid": str(IID)}]
+    assert [step_label(call.request) for call in router.calls] == [
+        "users(",
+        "mergeRequestSetReviewers",
+        "mergeRequest(",
+    ]
+    assert routes["fields"].call_count == 0
+    assert data["applied"] == ["add_reviewers"]
+
+
 async def test_username_lookup_failure_skips_people_but_not_other_steps(gitlab_env, router):
     """A failed username lookup skips the people calls only."""
     # Arrange
