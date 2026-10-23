@@ -38,8 +38,17 @@ error. A list uses the same scan, cursor, and output budget as a single value.
 
 ## Tools
 
+### Focused work-item reads 📖
+
+Use `get_work_item(section="WP8")` for one section or `section=["Context", "WP8"]` for several sections in one call.
+Use `headings_only=true` to find heading names first. Section content shares the `description_limit` budget, and
+each cut section is marked as truncated. Missing or ambiguous headings fail the whole request. Focused reads
+require descriptions and cannot use a widget cursor. `description_hash` covers the full fetched description,
+even when the returned content is focused or truncated.
+
 | Tool | Description |
 | --- | --- |
+| `get_work_item` | Read work-item details, all headings, or selected sections with a full-description hash. |
 | `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. |
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
