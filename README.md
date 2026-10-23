@@ -54,6 +54,7 @@ even when the returned content is focused or truncated.
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. Pass `names` to check which exact label names exist (`existing`/`missing`) before `create_merge_request(labels=...)`. |
 | `reply_to_thread` | Reply to or resolve one review thread; a successful resolve also returns the MR's open thread count. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome and each MR's open thread count after resolving. |
+| `resolve_open_threads` | Resolve every open review thread on one MR, with the resolved IDs, failed or unknown items, the open thread count after the writes, and `complete=false` when the MR has too many discussions to scan at once. |
 | `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
 | `update_merge_request` | Change MR fields, reviewers, assignees, blockers, or approval; rebase reports `applied`, `pending` (still running after about 10 seconds), or `failed` (for example, when the MR has conflicts). |
 | `land_merge_request` | Queue, merge now, or cancel an MR; `auto` and `now` also return the queued `head_sha` and `pipeline_status`, and merge train results add `train_position`, `train_status`, and `train_pipeline_id`. |

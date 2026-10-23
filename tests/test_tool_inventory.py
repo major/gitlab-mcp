@@ -35,6 +35,7 @@ WRITE_TOOLS = {
     "post_review_notes",
     "reply_to_thread",
     "reply_to_threads",
+    "resolve_open_threads",
     "update_merge_request",
 }
 
@@ -188,6 +189,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"description", "description_file", "labels", "remove_source_branch", "blocked_by"},
         ),
         ("reply_to_threads", {"project", "replies"}, set()),
+        ("resolve_open_threads", {"project", "iid"}, set()),
         ("land_merge_requests", {"project", "items"}, {"mode", "squash", "remove_source_branch"}),
         (
             "list_merge_requests",
