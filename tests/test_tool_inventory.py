@@ -1,5 +1,6 @@
 """Inventory checks for the MCP tool catalog, run through a real in-memory client 🧭."""
 
+import re
 from typing import Any
 
 import pytest
@@ -22,7 +23,7 @@ EXISTING_WRITE_TOOLS = {
     "land_merge_request",
     "update_merge_request",
 }
-NEW_READ_ONLY_TOOLS = {"get_work_item", "list_work_item_notes"}
+NEW_READ_ONLY_TOOLS = {"get_work_item", "list_work_item_notes", "list_labels"}
 NEW_WRITE_TOOLS = {
     "edit_work_item_description",
     "edit_merge_request_description",
@@ -36,8 +37,8 @@ EXPECTED_TOOLS = EXPECTED_READ_ONLY_TOOLS | EXPECTED_WRITE_TOOLS
 
 # Counts are kept as names so a drift shows up as a readable set difference.
 EXISTING_TOOL_COUNT = 11
-NEW_TOOL_COUNT = 6
-TOTAL_TOOL_COUNT = 17
+NEW_TOOL_COUNT = 7
+TOTAL_TOOL_COUNT = 18
 
 
 @pytest.fixture
@@ -57,7 +58,7 @@ def test_expected_counts_add_up():
 
 
 async def test_registered_tool_names_match_inventory_exactly(tools):
-    """The server exposes exactly the 11 existing tools plus the 6 planned tools."""
+    """The server exposes exactly the 11 existing tools plus the 7 planned tools."""
     # Act
     names = set(tools)
 
@@ -88,6 +89,42 @@ async def test_server_instructions_describe_the_review_workflow(gitlab_env):
     assert "post_review_notes(validate_only=true)" in instructions
     assert instructions.index("validate_only=true") < instructions.index("APPROVE")
     assert "explicit APPROVE before posting" in instructions
+
+
+async def test_server_instruction_tool_references_are_registered(gitlab_env):
+    """Every named tool in the server instructions exists in the registered catalog."""
+    # Arrange / Act
+    async with Client(mcp) as client:
+        listed = await client.list_tools()
+        instructions = client.instructions
+
+    assert instructions is not None
+    registered_names = {tool.name for tool in listed}
+    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - {"validate_only"}
+
+    # Assert
+    assert referenced_names <= registered_names, (
+        f"unregistered references: {sorted(referenced_names - registered_names)}"
+    )
+    assert {
+        "create_merge_request",
+        "list_labels",
+        "get_merge_request_threads",
+        "reply_to_thread",
+        "edit_merge_request_description",
+    } <= referenced_names
+
+
+async def test_thread_description_recommends_headings_before_full_view(tools):
+    """Thread triage guidance starts with headings and uses selected IDs for full notes."""
+    # Arrange
+    description = tools["get_merge_request_threads"].description
+
+    # Act / Assert
+    headings_position = description.index('view="headings"')
+    ids_position = description.index("ids=[...]")
+    full_position = description.index('view="full"')
+    assert headings_position < ids_position < full_position
 
 
 @pytest.mark.parametrize(
