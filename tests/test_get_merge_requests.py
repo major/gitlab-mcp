@@ -2,6 +2,7 @@
 
 import json
 from typing import Any
+lazy from collections.abc import Callable
 
 import httpx
 import pytest
@@ -49,6 +50,26 @@ def batch_response(*nodes: dict[str, Any] | None) -> httpx.Response:
 def sent_request(route: respx.Route) -> dict[str, Any]:
     """Return the JSON GraphQL request body sent to GitLab."""
     return json.loads(route.calls.last.request.content)
+
+
+def sent_chunks(route: respx.Route) -> list[list[str]]:
+    """Return the IID values sent in each GraphQL request, in request order."""
+    return [
+        [value for key, value in json.loads(call.request.content)["variables"].items() if key.startswith("iid")]
+        for call in route.calls
+    ]
+
+
+def echo_batch(missing: frozenset[int] = frozenset()) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer each GraphQL request with one node per requested IID, or null for IIDs in `missing`."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Build the alias response for the IIDs in one request."""
+        variables = json.loads(request.content)["variables"]
+        iids = [int(value) for key, value in variables.items() if key.startswith("iid")]
+        return batch_response(*(None if iid in missing else make_mr(iid) for iid in iids))
+
+    return respond
 
 
 async def call_tool(iids: list[Any], **extra: Any) -> dict[str, Any]:
@@ -128,6 +149,45 @@ async def test_all_missing_iids_succeed(gitlab_env):
     # Assert
     assert route.call_count == 1
     assert data == {"merge_requests": [], "missing_iids": [12, 8]}
+
+
+@pytest.mark.parametrize(
+    ("iid_count", "expected_sizes"),
+    [(1, [1]), (8, [8]), (9, [8, 1]), (20, [8, 8, 4])],
+    ids=["one", "chunk-limit", "spills-to-second-query", "three-queries"],
+)
+@respx.mock
+async def test_batches_are_split_into_queries_of_at_most_eight_iids(gitlab_env, iid_count, expected_sizes):
+    """Each GraphQL query carries at most eight aliases, and every requested MR comes back in order."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(side_effect=echo_batch())
+    iids = list(range(1, iid_count + 1))
+
+    # Act
+    data = await call_tool(iids)
+
+    # Assert
+    assert [len(chunk) for chunk in sent_chunks(route)] == expected_sizes
+    assert [mr["iid"] for mr in data["merge_requests"]] == iids
+    assert "missing_iids" not in data
+
+
+@respx.mock
+async def test_missing_iid_in_a_later_query_keeps_requested_order(gitlab_env):
+    """Twenty reversed IIDs run as three queries, and a miss in the last query is still reported."""
+    # Arrange
+    missing = 2
+    route = respx.post(GRAPHQL).mock(side_effect=echo_batch(missing=frozenset({missing})))
+    requested = list(range(20, 0, -1))
+
+    # Act
+    data = await call_tool(requested)
+
+    # Assert
+    assert [len(chunk) for chunk in sent_chunks(route)] == [8, 8, 4]
+    assert [chunk[0] for chunk in sent_chunks(route)] == ["20", "12", "4"]
+    assert [mr["iid"] for mr in data["merge_requests"]] == [iid for iid in requested if iid != missing]
+    assert data["missing_iids"] == [missing]
 
 
 @pytest.mark.parametrize(
