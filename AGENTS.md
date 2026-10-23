@@ -21,7 +21,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 ## Layout
 
 - `src/gitlab_mcp/server.py`: the `mcp` FastMCP app, lifespan, and every `@mcp.tool`. New tools go here.
-- `src/gitlab_mcp/client.py`: `GitLabClient.get()` (REST, base `/api/v4`) and `.graphql()` (absolute `/api/graphql` URL). HTTP, network, and GraphQL errors become `ToolError` subclasses with friendly hints.
+- `src/gitlab_mcp/client.py`: `GitLabClient.get()` and `.get_page()` (REST, base `/api/v4`; `get_page` also returns `X-Next-Page`) and `.graphql()` (absolute `/api/graphql` URL). HTTP, network, and GraphQL errors become `ToolError` subclasses with friendly hints.
 - `src/gitlab_mcp/config.py`: `Settings.from_env()` reads `GITLAB_URL`, `GITLAB_TOKEN`, `GITLAB_TIMEOUT`.
 - Config errors must not crash the server: the lifespan stores the error and `get_client(ctx)` raises it as a `ToolError` on the next tool call.
 - When you add a tool, also add a row to the README `Tools` table.
@@ -41,7 +41,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 - Write sociable, behavioral tests: call tools through the real in-memory MCP client (`async with Client(mcp)`) and assert on `structured_content` and the requests `respx` captured. Do not unit-test private helpers like `_to_summary` directly.
 - Use Arrange-Act-Assert comments, `pytest.mark.parametrize`, and fixtures. `asyncio_mode = "auto"`, so async tests need no marker.
 - `pytest-randomly` shuffles order; tests must not depend on each other.
-- Rule of Three for test helpers: `gitlab_env` is copied in two test files on purpose. When a third file needs it (or any helper), move it to `tests/conftest.py` instead of copying again.
+- Rule of Three for test helpers: shared fixtures like `gitlab_env` live in `tests/conftest.py`. Keep other helpers in their test file until a third file needs them, then move them there.
 - Known noise: one `SocketBlockedError` UserWarning and one beartype `DeprecationWarning` show up on a passing run.
 
 ## Local MCP config
