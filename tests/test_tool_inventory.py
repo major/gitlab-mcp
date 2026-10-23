@@ -8,37 +8,29 @@ from fastmcp import Client
 
 from gitlab_mcp.server import mcp
 
-EXISTING_READ_ONLY_TOOLS = {
+# One name per line, alphabetical, so a new tool is a one-line change.
+READ_ONLY_TOOLS = {
     "get_current_user",
+    "get_merge_request",
+    "get_merge_request_diff",
+    "get_merge_request_threads",
+    "get_merge_requests",
+    "get_work_item",
+    "list_labels",
     "list_merge_requests",
     "list_merge_train",
-    "get_merge_request",
-    "get_merge_requests",
-    "get_merge_request_threads",
-    "get_merge_request_diff",
+    "list_work_item_notes",
 }
-EXISTING_WRITE_TOOLS = {
-    "reply_to_thread",
-    "post_review_notes",
+WRITE_TOOLS = {
+    "create_merge_request",
+    "edit_merge_request_description",
+    "edit_work_item_description",
     "land_merge_request",
+    "post_review_notes",
+    "reply_to_thread",
+    "reply_to_threads",
     "update_merge_request",
 }
-NEW_READ_ONLY_TOOLS = {"get_work_item", "list_work_item_notes", "list_labels"}
-NEW_WRITE_TOOLS = {
-    "edit_work_item_description",
-    "edit_merge_request_description",
-    "create_merge_request",
-    "reply_to_threads",
-}
-
-EXPECTED_READ_ONLY_TOOLS = EXISTING_READ_ONLY_TOOLS | NEW_READ_ONLY_TOOLS
-EXPECTED_WRITE_TOOLS = EXISTING_WRITE_TOOLS | NEW_WRITE_TOOLS
-EXPECTED_TOOLS = EXPECTED_READ_ONLY_TOOLS | EXPECTED_WRITE_TOOLS
-
-# Counts are kept as names so a drift shows up as a readable set difference.
-EXISTING_TOOL_COUNT = 11
-NEW_TOOL_COUNT = 7
-TOTAL_TOOL_COUNT = 18
 
 
 @pytest.fixture
@@ -49,24 +41,14 @@ async def tools(gitlab_env) -> dict[str, Any]:
     return {tool.name: tool for tool in listed}
 
 
-def test_expected_counts_add_up():
-    """The inventory counts in this file match the planned tool groups."""
-    # Arrange / Act / Assert
-    assert len(EXISTING_READ_ONLY_TOOLS | EXISTING_WRITE_TOOLS) == EXISTING_TOOL_COUNT
-    assert len(NEW_READ_ONLY_TOOLS | NEW_WRITE_TOOLS) == NEW_TOOL_COUNT
-    assert len(EXPECTED_TOOLS) == TOTAL_TOOL_COUNT
-
-
 async def test_registered_tool_names_match_inventory_exactly(tools):
-    """The server exposes exactly the 11 existing tools plus the 7 planned tools."""
+    """The server exposes exactly the read-only and write tools in this inventory."""
     # Act
     names = set(tools)
 
     # Assert
-    assert names == EXPECTED_TOOLS, (
-        f"missing: {sorted(EXPECTED_TOOLS - names)}, extra: {sorted(names - EXPECTED_TOOLS)}"
-    )
-    assert len(tools) == TOTAL_TOOL_COUNT
+    expected = READ_ONLY_TOOLS | WRITE_TOOLS
+    assert names == expected, f"missing: {sorted(expected - names)}, extra: {sorted(names - expected)}"
 
 
 async def test_post_review_notes_is_registered(tools):
@@ -151,7 +133,7 @@ async def test_review_tools_have_searchable_first_line_descriptions(tools, name,
         assert "glab mr update" in tools[name].description
 
 
-@pytest.mark.parametrize("name", sorted(EXPECTED_READ_ONLY_TOOLS))
+@pytest.mark.parametrize("name", sorted(READ_ONLY_TOOLS))
 async def test_read_only_tools_are_marked_read_only(tools, name):
     """Read tools advertise readOnlyHint and openWorldHint, since they call GitLab."""
     # Act
@@ -162,7 +144,7 @@ async def test_read_only_tools_are_marked_read_only(tools, name):
     assert annotations.open_world_hint is True
 
 
-@pytest.mark.parametrize("name", sorted(EXPECTED_WRITE_TOOLS))
+@pytest.mark.parametrize("name", sorted(WRITE_TOOLS))
 async def test_write_tools_are_marked_as_writes(tools, name):
     """Write tools are not read-only, never claim idempotence, and call an external system."""
     # Act

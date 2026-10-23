@@ -8,10 +8,10 @@ lazy from collections.abc import Callable
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import DIFF_BUDGET, MAX_PAGES, mcp
+from gitlab_mcp.server import DIFF_BUDGET, MAX_PAGES
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -124,10 +124,8 @@ def encode_cursor(raw: str) -> str:
 
 
 async def call_tool(**arguments: Any) -> dict[str, Any]:
-    """Call get_merge_request_diff through the MCP protocol and return its data."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("get_merge_request_diff", {"project": PROJECT, "iid": IID, **arguments})
-    return result.structured_content
+    """Call get_merge_request_diff with the default project and IID and return its data."""
+    return await call_mcp_tool("get_merge_request_diff", {"project": PROJECT, "iid": IID, **arguments})
 
 
 # Shared pages for the budget and page-limit scenarios, reused by several tests.

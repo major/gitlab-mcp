@@ -20,6 +20,7 @@ from gitlab_mcp.server import (
     THREAD_HEADING_CAP,
     mcp,
 )
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -149,13 +150,11 @@ def thread_ids(data: dict[str, Any]) -> list[str]:
 
 
 async def call_tool(**arguments: Any) -> dict[str, Any]:
-    """Call get_merge_request_threads through the MCP protocol and return its data."""
+    """Call get_merge_request_threads with the default project and IID and return its data."""
     tool_arguments = {"project": PROJECT, **arguments}
     if "iid" not in arguments and "iids" not in arguments:
         tool_arguments["iid"] = IID
-    async with Client(mcp) as client:
-        result = await client.call_tool("get_merge_request_threads", tool_arguments)
-    return result.structured_content
+    return await call_mcp_tool("get_merge_request_threads", tool_arguments)
 
 
 def encode_cursor(raw: str) -> str:

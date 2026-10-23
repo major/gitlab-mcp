@@ -8,12 +8,11 @@ from unittest.mock import Mock
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from gitlab_mcp import description_edits as description_edits_module
 from gitlab_mcp.description_edits import DIFF_CAP
-from gitlab_mcp.server import mcp
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -33,10 +32,8 @@ def router(gitlab_env):
 
 
 async def call_tool(name: str, **arguments: Any) -> dict[str, Any]:
-    """Call one test tool through the MCP protocol and return its structured content."""
-    async with Client(mcp) as client:
-        result = await client.call_tool(name, arguments)
-    return result.structured_content
+    """Call one tool by name with keyword arguments and return its structured content."""
+    return await call_mcp_tool(name, arguments)
 
 
 def operation(request: httpx.Request) -> str:

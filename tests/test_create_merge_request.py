@@ -10,6 +10,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from gitlab_mcp.server import MAX_CREATE_ASSIGNEES, mcp
+from mcp_helpers import call_tool as call_mcp_tool
 
 API = "https://gitlab.example.com/api/v4"
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -35,10 +36,8 @@ def router(gitlab_env):
 
 
 async def call_tool(**arguments: Any) -> dict[str, Any]:
-    """Call create_merge_request through the MCP protocol and return structured data."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("create_merge_request", {"project": PROJECT, **arguments})
-    return result.structured_content
+    """Call create_merge_request with the default project and return structured data."""
+    return await call_mcp_tool("create_merge_request", {"project": PROJECT, **arguments})
 
 
 def create_response(**overrides: Any) -> httpx.Response:

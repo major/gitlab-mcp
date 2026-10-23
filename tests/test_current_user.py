@@ -3,10 +3,9 @@
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import mcp
+from mcp_helpers import call_tool
 
 API = "https://gitlab.example.com/api/v4"
 
@@ -19,13 +18,6 @@ USER = {
 }
 
 
-async def call_tool() -> dict:
-    """Call get_current_user through the MCP protocol and return its data."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("get_current_user", {})
-    return result.structured_content
-
-
 @respx.mock
 async def test_returns_only_username_and_id(gitlab_env):
     """The tool sends the token and returns only username and id."""
@@ -33,7 +25,7 @@ async def test_returns_only_username_and_id(gitlab_env):
     route = respx.get(f"{API}/user").mock(return_value=httpx.Response(200, json=USER))
 
     # Act
-    data = await call_tool()
+    data = await call_tool("get_current_user")
 
     # Assert
     assert route.calls.last.request.headers["PRIVATE-TOKEN"] == "glpat-test"
@@ -52,7 +44,7 @@ async def test_api_errors_become_helpful_tool_errors(gitlab_env, status, hint):
 
     # Act / Assert
     with pytest.raises(ToolError, match=hint):
-        await call_tool()
+        await call_tool("get_current_user")
 
 
 async def test_missing_token_is_reported_by_the_tool(monkeypatch):
@@ -62,7 +54,7 @@ async def test_missing_token_is_reported_by_the_tool(monkeypatch):
 
     # Act / Assert
     with pytest.raises(ToolError, match="GITLAB_TOKEN is not set"):
-        await call_tool()
+        await call_tool("get_current_user")
 
 
 @respx.mock
@@ -73,4 +65,4 @@ async def test_network_failure_names_the_instance(gitlab_env):
 
     # Act / Assert
     with pytest.raises(ToolError, match=r"Could not reach https://gitlab\.example\.com: boom"):
-        await call_tool()
+        await call_tool("get_current_user")
