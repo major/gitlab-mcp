@@ -33,6 +33,14 @@ class GitLabAPIError(ToolError):
         super().__init__(f"GitLab returned HTTP {status} for {path}. {_STATUS_HINTS.get(status, '')}".strip())
 
 
+class GitLabGraphQLError(ToolError):
+    """GitLab answered the GraphQL request with one or more errors."""
+
+    def __init__(self, messages: list[str]) -> None:
+        """Join every error message so the agent sees them all."""
+        super().__init__("GitLab GraphQL error: " + "; ".join(messages))
+
+
 class GitLabClient:
     """Small wrapper around httpx that knows how to talk to GitLab."""
 
@@ -64,3 +72,27 @@ class GitLabClient:
         if response.is_error:
             raise GitLabAPIError(response.status_code, path)
         return response.json()
+
+    async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """Run one GraphQL `query` and return its `data` object.
+
+        GraphQL reports most failures inside a 200 response, so the
+        `errors` list is checked before the data is returned.
+
+        Raises:
+            GitLabConnectionError: When the instance cannot be reached.
+            GitLabAPIError: When GitLab returns an error status.
+            GitLabGraphQLError: When the response contains GraphQL errors.
+        """
+        url = f"{self.settings.url}/api/graphql"  # Absolute URL, because base_url is /api/v4.
+        try:
+            response = await self._http.post(url, json={"query": query, "variables": variables})
+        except httpx.HTTPError as exc:
+            raise GitLabConnectionError(self.settings.url, exc) from exc
+
+        if response.is_error:
+            raise GitLabAPIError(response.status_code, "/api/graphql")
+        body = response.json()
+        if errors := body.get("errors"):
+            raise GitLabGraphQLError([error.get("message", str(error)) for error in errors])
+        return body["data"]

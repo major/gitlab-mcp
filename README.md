@@ -36,9 +36,14 @@ Example MCP client config:
 
 ## Tools
 
-| Tool               | Same as                          | Returns                 |
-| ------------------ | -------------------------------- | ----------------------- |
-| `get_current_user` | `glab api user --jq .username`   | `{"username", "id"}`    |
+| Tool                  | Same as                        | Returns                                                   |
+| --------------------- | ------------------------------ | --------------------------------------------------------- |
+| `get_current_user`    | `glab api user --jq .username` | `{"username", "id"}`                                      |
+| `list_merge_requests` | `glab mr list` + filters       | `{"web_url_prefix", "merge_requests": [...], "has_more"}` |
+
+`list_merge_requests` needs a token with the `read_api` scope. Pass `project`
+as the full path, like `group/subgroup/project`, not the numeric ID or the
+URL.
 
 ## Development
 
