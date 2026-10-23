@@ -587,6 +587,8 @@ class ThreadReplyResult(BaseModel):
     thread_id: str
     note_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
     resolved: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Set only after a successful resolve. The MR's open thread count after the write, or None if it could not be read.
+    open_threads: int | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
@@ -620,6 +622,8 @@ class ThreadReplyBatchItem(BaseModel):
     thread_id: str
     status: ThreadReplyBatchStatus
     resolved: bool | None
+    # Sent once per MR, on its last item with resolve=true, when that resolution succeeded.
+    open_threads: int | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
@@ -1910,30 +1914,38 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     return MergeRequestThreadBatch(merge_requests=merge_requests, missing_iids=missing_iids)
 
 
-@mcp.tool(
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    }
-)
-async def reply_to_thread(  # noqa: C901, PLR0913, PLR0917 - user-facing inputs and distinct write outcomes.
-    ctx: Context,
-    project: Project,
-    iid: Iid,
-    thread_id: str,
-    body: Annotated[str | None, Field(description="Reply text. Omit only when resolving the thread.")] = None,
-    resolve: Annotated[
-        bool,
-        Field(description="Resolve the thread after a successful reply, or resolve it alone."),
-    ] = False,
-) -> ThreadReplyResult:
-    """Reply to or resolve a review thread. Like `glab mr note create --reply` and `glab mr note resolve`.
+async def _read_open_threads(client: GitLabClient, project: str, iid: int) -> int | None:
+    """Return the MR's open thread count, or None when the read fails.
 
-    Get user approval before posting a reply or resolving a thread. A missing body is allowed only with `resolve=True`.
-    `resolve=False` leaves the current resolution state unchanged and never reopens a thread. Replying and resolving
-    are separate GitLab writes. If resolution fails after a reply, the result says not to repost the reply.
+    The write before this read already succeeded, so a failed read must not fail the write result. Callers then leave
+    the field out. The totals match `get_merge_request_threads(count_only=true)`.
+    """
+    try:
+        node = await _fetch_merge_request(client, THREAD_COUNTS_QUERY, project, iid)
+        return _to_thread_counts(node, iid).open
+    except ToolError:
+        return None
+
+
+def _last_resolve_positions(replies: list[ThreadReplyRequest]) -> dict[int, int]:
+    """Map each MR IID to the position of its last item that asks for a resolve.
+
+    That item reports the MR's open thread count, so each MR is counted once, after its resolutions.
+    """
+    return {reply.iid: position for position, reply in enumerate(replies) if reply.resolve}
+
+
+async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write outcomes and the user-facing inputs.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    thread_id: str,
+    body: str | None,
+    resolve: bool,
+) -> ThreadReplyResult:
+    """Post the reply and resolve the thread, without reading the thread count afterward.
+
+    The public tools add the count. A batch reads it once per MR instead of once per item.
     """
     bare_thread_id = _bare_id(thread_id)
     if not bare_thread_id.strip():
@@ -1943,7 +1955,6 @@ async def reply_to_thread(  # noqa: C901, PLR0913, PLR0917 - user-facing inputs 
     if body is None and not resolve:
         raise ToolError("Provide a reply body or set resolve=True.")  # noqa: TRY003
 
-    client = get_client(ctx)
     discussion_path = f"{_mr_rest_path(project, iid)}/discussions/{quote(bare_thread_id, safe='')}"
     note_id: int | None = None
 
@@ -1992,6 +2003,40 @@ async def reply_to_thread(  # noqa: C901, PLR0913, PLR0917 - user-facing inputs 
         "openWorldHint": True,
     }
 )
+async def reply_to_thread(  # noqa: PLR0913, PLR0917 - user-facing inputs.
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    thread_id: str,
+    body: Annotated[str | None, Field(description="Reply text. Omit only when resolving the thread.")] = None,
+    resolve: Annotated[
+        bool,
+        Field(description="Resolve the thread after a successful reply, or resolve it alone."),
+    ] = False,
+) -> ThreadReplyResult:
+    """Reply to or resolve a review thread. Like `glab mr note create --reply` and `glab mr note resolve`.
+
+    Get user approval before posting a reply or resolving a thread. A missing body is allowed only with `resolve=True`.
+    `resolve=False` leaves the current resolution state unchanged and never reopens a thread. Replying and resolving
+    are separate GitLab writes. If resolution fails after a reply, the result says not to repost the reply.
+    After a successful resolve, `open_threads` is the MR's open thread count after the write. It is left out if that
+    count cannot be read.
+    """
+    client = get_client(ctx)
+    outcome = await _write_thread_reply(client, project, iid, thread_id, body, resolve)
+    if outcome.resolved:
+        outcome.open_threads = await _read_open_threads(client, project, iid)
+    return outcome
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def reply_to_threads(
     ctx: Context,
     project: Project,
@@ -2006,13 +2051,18 @@ async def reply_to_threads(
     the same reply and resolution behavior as `reply_to_thread`; items run sequentially, and a failed item does not
     stop later items or roll back successful writes. Writes are never retried. Check each status and warning before
     deciding what to do next, especially when an outcome is unknown.
+
+    After a successful `resolve=true`, `open_threads` is sent once per merge request, on that MR's last item with
+    `resolve=true`. It is left out if that count cannot be read or if that last resolution failed.
     """
+    client = get_client(ctx)
+    last_resolve = _last_resolve_positions(replies)
     results: list[ThreadReplyBatchItem] = []
-    for reply in replies:
+    for position, reply in enumerate(replies):
         thread_id = _bare_id(reply.thread_id)
         try:
-            outcome = await reply_to_thread(
-                ctx,
+            outcome = await _write_thread_reply(
+                client,
                 project,
                 reply.iid,
                 reply.thread_id,
@@ -2053,12 +2103,16 @@ async def reply_to_threads(
             status = "partial"
         else:
             status = "applied"
+        open_threads = None
+        if outcome.resolved and last_resolve.get(reply.iid) == position:
+            open_threads = await _read_open_threads(client, project, reply.iid)
         results.append(
             ThreadReplyBatchItem(
                 iid=reply.iid,
                 thread_id=outcome.thread_id,
                 status=status,
                 resolved=outcome.resolved,
+                open_threads=open_threads,
                 warning=warning,
             )
         )
