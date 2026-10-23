@@ -1731,8 +1731,10 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
       the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
       160 characters. It includes no note bodies or replies.
-    - `view="finding"` returns full notes like `full`, but removes separate greetings and signoffs from bot-authored
-      notes only when they contain numbered findings. Headings, paths, fixes, and code blocks are kept.
+    - `view="finding"` returns full notes like `full`, but compacts recognized bot findings. Numbered findings lose
+      separate greetings and signoffs. Section findings keep the bold title and the "Needs to be improved", "Failure
+      scenario", and "How to fix" sections, including their code and diagrams. A bold-heading action-bullet format
+      loses its introductory paragraph. Human notes and unrecognized formats remain unchanged.
     - In full and finding views, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits
       body text. A call returns about 30000 body characters. Headings view returns about 30000 serialized characters.
       Continue with `next_cursor` using the same filters, `view`, and `max_body_chars`.
