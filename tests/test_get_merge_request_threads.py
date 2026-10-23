@@ -859,6 +859,160 @@ async def test_state_filters_threads(gitlab_env, arguments, expected):
     ]
 
 
+def state_mix_page() -> dict[str, Any]:
+    """Build one page with an open, a resolved, a plain-comment, and a system-only discussion, in that order."""
+    return page(
+        make_discussion("open"),
+        make_discussion("resolved", resolved=True),
+        make_discussion("comment", resolvable=False),
+        make_discussion("system", make_note(system=True)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (["open"], ["open"]),  # A one-item list matches the scalar form.
+        (["open", "comments"], ["open", "comment"]),  # Resolved threads are left out.
+        (["resolved", "comments"], ["resolved", "comment"]),
+        (["open", "open", "open"], ["open"]),  # Duplicate states never repeat a thread.
+        (["comments", "open", "comments"], ["open", "comment"]),  # List order does not change result order.
+        (["open", "all"], ["open", "resolved", "comment"]),  # all wins a mixed set.
+        (["all", "comments", "resolved"], ["open", "resolved", "comment"]),
+    ],
+    ids=["one-item", "open-comments", "resolved-comments", "duplicates", "order", "all-mixed", "all-three"],
+)
+@respx.mock
+async def test_state_list_keeps_the_union_in_scan_order(gitlab_env, state, expected):
+    """A state list keeps the union of its states, in GitLab's order, with one scan and no repeats."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(state_mix_page()))
+
+    # Act
+    data = await call_tool(state=state)
+
+    # Assert
+    assert thread_ids(data) == expected
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{"state": []}, {"state": [], "count_only": True}, {"state": [], "ids": ["open"]}],
+    ids=["threads", "count-only", "ids"],
+)
+@respx.mock
+async def test_empty_state_list_is_rejected_before_network(gitlab_env, arguments):
+    """An empty state list is an error in every mode, so it never silently means "all" or "open"."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(state_mix_page()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Pass at least one state"):
+        await call_tool(**arguments)
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize("state", ["bogus", ["open", "bogus"], ["open", None]], ids=["scalar", "mixed", "null"])
+@respx.mock
+async def test_unknown_state_values_are_rejected_before_network(gitlab_env, state):
+    """Only the four state names are accepted, alone or inside a list."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(state_mix_page()))
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(state=state)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_state_list_budget_cursor_resumes_with_the_same_states(gitlab_env):
+    """A state list shares one output budget, and the resumed call returns each matching thread once."""
+    # Arrange: each thread holds three full-size notes, 12000 characters. Resolved threads never match.
+    big_notes = [make_note("x" * NOTE_CAP) for _ in range(3)]
+    route = respx.post(GRAPHQL).mock(
+        side_effect=serve(
+            {
+                None: page(
+                    make_discussion("t1", *big_notes),  # open, matches
+                    make_discussion("t2", *big_notes, resolved=True),  # resolved, skipped
+                    make_discussion("t3", *big_notes, resolvable=False),  # comment, matches
+                    make_discussion("t4", *big_notes),  # open, would pass the budget
+                    make_discussion("t5", *big_notes, resolved=True),
+                    has_next=True,
+                    end_cursor="c1",
+                ),
+                "c1": page(
+                    make_discussion("t6", *big_notes, resolvable=False),
+                    make_discussion("t7", *big_notes, resolved=True),
+                    make_discussion("t8"),
+                ),
+            },
+        ),
+    )
+
+    # Act
+    first = await call_tool(state=["open", "comments"])
+    second = await call_tool(state=["open", "comments"], cursor=first["next_cursor"])
+
+    # Assert
+    assert thread_ids(first) == ["t1", "t3"]
+    assert thread_ids(second) == ["t4", "t6", "t8"]
+    assert "next_cursor" not in second
+    assert requested_afters(route) == [None, None, "c1"]
+
+
+@respx.mock
+async def test_state_list_applies_to_every_batch_result(gitlab_env):
+    """Each batch merge request gets the same state union, and each keeps its own result."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(state_mix_page()))
+
+    # Act
+    iids = [5, 8]
+    data = await call_tool(iids=iids, state=["resolved", "comments"])
+
+    # Assert
+    assert [result["iid"] for result in data["merge_requests"]] == [5, 8]
+    assert [thread_ids(result) for result in data["merge_requests"]] == [["resolved", "comment"]] * len(iids)
+    assert route.call_count == len(iids)
+
+
+@respx.mock
+async def test_ids_ignore_a_state_list(gitlab_env):
+    """Explicit IDs still win over a state list, so a resolved thread is returned."""
+    # Arrange
+    respx.post(GRAPHQL).mock(
+        return_value=respond(page(make_discussion("resolved", resolved=True), make_discussion("open"))),
+    )
+
+    # Act
+    data = await call_tool(ids=["resolved"], state=["open", "comments"])
+
+    # Assert
+    assert thread_ids(data) == ["resolved"]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [["open", "comments"], ["all", "resolved"], "resolved"],
+    ids=["list", "all", "scalar"],
+)
+@respx.mock
+async def test_count_only_ignores_a_state_list(gitlab_env, state):
+    """Count-only still counts both states and sends no discussion query, whatever the state."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(counts_page(9, 4)))
+
+    # Act
+    data = await call_tool(count_only=True, state=state)
+
+    # Assert
+    assert data == {"open": 5, "resolved": 4}
+    assert sent_variables(route) == [{"fullPath": PROJECT, "iid": str(IID)}]
+
+
 @pytest.mark.parametrize("requested", [gid("resolved"), "resolved"], ids=["full-gid", "bare-sha"])
 @respx.mock
 async def test_ids_bypass_state_and_accept_bare_shas(gitlab_env, requested):
