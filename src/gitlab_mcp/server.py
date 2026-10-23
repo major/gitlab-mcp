@@ -18,6 +18,7 @@ from fastmcp.server.lifespan import lifespan
 from pydantic import BaseModel, Field, model_validator
 
 from gitlab_mcp import description_edits as _description_edits
+from gitlab_mcp import findings as _findings
 from gitlab_mcp import work_items as _work_items
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.config import ConfigError, Settings
@@ -85,7 +86,7 @@ query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeJobs
           id resolvable resolved
           notes(first: 1) {
             count
-            nodes { system author { username } position { oldPath newPath oldLine newLine } }
+            nodes { system author { username bot name id } position { oldPath newPath oldLine newLine } }
           }
         }
       }
@@ -134,6 +135,10 @@ THREADS_QUERY = """
 query($fullPath: ID!, $iid: String!, $after: String) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
+      sourceBranch
+      diffRefs { headSha }
+      detailedMergeStatus
+      headPipeline { status }
       discussions(first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -142,12 +147,24 @@ query($fullPath: ID!, $iid: String!, $after: String) {
             pageInfo { hasNextPage }
             nodes {
               system body createdAt
-              author { username }
+              author { username bot name id }
               position { oldPath newPath oldLine newLine }
             }
           }
         }
       }
+    }
+  }
+}
+"""
+
+# Exact thread totals without fetching discussion pages or note bodies. 🧮
+THREAD_COUNTS_QUERY = """
+query($fullPath: ID!, $iid: String!) {
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) {
+      resolvableDiscussionsCount
+      resolvedDiscussionsCount
     }
   }
 }
@@ -232,7 +249,8 @@ mcp = FastMCP(
     instructions=(
         "Tools for GitLab developer workflows on gitlab.com or self-managed "
         "GitLab. Call get_current_user first to learn who you are acting as. "
-        "For merge request review, use get_merge_request and get_merge_request_diff. "
+        "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
+        "Use get_merge_request for descriptions, approvals, and jobs, and get_merge_request_diff for patches. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
         "Get the user's explicit APPROVE before posting notes with post_review_notes. "
         "Use update_merge_request for reviewer, assignee, and approval changes."
@@ -378,7 +396,7 @@ class ThreadIndex(BaseModel):
 
 # "comment" means the discussion cannot be resolved, like a plain MR comment.
 ThreadStatus = Literal["open", "resolved", "comment"]
-ThreadView = Literal["full", "headings"]
+ThreadView = Literal["full", "headings", "finding"]
 
 
 class Note(BaseModel):
@@ -415,8 +433,12 @@ class ThreadHeading(BaseModel):
 
 
 class ThreadList(BaseModel):
-    """One page of threads."""
+    """One page of threads with compact merge request triage status."""
 
+    head_sha: str = Field(default="", exclude_if=lambda v: not v)
+    source_branch: str = Field(default="", exclude_if=lambda v: not v)
+    merge_status: str = Field(default="", exclude_if=lambda v: not v)
+    pipeline_status: str = Field(default="", exclude_if=lambda v: not v)
     threads: list[Thread | ThreadHeading]
     next_cursor: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the scan finished.
     not_found_ids: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
@@ -432,6 +454,28 @@ class MergeRequestThreadBatch(BaseModel):
     """Thread pages for requested merge requests and the IIDs that were missing."""
 
     merge_requests: list[MergeRequestThreadList]
+    missing_iids: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+
+class ThreadCounts(BaseModel):
+    """Exact open and resolved discussion counts for one merge request."""
+
+    open: int
+    resolved: int
+
+
+class MergeRequestThreadCounts(BaseModel):
+    """Exact discussion counts attributed to one merge request."""
+
+    iid: int
+    open: int
+    resolved: int
+
+
+class MergeRequestThreadCountsBatch(BaseModel):
+    """Thread counts for requested merge requests and the IIDs that were missing."""
+
+    merge_requests: list[MergeRequestThreadCounts]
     missing_iids: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)
 
 
@@ -965,6 +1009,22 @@ def _position_fields(position: dict[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
+def _author_display(author: dict[str, Any] | None) -> str:
+    """Return a short display label for a note author, or empty for a deleted author."""
+    if author is None:
+        return ""
+    if author.get("bot") is not True:
+        return author.get("username") or ""
+
+    name = author.get("name")
+    if isinstance(name, str) and name.strip() and name.strip() != "****":
+        return name
+
+    author_id = author.get("id")
+    id_fragment = str(author_id).rsplit("/", 1)[-1] if author_id else "unknown"
+    return f"bot:{id_fragment}"
+
+
 def _to_thread_ref(discussion: dict[str, Any]) -> ThreadRef:
     """Convert one open discussion into a thread ref, using its first note for the details."""
     notes = discussion["notes"]
@@ -972,7 +1032,7 @@ def _to_thread_ref(discussion: dict[str, Any]) -> ThreadRef:
     author = first["author"]  # A deleted or banned author comes back as null.
     return ThreadRef(
         id=_bare_id(discussion["id"]),
-        by=author["username"] if author else "",
+        by=_author_display(author),
         notes=notes["count"],
         **_position_fields(first["position"]),
     )
@@ -1317,17 +1377,24 @@ def _thread_heading(body: str) -> str:
     return next((line.strip()[:THREAD_HEADING_CAP] for line in body.splitlines() if line.strip()), "")
 
 
-def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Note:
+def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP, compact_findings: bool = False) -> Note:
     """Convert one GraphQL note into a note with a capped body and a date-only timestamp."""
     author = node["author"]  # A deleted or banned author comes back as null.
+    body = node["body"]
+    if compact_findings and author is not None and author.get("bot") is True:
+        body = _findings.compact_finding_body(body)
     return Note(
-        by=author["username"] if author else "",
-        body=_cap_note_body(node["body"], max_body_chars=max_body_chars),
+        by=_author_display(author),
+        body=_cap_note_body(body, max_body_chars=max_body_chars),
         at=node["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
     )
 
 
-def _to_thread(discussion: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Thread | None:
+def _to_thread(
+    discussion: dict[str, Any],
+    max_body_chars: int = NOTE_CAP,
+    compact_findings: bool = False,
+) -> Thread | None:
     """Convert one discussion into a thread, or return None when it has no human notes.
 
     System notes, like "assigned to @user", are dropped. The location comes
@@ -1340,7 +1407,7 @@ def _to_thread(discussion: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Th
     return Thread(
         id=_bare_id(discussion["id"]),
         status=_thread_status(discussion),
-        notes=[_to_note(node, max_body_chars=max_body_chars) for node in human],
+        notes=[_to_note(node, max_body_chars=max_body_chars, compact_findings=compact_findings) for node in human],
         # GitLab only returns the first 50 notes, so more may exist.
         notes_truncated=notes["pageInfo"]["hasNextPage"],
         **_position_fields(human[0]["position"]),
@@ -1365,9 +1432,9 @@ def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHead
         path=thread.path,
         line=thread.line,
         old_line=thread.old_line,
-        by=author["username"] if author else "",
+        by=_author_display(author),
         heading=_thread_heading(root_note["body"]),
-        last_by=last_author["username"] if last_author else "",
+        last_by=_author_display(last_author),
         last_at=last_note["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
         note_count=len(human_notes),
         notes_truncated=notes["pageInfo"]["hasNextPage"],
@@ -1383,7 +1450,7 @@ class _ThreadFilter:
     file: str | None
     author: str | None
 
-    def matches(self, thread: Thread) -> bool:
+    def matches(self, thread: Thread, discussion: dict[str, Any]) -> bool:
         """Return True when the thread passes every filter."""
         # Explicit IDs replace the state filter, so a known thread is returned in any state.
         if self.ids is not None:
@@ -1394,7 +1461,12 @@ class _ThreadFilter:
         if self.file is not None and self.file not in (thread.path, thread.old_path):
             return False
         # Only the first 50 notes are fetched, so this can miss a late reply.
-        return self.author is None or any(note.by == self.author for note in thread.notes)
+        if self.author is None:
+            return True
+        return any(
+            not note["system"] and note["author"] is not None and note["author"]["username"] == self.author
+            for note in discussion["notes"]["nodes"]
+        )
 
 
 async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the scan.
@@ -1405,57 +1477,125 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     start: tuple[str | None, int],
     max_body_chars: int = NOTE_CAP,
     view: ThreadView = "full",
-) -> tuple[list[Thread | ThreadHeading], str, set[str]]:
+) -> tuple[list[Thread | ThreadHeading], str, set[str], dict[str, str]]:
     """Read discussion pages from `start` and collect the matching threads.
 
     The scan stops at the budget, at `MAX_PAGES`, or at the last page. Returns
     the threads, the cursor to resume from (empty when every page was read),
-    and every discussion ID that was read, matching or not.
+    every discussion ID that was read, matching or not, and compact MR status.
     """
     after, skip = start
     threads: list[Thread | ThreadHeading] = []
     seen: set[str] = set()
+    mr_headers: dict[str, str] = {}
+    full_view = view in {"full", "finding"}
     output_size = 2 if view == "headings" else 0  # Count the serialized list brackets.
     for _ in range(MAX_PAGES):
         node = await _fetch_merge_request(client, THREADS_QUERY, project, iid, after=after)
+        mr_headers = _thread_mr_headers(node)
         connection = node["discussions"]
         nodes = connection["nodes"]
         for index in range(skip, len(nodes)):
             seen.add(_bare_id(nodes[index]["id"]))
-            thread = _to_thread(nodes[index], max_body_chars=max_body_chars)
-            if thread is None or not thread_filter.matches(thread):
+            thread = _to_thread(
+                nodes[index],
+                max_body_chars=max_body_chars,
+                compact_findings=view == "finding",
+            )
+            if thread is None or not thread_filter.matches(thread, nodes[index]):
                 continue
-            output_thread = thread if view == "full" else _to_thread_heading(nodes[index], thread)
+            output_thread = thread if full_view else _to_thread_heading(nodes[index], thread)
             size = (
                 sum(len(note.body) for note in thread.notes)
-                if view == "full"
+                if full_view
                 else len(output_thread.model_dump_json()) + (1 if threads else 0)
             )
-            budget = THREAD_BODY_BUDGET if view == "full" else THREAD_HEADING_BUDGET
+            budget = THREAD_BODY_BUDGET if full_view else THREAD_HEADING_BUDGET
             # Always return at least one thread, even when that thread alone is over budget.
             if threads and output_size + size > budget:
-                return threads, _encode_cursor({"after": after, "skip": index}), seen
+                return threads, _encode_cursor({"after": after, "skip": index}), seen, mr_headers
             threads.append(output_thread)
             output_size += size
         page_info = connection["pageInfo"]
         if not page_info["hasNextPage"]:
-            return threads, "", seen
+            return threads, "", seen, mr_headers
         after, skip = page_info["endCursor"], 0
     # The page limit was hit. `after` is now the cursor of the next unread page.
-    return threads, _encode_cursor({"after": after, "skip": 0}), seen
+    return threads, _encode_cursor({"after": after, "skip": 0}), seen, mr_headers
+
+
+def _thread_mr_headers(node: dict[str, Any]) -> dict[str, str]:
+    """Convert compact MR status fields returned with a discussion page."""
+    pipeline = node.get("headPipeline")
+    return {
+        "head_sha": _head_sha(node.get("diffRefs")),
+        "source_branch": node.get("sourceBranch") or "",
+        "merge_status": _lower(node.get("detailedMergeStatus")),
+        "pipeline_status": _lower(pipeline.get("status")) if pipeline else "",
+    }
+
+
+def _to_thread_counts(node: dict[str, Any], iid: int) -> ThreadCounts:
+    """Convert GitLab's exact discussion totals, rejecting absent or invalid fields."""
+    total = node.get("resolvableDiscussionsCount")
+    resolved = node.get("resolvedDiscussionsCount")
+    if (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or not isinstance(resolved, int)
+        or isinstance(resolved, bool)
+    ):
+        raise ToolError(f"GitLab did not return discussion counts for merge request !{iid}.")  # noqa: TRY003
+    return ThreadCounts(open=total - resolved, resolved=resolved)
+
+
+async def _get_thread_counts(
+    client: GitLabClient,
+    project: str,
+    iid: int | None,
+    iids: list[int] | None,
+) -> ThreadCounts | MergeRequestThreadCountsBatch:
+    """Fetch exact thread counts for one MR or a batch, retaining existing missing-IID behavior."""
+    if iid is not None:
+        node = await _fetch_merge_request(client, THREAD_COUNTS_QUERY, project, iid)
+        return _to_thread_counts(node, iid)
+
+    unique_iids = list(dict.fromkeys(iids or []))
+    if not unique_iids:
+        raise ToolError("Pass at least one merge request IID.")  # noqa: TRY003
+    if len(unique_iids) > MAX_BATCH_MERGE_REQUESTS:
+        raise ToolError("Pass no more than 20 unique merge request IIDs.")  # noqa: TRY003
+
+    merge_requests: list[MergeRequestThreadCounts] = []
+    missing_iids: list[int] = []
+    for requested_iid in unique_iids:
+        try:
+            node = await _fetch_merge_request(client, THREAD_COUNTS_QUERY, project, requested_iid)
+        except MergeRequestNotFoundError:
+            missing_iids.append(requested_iid)
+            continue
+        counts = _to_thread_counts(node, requested_iid)
+        merge_requests.append(MergeRequestThreadCounts(iid=requested_iid, open=counts.open, resolved=counts.resolved))
+    return MergeRequestThreadCountsBatch(merge_requests=merge_requests, missing_iids=missing_iids)
 
 
 # FastMCP wraps a model union in `result`, which changes both established structured response shapes.
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
-async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument is a user-facing filter.
+async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters and output modes share this dispatch.
     ctx: Context,
     project: Project,
     iid: Iid | None = None,
     state: Literal["open", "resolved", "comments", "all"] = "open",
-    ids: Annotated[list[str] | None, Field(description="Thread IDs from threads.open. Ignores state.")] = None,
+    ids: Annotated[
+        list[str] | None,
+        Field(description="Thread IDs from threads.open. Single iid only. Ignores state."),
+    ] = None,
     file: Annotated[str | None, Field(description="Only threads on this path, old or new.")] = None,
     author: Annotated[str | None, Field(description="Only threads with a note by this user.")] = None,
-    view: Annotated[ThreadView, Field(description="`full` notes, or compact root-note `headings`.")] = "full",
+    view: Annotated[
+        ThreadView,
+        Field(description="`full` notes, compact root-note `headings`, or bot finding bodies in `finding` view."),
+    ] = "full",
     max_body_chars: Annotated[
         int,
         Field(ge=0, le=NOTE_CAP, description="Maximum body characters per note. Zero omits bodies."),
@@ -1468,10 +1608,23 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
         list[PositiveIid] | None,
         Field(description="Batch of 1 to 20 unique positive merge request IIDs. Duplicates keep first-request order."),
     ] = None,
+    count_only: Annotated[
+        bool,
+        Field(
+            description="Return exact open/resolved counts only. Counts both states and fetches no discussion notes."
+        ),
+    ] = False,
 ) -> Any:
-    """Read review thread notes for one merge request or a batch, like `glab mr note list`.
+    """Read compact MR triage status and review thread notes for one MR or a batch, like `glab mr note list`.
 
     - `state`: `open` (default), `resolved`, `comments` (cannot be resolved), or `all`. `ids` ignore `state`.
+    - `count_only=true` returns exact counts from GitLab's resolvable and resolved discussion totals. `open` is total
+      minus resolved. It ignores `state`, counts both states, and fetches no discussion notes. It cannot be combined
+      with `cursor`, `ids`, `file`, or `author`. Batch results contain `iid`, `open`, and `resolved` per MR.
+    - `ids` can only be used with a single `iid`. It is rejected with `iids` because a thread ID can match multiple
+      merge requests in a batch.
+    - Results include the head SHA, source branch, merge status, and pipeline status when available. Use
+      `get_merge_request` when you need a description, approvals, or jobs.
     - Pass exactly one of `iid` or `iids`. Batch `iids` are deduplicated in request order and allow at most 20
       unique positive values. Missing merge requests appear in `missing_iids`.
     - System notes and threads with no human notes are skipped.
@@ -1482,9 +1635,11 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
       the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
       160 characters. It includes no note bodies or replies.
-    - In full view, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits body text. A
-      call returns about 30000 body characters. Headings view returns about 30000 serialized characters. Continue
-      with `next_cursor` using the same filters, `view`, and `max_body_chars`.
+    - `view="finding"` returns full notes like `full`, but removes separate greetings and signoffs from bot-authored
+      notes only when they contain numbered findings. Headings, paths, fixes, and code blocks are kept.
+    - In full and finding views, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits
+      body text. A call returns about 30000 body characters. Headings view returns about 30000 serialized characters.
+      Continue with `next_cursor` using the same filters, `view`, and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
     - Each batch result includes its own `iid`, `threads`, `next_cursor`, and `not_found_ids`. Batch cursors are not
       accepted: resume a result with a single `iid` call and that result's cursor. Every merge request gets its own
@@ -1493,13 +1648,18 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     if (iid is None) == (iids is None):
         raise ToolError("Pass exactly one of iid or iids.")  # noqa: TRY003
 
+    if count_only:
+        if cursor is not None or ids is not None or file is not None or author is not None:
+            raise ToolError("count_only cannot be combined with cursor, ids, file, or author.")  # noqa: TRY003
+        return await _get_thread_counts(get_client(ctx), project, iid, iids)
+
     # An empty list means no IDs were given, so the state filter applies.
     wanted = _bare_ids(ids) if ids else None
     thread_filter = _ThreadFilter(state=state, ids=wanted, file=file, author=author)
     if iid is not None:
         client = get_client(ctx)
         start = _thread_cursor_start(cursor) if cursor else (None, 0)
-        threads, next_cursor, seen = await _scan_threads(
+        threads, next_cursor, seen, mr_headers = await _scan_threads(
             client,
             project,
             iid,
@@ -1512,10 +1672,17 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
         not_found_ids: list[str] = []
         if wanted and cursor is None and not next_cursor:
             not_found_ids = [thread_id for thread_id in wanted if thread_id not in seen]
-        return ThreadList(threads=threads, next_cursor=next_cursor, not_found_ids=not_found_ids)
+        return ThreadList(
+            **mr_headers,
+            threads=threads,
+            next_cursor=next_cursor,
+            not_found_ids=not_found_ids,
+        )
 
     if cursor is not None:
         raise ToolError("Batch thread calls do not accept cursor. Resume with a single iid call.")  # noqa: TRY003
+    if ids is not None:
+        raise ToolError("ids can only be used with a single iid, not iids.")  # noqa: TRY003
     unique_iids = list(dict.fromkeys(iids or []))
     if not unique_iids:
         raise ToolError("Pass at least one merge request IID.")  # noqa: TRY003
@@ -1527,7 +1694,7 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     missing_iids: list[int] = []
     for requested_iid in unique_iids:
         try:
-            threads, next_cursor, seen = await _scan_threads(
+            threads, next_cursor, _, mr_headers = await _scan_threads(
                 client,
                 project,
                 requested_iid,
@@ -1540,16 +1707,12 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
             missing_iids.append(requested_iid)
             continue
 
-        # Each full per-MR scan reports missing thread IDs independently.
-        not_found_ids = [thread_id for thread_id in wanted or [] if thread_id not in seen]
-        if next_cursor:
-            not_found_ids = []
         merge_requests.append(
             MergeRequestThreadList(
+                **mr_headers,
                 iid=requested_iid,
                 threads=threads,
                 next_cursor=next_cursor,
-                not_found_ids=not_found_ids,
             ),
         )
     return MergeRequestThreadBatch(merge_requests=merge_requests, missing_iids=missing_iids)
