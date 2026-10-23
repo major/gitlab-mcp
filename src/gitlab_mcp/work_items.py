@@ -94,6 +94,7 @@ query($fullPath: ID!, $iid: String!, $after: String) {
   namespace(fullPath: $fullPath) {
     __typename fullPath
     workItem(iid: $iid) {
+      iid
       widgets {
         __typename
         ... on WorkItemWidgetNotes {
@@ -428,14 +429,15 @@ def _required_string(item: dict[str, Any], key: str) -> str:
     return value
 
 
-def _positive_graphql_iid(value: Any) -> int:
+def _positive_graphql_iid(value: Any, *, context: str | None = None) -> int:
     """Convert GraphQL's string IID to a positive integer."""
+    context_suffix = f" ({context})" if context else ""
     try:
         iid = int(value)
     except (TypeError, ValueError) as exc:
-        _raise_data_error("GitLab returned a work item without a valid IID.", cause=exc)
+        _raise_data_error(f"GitLab returned a work item without a valid IID{context_suffix}.", cause=exc)
     if iid < 1:
-        _raise_data_error("GitLab returned a work item without a positive IID.")
+        _raise_data_error(f"GitLab returned a work item without a positive IID{context_suffix}.")
     return iid
 
 
@@ -788,7 +790,7 @@ async def read_work_item_notes(  # noqa: PLR0913, PLR0917 - helper signature is 
         {"fullPath": project, "iid": str(iid), "after": after},
     )
     _, item = _item_from_data(data, scope, project, iid)
-    if _positive_graphql_iid(item.get("iid")) != iid:
+    if _positive_graphql_iid(item.get("iid"), context="notes query field") != iid:
         _raise_data_error("GitLab returned a different work item IID than requested.")
     notes_widget = _note_widget(item)
     discussion_nodes, has_next, end_cursor = _discussion_page(notes_widget)

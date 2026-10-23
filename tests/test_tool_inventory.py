@@ -206,3 +206,21 @@ async def test_new_and_extended_options_are_in_the_schema(tools, name, required,
     # Assert
     assert required <= required_fields
     assert required | optional <= properties
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_description"),
+    [
+        ("get_work_item", "Work item (issue) number."),
+        ("list_work_item_notes", "Work item (issue) number."),
+        ("edit_work_item_description", "Work item (issue) number."),
+        ("edit_merge_request_description", "MR number."),
+    ],
+)
+async def test_work_item_iid_descriptions_are_scoped_to_work_item_tools(tools, name, expected_description):
+    """Work-item schemas describe an issue number without changing MR schema wording."""
+    # Arrange
+    iid_schema = tools[name].input_schema["properties"]["iid"]
+
+    # Act / Assert
+    assert iid_schema["description"] == expected_description

@@ -222,6 +222,7 @@ TSV_COLUMNS = ("iid", "title", "author", "state", "draft", "approved", "approved
 # Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
 Project = Annotated[str, Field(description="Project path, like group/project.")]
 Iid = Annotated[int, Field(description="MR number.")]
+WorkItemIid = Annotated[int, Field(description="Work item (issue) number.")]
 PositiveIid = Annotated[int, Field(strict=True, ge=1)]
 
 
@@ -3974,7 +3975,7 @@ async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a u
 async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-facing read option.
     ctx: Context,
     project: Project,
-    iid: Iid,
+    iid: WorkItemIid,
     scope: _work_items.WorkItemScope = "project",
     include_description: bool = True,
     description_limit: Annotated[
@@ -4008,7 +4009,7 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
 async def list_work_item_notes(  # noqa: PLR0913, PLR0917 - each argument is a user-facing read option.
     ctx: Context,
     project: Project,
-    iid: Iid,
+    iid: WorkItemIid,
     scope: _work_items.WorkItemScope = "project",
     cursor: Annotated[
         str | None,
@@ -4059,7 +4060,7 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
 async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument is a user-facing edit option.
     ctx: Context,
     project: Project,
-    iid: Iid,
+    iid: WorkItemIid,
     old_text: Annotated[str, Field(description="Text that must appear exactly once in the description.")],
     new_text: Annotated[str, Field(description="Replacement text. Empty text deletes the match.")],
     scope: _work_items.WorkItemScope = "project",

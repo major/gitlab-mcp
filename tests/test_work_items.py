@@ -818,13 +818,12 @@ def notes_response(  # noqa: PLR0913 - fixture exposes optional response fields 
     *,
     has_next: bool = False,
     end_cursor: str | None = None,
-    item_iid: int | str = IID,
+    item_iid: int | str | None = IID,
     scope: Literal["project", "group"] = "project",
     path: str = PROJECT,
 ) -> httpx.Response:
     """Wrap discussion and nested note pages in a work-item notes widget."""
     item = {
-        "iid": str(item_iid),
         "widgets": [
             {
                 "__typename": "WorkItemWidgetNotes",
@@ -835,6 +834,8 @@ def notes_response(  # noqa: PLR0913 - fixture exposes optional response fields 
             },
         ],
     }
+    if item_iid is not None:
+        item["iid"] = str(item_iid)
     return response(item, scope=scope, path=path)
 
 
@@ -872,6 +873,7 @@ async def test_notes_filter_system_notes_cap_bodies_and_paginate_discussions(git
     query = json.loads(route.calls.last.request.content)["query"]
     assert "scopeNamespace: project(fullPath: $fullPath)" in query
     assert "namespace(fullPath: $fullPath)" in query
+    assert "workItem(iid: $iid) {\n      iid" in query
     assert result["notes"] == [
         {"body": "xxxxx", "at": "2026-10-21", "body_truncated": True},
         {"by": "mhayden", "body": "short", "at": "2026-10-22"},
@@ -905,6 +907,19 @@ async def test_notes_reject_a_different_returned_iid(gitlab_env):
 
     # Act / Assert
     with pytest.raises(ToolError, match="different work item IID"):
+        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize("item_iid", [None, "not-an-iid", "0"])
+@respx.mock
+async def test_notes_report_invalid_returned_iid_field(gitlab_env, item_iid):
+    """Missing or invalid notes query IIDs identify the response field in the error."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=notes_response([], item_iid=item_iid))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="notes query field"):
         await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
