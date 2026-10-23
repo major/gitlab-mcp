@@ -9,9 +9,10 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import mcp
+from gitlab_mcp.server import MAX_CREATE_ASSIGNEES, mcp
 
 API = "https://gitlab.example.com/api/v4"
+GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 PROJECT_API = f"{API}/projects/group%2Fproject"
 PROJECT_LABELS = f"{PROJECT_API}/labels"
@@ -44,6 +45,13 @@ def create_response(**overrides: Any) -> httpx.Response:
     """Return a successful merge request creation response."""
     body = {"iid": CREATED_IID, "web_url": CREATED_URL, "id": 4200} | overrides
     return httpx.Response(201, json=body)
+
+
+def mock_assignee_lookup(router: respx.MockRouter, nodes: list[dict[str, Any]]) -> respx.Route:
+    """Return the requested users from the create-assignee GraphQL lookup."""
+    return router.post(GRAPHQL).mock(
+        return_value=httpx.Response(200, json={"data": {"users": {"nodes": nodes}}}),
+    )
 
 
 def mock_blocker(router: respx.MockRouter, iid: int, *, global_id: int | None = None) -> respx.Route:
@@ -97,6 +105,193 @@ async def test_create_with_fields_labels_and_blockers(gitlab_env, router):
         "url": CREATED_URL,
         "applied": ["create", "blocked_by:5"],
     }
+
+
+@pytest.mark.parametrize("arguments", [{}, {"assignees": []}])
+async def test_omitted_or_empty_assignees_skip_lookup_and_body_field(gitlab_env, router, arguments):
+    """Omitted and empty assignees do not add lookup or assignment requests."""
+    # Arrange
+    lookup = router.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": {"users": {"nodes": []}}}))
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature", target_branch="main", title="New MR", description="Details", **arguments
+    )
+
+    # Assert
+    assert lookup.call_count == 0
+    assert "assignee_ids" not in json.loads(create.calls[0].request.content)
+    assert data["applied"] == ["create"]
+
+
+async def test_known_assignee_is_resolved_before_creation_and_reported_applied(gitlab_env, router):
+    """A known username is resolved by GraphQL and its numeric ID is included in creation."""
+    # Arrange
+    lookup = mock_assignee_lookup(router, [{"id": "gid://gitlab/User/19", "username": "alice"}])
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature", target_branch="main", title="New MR", description="Details", assignees=["alice"]
+    )
+
+    # Assert
+    assert json.loads(lookup.calls[0].request.content)["variables"] == {"usernames": ["alice"]}
+    assert json.loads(create.calls[0].request.content)["assignee_ids"] == [19]
+    assert data["applied"] == ["create", "assignees:alice"]
+
+
+async def test_unknown_assignee_is_omitted_and_reported(gitlab_env, router):
+    """A missing GraphQL user is reported without blocking merge request creation."""
+    # Arrange
+    mock_assignee_lookup(router, [])
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature", target_branch="main", title="New MR", description="Details", assignees=["missing"]
+    )
+
+    # Assert
+    assert "assignee_ids" not in json.loads(create.calls[0].request.content)
+    assert data["failed"] == {"assignees:missing": "unknown user"}
+    assert data["applied"] == ["create"]
+
+
+async def test_mixed_known_and_unknown_assignees(gitlab_env, router):
+    """Known assignees are included while unknown users are reported independently."""
+    # Arrange
+    mock_assignee_lookup(router, [{"id": "gid://gitlab/User/19", "username": "alice"}])
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature",
+        target_branch="main",
+        title="New MR",
+        description="Details",
+        assignees=["alice", "missing"],
+    )
+
+    # Assert
+    assert json.loads(create.calls[0].request.content)["assignee_ids"] == [19]
+    assert data["failed"] == {"assignees:missing": "unknown user"}
+    assert data["applied"] == ["create", "assignees:alice"]
+
+
+async def test_assignee_lookup_normalizes_case_and_deduplicates(gitlab_env, router):
+    """Case variants are queried and assigned once, preserving the first requested spelling in results."""
+    # Arrange
+    lookup = mock_assignee_lookup(router, [{"id": "gid://gitlab/User/19", "username": "Alice"}])
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature",
+        target_branch="main",
+        title="New MR",
+        description="Details",
+        assignees=["Alice", "alice", "ALICE"],
+    )
+
+    # Assert
+    assert json.loads(lookup.calls[0].request.content)["variables"] == {"usernames": ["alice"]}
+    assert json.loads(create.calls[0].request.content)["assignee_ids"] == [19]
+    assert data["applied"] == ["create", "assignees:Alice"]
+
+
+async def test_assignee_lookup_failure_reports_each_user_and_creation_continues(gitlab_env, router):
+    """A failed user lookup is item-scoped and does not prevent creation."""
+    # Arrange
+    lookup = router.post(GRAPHQL).mock(return_value=httpx.Response(500, json={"message": "Boom"}))
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature",
+        target_branch="main",
+        title="New MR",
+        description="Details",
+        assignees=["Alice", "bob", "alice"],
+    )
+
+    # Assert
+    assert lookup.call_count == 1
+    assert "assignee_ids" not in json.loads(create.calls[0].request.content)
+    assert set(data["failed"]) == {"assignees:Alice", "assignees:bob"}
+    assert all("HTTP 500" in message for message in data["failed"].values())
+    assert data["applied"] == ["create"]
+
+
+@pytest.mark.parametrize(
+    "global_id",
+    ["gid://gitlab/Group/19", "gid://gitlab/User/0", "not-a-gid", f"gid://gitlab/User/{'9' * 5000}"],
+)
+async def test_invalid_assignee_global_id_is_reported_and_omitted(gitlab_env, router, global_id):
+    """Only positive numeric GitLab User global IDs can be included in creation."""
+    # Arrange
+    mock_assignee_lookup(router, [{"id": global_id, "username": "alice"}])
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        source_branch="feature", target_branch="main", title="New MR", description="Details", assignees=["alice"]
+    )
+
+    # Assert
+    assert "assignee_ids" not in json.loads(create.calls[0].request.content)
+    assert data["failed"] == {"assignees:alice": "could not verify user: invalid GitLab user ID"}
+    assert data["applied"] == ["create"]
+
+
+async def test_failed_creation_does_not_report_assignees_applied(gitlab_env, router):
+    """A definite creation rejection does not claim that pre-resolved assignees were applied."""
+    # Arrange
+    mock_assignee_lookup(router, [{"id": "gid://gitlab/User/19", "username": "alice"}])
+    create = router.post(CREATE).mock(return_value=httpx.Response(400, json={"message": "Bad request"}))
+
+    # Act
+    data = await call_tool(
+        source_branch="feature", target_branch="main", title="New MR", description="Details", assignees=["alice"]
+    )
+
+    # Assert
+    assert create.call_count == 1
+    assert data["failed"]["create"]
+    assert not any(key.startswith("assignees:") for key in data.get("applied", []))
+
+
+async def test_unknown_creation_does_not_report_assignees_applied(gitlab_env, router):
+    """An uncertain creation does not claim any assignee assignment was applied."""
+    # Arrange
+    mock_assignee_lookup(router, [{"id": "gid://gitlab/User/19", "username": "alice"}])
+    create = router.post(CREATE).mock(side_effect=httpx.ConnectError("connection reset"))
+
+    # Act
+    data = await call_tool(
+        source_branch="feature", target_branch="main", title="New MR", description="Details", assignees=["alice"]
+    )
+
+    # Assert
+    assert create.call_count == 1
+    assert data["unknown"] == ["create"]
+    assert not any(key.startswith("assignees:") for key in data.get("applied", []))
+
+
+async def test_assignees_schema_allows_up_to_100_names(gitlab_env):
+    """The tool schema exposes the optional assignees list with its 100-item limit."""
+    # Arrange
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+
+    # Act
+    tool = next(tool for tool in tools if tool.name == "create_merge_request")
+
+    # Assert
+    assignees = tool.input_schema["properties"]["assignees"]
+    array_schema = next(option for option in assignees["anyOf"] if option.get("type") == "array")
+    assert array_schema["maxItems"] == MAX_CREATE_ASSIGNEES
 
 
 async def test_description_file_is_read_as_utf8_and_empty_content_is_valid(gitlab_env, router, tmp_path):
