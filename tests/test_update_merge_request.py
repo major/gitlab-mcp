@@ -14,6 +14,7 @@ from gitlab_mcp.server import MAX_PAGES, mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 MR = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187"
+LABELS = "https://gitlab.example.com/api/v4/projects/group%2Fproject/labels"
 PROJECT = "group/project"
 PROJECT_ID = 1
 IID = 2187
@@ -95,6 +96,12 @@ def serve_writes(router: respx.MockRouter, replies: dict[str, Any] | None = None
     """Register a success reply for every write endpoint and for GraphQL. Tests can swap any route later."""
     return {
         "fields": router.put(MR).mock(return_value=httpx.Response(200, json={})),
+        "labels": router.get(LABELS).mock(
+            return_value=httpx.Response(
+                200,
+                json=[{"name": name} for name in ("bug", "urgent", "wip", "a", "b", "c")],
+            ),
+        ),
         "rebase": router.put(f"{MR}/rebase").mock(return_value=httpx.Response(202, json={"message": "202 Accepted"})),
         "approve": router.post(f"{MR}/approve").mock(return_value=httpx.Response(201, json={})),
         "unapprove": router.post(f"{MR}/unapprove").mock(return_value=httpx.Response(201, json={})),
@@ -182,6 +189,93 @@ async def test_all_plain_fields_share_one_put(gitlab_env, router):
         "remove_labels": "b,c",
     }
     assert data["applied"] == ["fields"]
+
+
+async def test_labels_use_exact_names_and_include_ancestor_group_labels(gitlab_env, router):
+    """Only exact project or ancestor-group names are sent, with unrelated fields still applied."""
+    # Arrange
+    routes = serve_writes(router)
+    routes["labels"].mock(return_value=httpx.Response(200, json=[{"name": "Group::Bug"}, {"name": "buggy"}]))
+
+    # Act
+    data = await call_tool(
+        title="New title",
+        add_labels=["Group::Bug", "group::bug"],
+        remove_labels=["buggy", "bug"],
+    )
+
+    # Assert
+    assert routes["labels"].call_count == 1
+    assert dict(routes["labels"].calls[0].request.url.params) == {
+        "include_ancestor_groups": "true",
+        "per_page": "100",
+        "page": "1",
+    }
+    assert [json.loads(call.request.content) for call in routes["fields"].calls] == [
+        {"title": "New title", "add_labels": "Group::Bug", "remove_labels": "buggy"}
+    ]
+    assert data["applied"] == ["fields"]
+    assert data["failed"] == {"labels:group::bug": "unknown label", "labels:bug": "unknown label"}
+
+
+async def test_label_scan_stops_when_all_requested_labels_are_found(gitlab_env, router):
+    """A later page is not requested after every label has been found."""
+    # Arrange
+    routes = serve_writes(router)
+    routes["labels"].mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"name": "bug"}, {"name": "urgent"}],
+            headers={"X-Next-Page": "2"},
+        ),
+    )
+
+    # Act
+    data = await call_tool(add_labels=["bug", "urgent"])
+
+    # Assert
+    assert [int(call.request.url.params["page"]) for call in routes["labels"].calls] == [1]
+    assert json.loads(routes["fields"].calls[0].request.content) == {"add_labels": "bug,urgent"}
+    assert data["applied"] == ["fields"]
+
+
+async def test_incomplete_label_scan_skips_unchecked_labels(gitlab_env, router):
+    """Known labels and unrelated fields proceed, while labels beyond the page cap are not guessed."""
+    # Arrange
+    routes = serve_writes(router)
+
+    def label_page(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        names = [{"name": "bug"}] if page == 1 else []
+        return httpx.Response(200, json=names, headers={"X-Next-Page": str(page + 1)})
+
+    routes["labels"].mock(side_effect=label_page)
+
+    # Act
+    data = await call_tool(title="New title", add_labels=["bug", "not-seen"])
+
+    # Assert
+    assert [int(call.request.url.params["page"]) for call in routes["labels"].calls] == list(range(1, MAX_PAGES + 1))
+    assert json.loads(routes["fields"].calls[0].request.content) == {"title": "New title", "add_labels": "bug"}
+    assert data["applied"] == ["fields"]
+    assert data["failed"] == {"labels:not-seen": f"could not verify label after {MAX_PAGES} pages"}
+
+
+async def test_label_lookup_failure_skips_labels_but_not_other_fields(gitlab_env, router):
+    """A failed label lookup skips unchecked labels without blocking an unrelated field write."""
+    # Arrange
+    routes = serve_writes(router)
+    routes["labels"].mock(return_value=httpx.Response(500, json={"message": "Boom"}))
+
+    # Act
+    data = await call_tool(title="New title", add_labels=["bug"], remove_labels=["wip"])
+
+    # Assert
+    assert routes["fields"].call_count == 1
+    assert json.loads(routes["fields"].calls[0].request.content) == {"title": "New title"}
+    assert data["applied"] == ["fields"]
+    assert "HTTP 500" in data["failed"]["labels:bug"]
+    assert "HTTP 500" in data["failed"]["labels:wip"]
 
 
 @pytest.mark.parametrize("draft", [True, False])

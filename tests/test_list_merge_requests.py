@@ -105,6 +105,11 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "state": "opened",
         "authorUsername": "jdoe",
         "search": None,
+        "createdAfter": None,
+        "updatedAfter": None,
+        "targetBranches": None,
+        "includeSourceBranch": False,
+        "includeLabels": False,
         "after": None,
         "first": 5,
     }
@@ -113,6 +118,76 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "merge_requests": (f"{HEADER}\n7\tFix login\t\topened\ttrue\ttrue\treviewer\t3\t2026-10-20"),
         "has_more": False,
     }
+
+
+@respx.mock
+async def test_filters_and_optional_columns(gitlab_env):
+    """Server-side filters are sent, and requested optional data is appended safely to TSV."""
+    # Arrange
+    node = make_node(
+        12,
+        sourceBranch="feature\tline\nbreak",
+        labels={
+            "nodes": [{"title": "Group::One"}, {"title": "path\tname"}],
+            "pageInfo": {"hasNextPage": True},
+        },
+    )
+    route = respx.post(GRAPHQL).mock(return_value=make_page(node))
+
+    # Act
+    data = await call_tool(
+        {
+            "created_after": "2026-10-01T12:30:00+02:00",
+            "updated_after": "2026-10-02T00:00:00Z",
+            "target_branch": "release/1",
+            "include_source_branch": True,
+            "include_labels": True,
+            "limit": 1,
+        },
+    )
+
+    # Assert
+    assert sent_variables(route) == {
+        "fullPath": PROJECT,
+        "state": "opened",
+        "authorUsername": None,
+        "search": None,
+        "createdAfter": "2026-10-01T10:30:00Z",
+        "updatedAfter": "2026-10-02T00:00:00Z",
+        "targetBranches": ["release/1"],
+        "includeSourceBranch": True,
+        "includeLabels": True,
+        "after": None,
+        "first": 1,
+    }
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "createdAfter: $createdAfter" in query
+    assert "updatedAfter: $updatedAfter" in query
+    assert "targetBranches: $targetBranches" in query
+    assert "sourceBranch @include(if: $includeSourceBranch)" in query
+    assert "labels(first: 100) @include(if: $includeLabels)" in query
+    row = rows(data)[0]
+    assert list(row) == [*HEADER.split("\t"), "source_branch", "labels"]
+    assert row["source_branch"] == "feature line break"
+    assert row["labels"] == json.dumps(["Group::One", "path\tname"], ensure_ascii=False, separators=(",", ":"))
+    assert data["labels_complete"] is False
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2026-10-01", "2026-10-01T12:30:00", "not-a-timestamp"],
+    ids=["date-only", "timezone-missing", "invalid"],
+)
+@respx.mock
+async def test_timestamps_must_be_timezone_aware_datetimes_before_network(gitlab_env, timestamp):
+    """Date-only, timezone-naive, and invalid timestamp filters fail before any request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=make_page())
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="timezone-aware ISO 8601 datetime"):
+        await call_tool({"created_after": timestamp})
+    assert route.call_count == 0
 
 
 @respx.mock
@@ -130,6 +205,11 @@ async def test_defaults_list_open_mrs_by_any_author(gitlab_env):
         "state": "opened",
         "authorUsername": None,  # GitLab treats null as "no author filter".
         "search": None,
+        "createdAfter": None,
+        "updatedAfter": None,
+        "targetBranches": None,
+        "includeSourceBranch": False,
+        "includeLabels": False,
         "after": None,
         "first": 20,
     }
@@ -385,6 +465,11 @@ async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
             "state": "closed",
             "authorUsername": "jdoe",
             "search": "release note",
+            "createdAfter": None,
+            "updatedAfter": None,
+            "targetBranches": None,
+            "includeSourceBranch": False,
+            "includeLabels": False,
             "after": None,
             "first": FULL_PAGE,
         },
@@ -393,6 +478,11 @@ async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
             "state": "closed",
             "authorUsername": "jdoe",
             "search": "release note",
+            "createdAfter": None,
+            "updatedAfter": None,
+            "targetBranches": None,
+            "includeSourceBranch": False,
+            "includeLabels": False,
             "after": "c1",
             "first": FULL_PAGE,
         },

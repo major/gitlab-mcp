@@ -6,6 +6,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
 from urllib.parse import quote
@@ -16,6 +17,8 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
 from pydantic import BaseModel, Field, model_validator
 
+from gitlab_mcp import description_edits as _description_edits
+from gitlab_mcp import work_items as _work_items
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.config import ConfigError, Settings
 
@@ -23,19 +26,34 @@ from gitlab_mcp.config import ConfigError, Settings
 # thread filters run on our side. Keeps one tool call from walking a huge project.
 MAX_PAGES = 5
 MAX_BATCH_MERGE_REQUESTS = 20
+MAX_CREATE_BLOCKERS = 20
+MAX_CREATE_LABELS = 100
+HTTP_NOT_FOUND = 404
+HTTP_REQUEST_TIMEOUT = 408
+HTTP_CONFLICT = 409
+HTTP_SERVER_ERROR = 500
 
 # One request per page. `open_threads` is computed from the two counts.
 MERGE_REQUESTS_QUERY = """
 query(
-  $fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $search: String, $first: Int!, $after: String
+  $fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $search: String,
+  $createdAfter: Time, $updatedAfter: Time, $targetBranches: [String!],
+  $includeSourceBranch: Boolean!, $includeLabels: Boolean!, $first: Int!, $after: String
 ) {
   project(fullPath: $fullPath) {
     mergeRequests(
-      state: $state, authorUsername: $authorUsername, search: $search, first: $first, after: $after, sort: UPDATED_DESC
+      state: $state, authorUsername: $authorUsername, search: $search,
+      createdAfter: $createdAfter, updatedAfter: $updatedAfter, targetBranches: $targetBranches,
+      first: $first, after: $after, sort: UPDATED_DESC
     ) {
       pageInfo { hasNextPage endCursor }
       nodes {
         iid title state draft updatedAt
+        sourceBranch @include(if: $includeSourceBranch)
+        labels(first: 100) @include(if: $includeLabels) {
+          nodes { title }
+          pageInfo { hasNextPage }
+        }
         author { username }
         approved
         approvedBy { nodes { username } }
@@ -254,6 +272,9 @@ class MergeRequestSummary(BaseModel):
 
     iid: int
     title: str
+    source_branch: str | None = None
+    labels: list[str] = Field(default_factory=list)
+    labels_truncated: bool = False
     author: str | None  # Null when the author was deleted or banned.
     state: str
     draft: bool
@@ -271,10 +292,12 @@ class MergeRequestList(BaseModel):
         description=(
             "TSV with a header row. Columns: iid, title, author, state, draft, approved, "
             "approved_by, open_threads, updated. approved_by is comma-separated usernames. "
-            "An empty cell means none. Booleans are true/false."
+            "An empty cell means none. Booleans are true/false. source_branch and labels are appended only when asked; "
+            "labels is a JSON array in one cell, and labels_complete reports whether all returned labels were included."
         ),
     )
     has_more: bool
+    labels_complete: bool | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class MergeTrainList(BaseModel):
@@ -570,20 +593,46 @@ def _cell(value: object) -> str:
     return re.sub(r"[\t\r\n]+", " ", str(value))
 
 
-def _to_tsv(mrs: list[MergeRequestSummary]) -> str:
-    """Render merge requests as TSV: a header row, then one line per MR, no trailing newline."""
-    lines = ["\t".join(TSV_COLUMNS)]
-    lines.extend("\t".join(_cell(getattr(mr, column)) for column in TSV_COLUMNS) for mr in mrs)
+def _to_tsv(
+    mrs: list[MergeRequestSummary],
+    *,
+    include_source_branch: bool = False,
+    include_labels: bool = False,
+) -> str:
+    """Render merge requests as TSV, appending optional data columns when requested."""
+    columns = list(TSV_COLUMNS)
+    if include_source_branch:
+        columns.append("source_branch")
+    if include_labels:
+        columns.append("labels")
+    lines = ["\t".join(columns)]
+    for mr in mrs:
+        values = [_cell(getattr(mr, column)) for column in TSV_COLUMNS]
+        if include_source_branch:
+            values.append(_cell(mr.source_branch))
+        if include_labels:
+            # JSON escaping keeps tabs and newlines inside one TSV cell.
+            values.append(json.dumps(mr.labels, ensure_ascii=False, separators=(",", ":")))
+        lines.append("\t".join(values))
     return "\n".join(lines)
 
 
-def _to_summary(node: dict[str, Any]) -> MergeRequestSummary:
+def _to_summary(
+    node: dict[str, Any],
+    *,
+    include_source_branch: bool = False,
+    include_labels: bool = False,
+) -> MergeRequestSummary:
     """Convert one GraphQL merge request node into a summary."""
     # A deleted or banned author comes back as null.
     author = node["author"]
+    label_connection = node.get("labels") if include_labels else None
     return MergeRequestSummary(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
+        source_branch=node.get("sourceBranch") if include_source_branch else None,
+        labels=[label["title"] for label in label_connection["nodes"]] if label_connection else [],
+        labels_truncated=label_connection["pageInfo"]["hasNextPage"] if label_connection else False,
         author=author["username"] if author else None,
         state=node["state"],
         draft=node["draft"],
@@ -622,6 +671,23 @@ def _to_merge_train_entry(target_branch: str, position: int, car: dict[str, Any]
     return "\t".join(_cell(value) for value in values)
 
 
+def _normalize_timestamp(value: str | None, name: str) -> str | None:
+    """Validate a timezone-aware ISO 8601 datetime and normalize it to UTC for GraphQL."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00").replace("z", "+00:00"))
+    except OverflowError, ValueError:
+        raise ToolError(  # noqa: TRY003 - the parameter name makes the validation error actionable.
+            f"{name} must be a timezone-aware ISO 8601 datetime, such as 2026-10-01T12:30:00Z."
+        ) from None
+    if "T" not in value.upper() or parsed.utcoffset() is None:
+        raise ToolError(  # noqa: TRY003 - the parameter name makes the validation error actionable.
+            f"{name} must be a timezone-aware ISO 8601 datetime, such as 2026-10-01T12:30:00Z."
+        )
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a user-facing filter.
     ctx: Context,
@@ -640,6 +706,23 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         bool | None,
         Field(description="True: only MRs with unresolved threads. False: only MRs without."),
     ] = None,
+    created_after: Annotated[
+        str | None,
+        Field(description="Timezone-aware ISO 8601 datetime. Date-only and timezone-naive values are not accepted."),
+    ] = None,
+    updated_after: Annotated[
+        str | None,
+        Field(description="Timezone-aware ISO 8601 datetime. Date-only and timezone-naive values are not accepted."),
+    ] = None,
+    target_branch: Annotated[str | None, Field(description="Only merge requests targeting this branch.")] = None,
+    include_source_branch: Annotated[
+        bool,
+        Field(description="Append the source branch column. Defaults to false to keep output compact."),
+    ] = False,
+    include_labels: Annotated[
+        bool,
+        Field(description="Append labels as a JSON array in one TSV cell. Defaults to false."),
+    ] = False,
     limit: Annotated[int, Field(ge=1, le=100)] = 20,
 ) -> MergeRequestList:
     """List merge requests in a project, newest-updated first.
@@ -654,10 +737,16 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
     approval, on Premium and Ultimate it means all approval rules are met.
     `search` uses GitLab's `Project.mergeRequests(search:)` filter, which matches
     text in the title or description.
+    `created_after` and `updated_after` accept timezone-aware ISO 8601 datetimes.
+    `target_branch` filters by target branch. `include_source_branch` and `include_labels`
+    append columns only when requested. Labels are JSON arrays inside a TSV cell;
+    `labels_complete` is false when any returned label list exceeds its first 100 labels.
     `approved` and `has_open_threads` are filtered after fetching, so the tool
     scans at most 5 pages. If `has_more` is true but fewer than `limit` MRs
     came back, the scan stopped early and more matches may exist.
     """
+    created_after = _normalize_timestamp(created_after, "created_after")
+    updated_after = _normalize_timestamp(updated_after, "updated_after")
     client = get_client(ctx)
     # Client-side filters can drop nodes, so fetch big pages to find matches faster.
     filtered = approved is not None or has_open_threads is not None
@@ -666,6 +755,11 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         "state": state,
         "authorUsername": author,
         "search": search,
+        "createdAfter": created_after,
+        "updatedAfter": updated_after,
+        "targetBranches": [target_branch] if target_branch is not None else None,
+        "includeSourceBranch": include_source_branch,
+        "includeLabels": include_labels,
         "after": None,
         "first": 100 if filtered else limit,
     }
@@ -677,7 +771,10 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         if data["project"] is None:
             raise ProjectNotFoundError(project)
         connection = data["project"]["mergeRequests"]
-        summaries = [_to_summary(node) for node in connection["nodes"]]
+        summaries = [
+            _to_summary(node, include_source_branch=include_source_branch, include_labels=include_labels)
+            for node in connection["nodes"]
+        ]
         collected.extend(mr for mr in summaries if _matches(mr, approved, has_open_threads))
         page_info = connection["pageInfo"]
         has_next = page_info["hasNextPage"]
@@ -685,10 +782,16 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
             break
         variables["after"] = page_info["endCursor"]
 
+    displayed = collected[:limit]
     return MergeRequestList(
         web_url_prefix=f"{client.settings.url}/{project}/-/merge_requests/",
-        merge_requests=_to_tsv(collected[:limit]),
+        merge_requests=_to_tsv(
+            displayed,
+            include_source_branch=include_source_branch,
+            include_labels=include_labels,
+        ),
         has_more=len(collected) > limit or has_next,
+        labels_complete=not any(mr.labels_truncated for mr in displayed) if include_labels else None,
     )
 
 
@@ -1527,6 +1630,35 @@ def _unattempted_review_notes(count: int, warning: str) -> PostReviewNotesResult
     )
 
 
+def _read_server_local_utf8_file(
+    path_value: str,
+    *,
+    path_field: str,
+    size_field: str,
+    byte_limit: int,
+) -> str:
+    """Read an absolute server-local regular UTF-8 file with a strict byte limit."""
+    path = Path(path_value)
+    if not path.is_absolute():
+        _raise_review_preflight_error(f"{path_field} must be an absolute server-local path")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            _raise_review_preflight_error(f"{path_field} must point to a regular file")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            encoded = source.read(byte_limit + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(encoded) > byte_limit:
+        _raise_review_preflight_error(f"{size_field} exceeds {byte_limit} UTF-8 bytes")
+    try:
+        return encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _raise_review_preflight_error(f"{path_field} is not valid UTF-8", cause=exc)
+
+
 def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
     """Read and validate every note body before the tool sends any GitLab request."""
     bodies: list[str] = []
@@ -1535,26 +1667,13 @@ def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
             body = note.body
             size = len(body.encode("utf-8"))
         else:
-            path = Path(note.body_path or "")
-            if not path.is_absolute():
-                _raise_review_preflight_error(f"note {index} body_path must be an absolute server-local path")
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    _raise_review_preflight_error(f"note {index} body_path must point to a regular file")
-                with os.fdopen(descriptor, "rb") as source:
-                    descriptor = -1
-                    encoded = source.read(REVIEW_NOTE_BODY_CAP + 1)
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            if len(encoded) > REVIEW_NOTE_BODY_CAP:
-                _raise_review_preflight_error(f"note {index} body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
-            try:
-                body = encoded.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                _raise_review_preflight_error(f"note {index} body_path is not valid UTF-8", cause=exc)
-            size = len(encoded)
+            body = _read_server_local_utf8_file(
+                note.body_path or "",
+                path_field=f"note {index} body_path",
+                size_field=f"note {index} body",
+                byte_limit=REVIEW_NOTE_BODY_CAP,
+            )
+            size = len(body.encode("utf-8"))
         if not body.strip():
             _raise_review_preflight_error(f"note {index} body must not be blank")
         if size > REVIEW_NOTE_BODY_CAP:
@@ -2153,6 +2272,8 @@ STEP_STATUS_REASONS = {
 
 # Blocks per page on the REST blocks endpoint. The largest page GitLab serves.
 BLOCKS_PAGE_SIZE = 100
+# Labels per page on the project labels endpoint. The largest page GitLab serves.
+PROJECT_LABELS_PAGE_SIZE = 100
 
 
 class MergeRequestUpdate(BaseModel):
@@ -2293,6 +2414,55 @@ async def _known_usernames(client: GitLabClient, usernames: set[str]) -> dict[st
     return {node["username"].lower(): node["username"] for node in data["users"]["nodes"]}
 
 
+async def validate_project_labels(
+    client: GitLabClient,
+    project: str,
+    labels: Sequence[str],
+) -> tuple[list[str], dict[str, str]]:
+    """Return requested labels that exist and failures for labels that cannot be checked.
+
+    Names are matched exactly, including scoped and ancestor-group labels. The
+    scan stops when every requested name is found or after ``MAX_PAGES``.
+    Failure keys are requested label names; callers can add tool-specific context.
+    """
+    requested = list(dict.fromkeys(labels))
+    if not requested:
+        return [], {}
+
+    wanted = set(requested)
+    found: set[str] = set()
+    path = f"/projects/{quote(project, safe='')}/labels"
+    page = 1
+    try:
+        for _ in range(MAX_PAGES):
+            data, next_page = await client.get_page(
+                path,
+                include_ancestor_groups=True,
+                per_page=PROJECT_LABELS_PAGE_SIZE,
+                page=page,
+            )
+            if not isinstance(data, list) or any(
+                not isinstance(label, dict) or not isinstance(label.get("name"), str) for label in data
+            ):
+                return [name for name in labels if name in found], {
+                    name: "could not verify label: invalid response" for name in requested if name not in found
+                }
+            found.update(label["name"] for label in data if label["name"] in wanted)
+            if found == wanted:
+                return [name for name in labels if name in found], {}
+            if next_page is None:
+                return [name for name in labels if name in found], {
+                    name: "unknown label" for name in requested if name not in found
+                }
+            page = next_page
+    except ToolError as exc:
+        return [name for name in labels if name in found], {name: str(exc) for name in requested if name not in found}
+
+    return [name for name in labels if name in found], {
+        name: f"could not verify label after {MAX_PAGES} pages" for name in requested if name not in found
+    }
+
+
 async def _list_blocks(client: GitLabClient, mr_path: str) -> tuple[list[dict[str, Any]], bool]:
     """Return the block entries of a merge request, and whether the scan stopped before the last page.
 
@@ -2345,6 +2515,7 @@ class _Update:
 
     async def run(self) -> None:
         """Run every requested step, in the order the docs describe."""
+        await self._labels()
         await self._fields()
         await self._draft()
         await self._people()
@@ -2390,6 +2561,18 @@ class _Update:
         body = self.changes.fields_body()
         if body:
             await self.attempt("fields", self.client.request("PUT", self.path, json=body))
+
+    async def _labels(self) -> None:
+        """Check project and ancestor-group labels before including them in a fields PUT."""
+        changes = self.changes
+        requested = [*changes.add_labels, *changes.remove_labels]
+        if not requested:
+            return
+        valid, failures = await validate_project_labels(self.client, self.project, requested)
+        known = set(valid)
+        changes.add_labels = [name for name in changes.add_labels if name in known]
+        changes.remove_labels = [name for name in changes.remove_labels if name in known]
+        self.failed.update({f"labels:{name}": reason for name, reason in failures.items()})
 
     async def _draft(self) -> None:
         """Set or clear draft status. GitLab only accepts this change through GraphQL."""
@@ -2550,3 +2733,366 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
         failed=update.failed,
         **final,
     )
+
+
+class MergeRequestCreateResult(BaseModel):
+    """The result of creating a merge request and its requested dependencies."""
+
+    iid: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    url: str = Field(default="", exclude_if=lambda value: not value)
+    applied: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
+    unknown: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
+    failed: dict[str, str] = Field(default_factory=dict, exclude_if=lambda value: not value)
+
+
+async def _resolve_create_blockers(
+    client: GitLabClient,
+    project: str,
+    blockers: Sequence[int],
+) -> tuple[dict[int, int], dict[str, str]]:
+    """Resolve same-project blocker IIDs to numeric global IDs before creating an MR."""
+    resolved: dict[int, int] = {}
+    failures: dict[str, str] = {}
+    project_path = f"/projects/{quote(project, safe='')}"
+    for iid in blockers:
+        key = f"blocked_by:{iid}"
+        try:
+            blocker = await client.get(f"{project_path}/merge_requests/{iid}")
+        except GitLabAPIError as exc:
+            failures[key] = (
+                "not found in this project or inaccessible"
+                if exc.status == HTTP_NOT_FOUND
+                else f"could not verify blocker: {exc}"
+            )
+            continue
+        except ToolError as exc:
+            failures[key] = f"could not verify blocker: {exc}"
+            continue
+
+        if not isinstance(blocker, dict) or type(blocker.get("iid")) is not int or blocker["iid"] != iid:
+            failures[key] = "GitLab did not return this merge request IID"
+            continue
+        global_id = blocker.get("id")
+        if type(global_id) is not int or global_id < 1:
+            failures[key] = "GitLab did not return a numeric global merge request ID"
+            continue
+        resolved[iid] = global_id
+    return resolved, failures
+
+
+def _create_description(description: str | None, description_file: str | None) -> str:
+    """Require exactly one description source and return its validated text."""
+    if (description is None) == (description_file is None):
+        raise ToolError("Set exactly one of description or description_file.")  # noqa: TRY003
+    if description is not None:
+        size = len(description.encode("utf-8"))
+        if size > REVIEW_NOTE_BODY_CAP:
+            raise ToolError(f"description exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes.")  # noqa: TRY003
+        return description
+
+    try:
+        return _read_server_local_utf8_file(
+            description_file or "",
+            path_field="description_file",
+            size_field="description_file",
+            byte_limit=REVIEW_NOTE_BODY_CAP,
+        )
+    except (OSError, ValueError) as exc:
+        raise ToolError(f"Could not read description_file: {exc}") from exc  # noqa: TRY003
+
+
+def _uncertain_write_error(error: GitLabAPIError) -> bool:
+    """Return true for HTTP statuses that can hide a committed write."""
+    return error.status == HTTP_REQUEST_TIMEOUT or error.status >= HTTP_SERVER_ERROR
+
+
+async def _post_create_request(
+    client: GitLabClient,
+    path: str,
+    body: dict[str, Any],
+    failures: dict[str, str],
+) -> tuple[dict[str, Any] | None, MergeRequestCreateResult | None]:
+    """Post the new merge request and return either its response or a terminal result."""
+    try:
+        response = await client.request("POST", path, json=body)
+    except GitLabConnectionError:
+        return None, MergeRequestCreateResult(unknown=["create"], failed=failures)
+    except GitLabAPIError as exc:
+        if _uncertain_write_error(exc):
+            return None, MergeRequestCreateResult(unknown=["create"], failed=failures)
+        failures["create"] = str(exc)
+        return None, MergeRequestCreateResult(failed=failures)
+    if not isinstance(response, dict):
+        return None, MergeRequestCreateResult(unknown=["create"], failed=failures)
+    return response, None
+
+
+async def _post_create_dependency(
+    client: GitLabClient,
+    path: str,
+    global_id: int,
+) -> tuple[Literal["applied", "failed", "unknown"], str]:
+    """Post one dependency and distinguish definite failures from uncertain outcomes."""
+    try:
+        await client.request("POST", path, blocking_merge_request_id=global_id)
+    except GitLabConnectionError as exc:
+        return "unknown", str(exc)
+    except GitLabAPIError as exc:
+        if _uncertain_write_error(exc):
+            return "unknown", str(exc)
+        reason = str(exc)
+        if exc.status == HTTP_CONFLICT:
+            reason += " The existing dependency was not confirmed; check before retrying."
+        return "failed", reason
+    except ToolError as exc:
+        return "failed", str(exc)
+    return "applied", ""
+
+
+async def _apply_create_dependencies(  # noqa: PLR0913, PLR0917 - each input is part of dependency creation.
+    client: GitLabClient,
+    project_path: str,
+    created_iid: int,
+    blockers: Sequence[int],
+    global_ids: dict[int, int],
+    failures: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Add dependencies sequentially, stopping if a write outcome becomes unknown."""
+    applied = ["create"]
+    unknown: list[str] = []
+    for index, blocker_iid in enumerate(blockers):
+        key = f"blocked_by:{blocker_iid}"
+        status, reason = await _post_create_dependency(
+            client,
+            f"{project_path}/merge_requests/{created_iid}/blocks",
+            global_ids[blocker_iid],
+        )
+        if status == "applied":
+            applied.append(key)
+        elif status == "failed":
+            failures[key] = reason
+        else:
+            unknown.append(key)
+            failures.update(
+                {
+                    f"blocked_by:{remaining}": "not attempted after an unknown dependency outcome"
+                    for remaining in blockers[index + 1 :]
+                },
+            )
+            break
+    return applied, unknown
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a user-facing create option.
+    ctx: Context,
+    project: Project,
+    source_branch: Annotated[str, Field(description="Existing source branch. No branch is pushed or created.")],
+    target_branch: Annotated[str, Field(description="Target branch in the project.")],
+    title: Annotated[str, Field(description="Nonblank merge request title.")],
+    description: Annotated[
+        str | None,
+        Field(
+            description="Merge request description. Set this or description_file, but not both. Empty text is valid."
+        ),
+    ] = None,
+    description_file: Annotated[
+        str | None,
+        Field(description="Absolute server-local UTF-8 file path, up to 100000 bytes. Set this or description."),
+    ] = None,
+    labels: Annotated[
+        list[str] | None,
+        Field(
+            max_length=MAX_CREATE_LABELS,
+            description="Existing project or ancestor-group labels to set, up to 100 labels.",
+        ),
+    ] = None,
+    remove_source_branch: Annotated[
+        bool | None,
+        Field(description="Delete the source branch after the merge. Omit for the project default."),
+    ] = None,
+    blocked_by: Annotated[
+        list[PositiveIid] | None,
+        Field(
+            max_length=MAX_CREATE_BLOCKERS,
+            description="Up to 20 unique same-project blocker IIDs to add after creation.",
+        ),
+    ] = None,
+) -> MergeRequestCreateResult:
+    """Create a merge request, like `glab mr create`, without pushing or creating branches.
+
+    Exactly one description source is required. A description file is read on this server and must be an absolute,
+    regular UTF-8 file no larger than 100000 bytes. Labels are checked against project and ancestor-group labels;
+    unknown or unchecked labels are omitted and reported while creation continues.
+    Blockers are resolved in this project before creation. After creation, dependency requests run sequentially.
+    `applied`, `unknown`, and `failed` report each outcome. A network error or server error can leave a write's
+    outcome unknown. Check GitLab before retrying. Do not retry blindly, especially when creation is unknown. Requires
+    the `api` scope;
+    merge request blocking dependencies require GitLab Premium or Ultimate.
+    """
+    for name, value in (("source_branch", source_branch), ("target_branch", target_branch), ("title", title)):
+        if not value.strip():
+            raise ToolError(f"{name} must not be blank.")  # noqa: TRY003
+    description_text = _create_description(description, description_file)
+    unique_blockers = list(dict.fromkeys(blocked_by or []))
+
+    client = get_client(ctx)
+    failures: dict[str, str] = {}
+    valid_labels: list[str] = []
+    if labels:
+        valid_labels, label_failures = await validate_project_labels(client, project, labels)
+        failures.update({f"labels:{name}": reason for name, reason in label_failures.items()})
+
+    resolved_blockers, blocker_failures = await _resolve_create_blockers(client, project, unique_blockers)
+    if blocker_failures:
+        failures.update(blocker_failures)
+        return MergeRequestCreateResult(failed=failures)
+
+    body: dict[str, Any] = {
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "title": title,
+        "description": description_text,
+    }
+    if valid_labels:
+        body["labels"] = ",".join(valid_labels)
+    if remove_source_branch is not None:
+        body["remove_source_branch"] = remove_source_branch
+    project_path = f"/projects/{quote(project, safe='')}"
+    response, terminal = await _post_create_request(client, f"{project_path}/merge_requests", body, failures)
+    if terminal is not None:
+        return terminal
+    if response is None:
+        return MergeRequestCreateResult(unknown=["create"], failed=failures)
+
+    created_iid = response.get("iid")
+    created_url = response.get("web_url")
+    if type(created_iid) is not int or created_iid < 1 or not isinstance(created_url, str) or not created_url:
+        return MergeRequestCreateResult(
+            iid=created_iid if type(created_iid) is int and created_iid > 0 else None,
+            url=created_url if isinstance(created_url, str) else "",
+            unknown=["create"],
+            failed=failures,
+        )
+
+    applied, unknown = await _apply_create_dependencies(
+        client,
+        project_path,
+        created_iid,
+        unique_blockers,
+        resolved_blockers,
+        failures,
+    )
+
+    return MergeRequestCreateResult(
+        iid=created_iid,
+        url=created_url,
+        applied=applied,
+        unknown=unknown,
+        failed=failures,
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-facing read option.
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    scope: _work_items.WorkItemScope = "project",
+    include_description: bool = True,
+    description_limit: Annotated[
+        int,
+        Field(ge=0, le=4000, description="Maximum description length, from 0 to 4000 characters."),
+    ] = 4000,
+    cursor: Annotated[
+        str | None,
+        Field(description="next_cursor from an earlier call with the same arguments."),
+    ] = None,
+) -> _work_items.WorkItemDetail:
+    """Read one project or group work item, like a scoped `glab api graphql` query.
+
+    `scope` is explicit. Use `group` for group work items such as epics. The group work-item API is experimental in
+    GitLab 18.1 and later, so permission or API errors can occur. Widget lists fetch up to 100 entries each;
+    `next_cursor` resumes incomplete lists. Merge each returned list across pages. Set `include_description` false or
+    lower `description_limit` to reduce output.
+    """
+    return await _work_items.read_work_item(
+        get_client(ctx),
+        project,
+        iid,
+        scope,
+        include_description,
+        description_limit,
+        cursor,
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def list_work_item_notes(  # noqa: PLR0913, PLR0917 - each argument is a user-facing read option.
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    scope: _work_items.WorkItemScope = "project",
+    cursor: Annotated[
+        str | None,
+        Field(description="next_cursor from an earlier call with the same arguments."),
+    ] = None,
+    max_body_chars: Annotated[
+        int,
+        Field(ge=0, le=4000, description="Maximum characters per note body, from 0 to 4000."),
+    ] = 4000,
+) -> _work_items.WorkItemNotes:
+    """Read a bounded page of human work-item notes, like a scoped `glab api graphql` query.
+
+    `scope="group"` reads group work items such as epics. Group work-item support is experimental in GitLab 18.1 and
+    later, so permission or API errors can occur. System notes are omitted. Each discussion returns up to 50 notes,
+    and each call returns up to 20 discussions. Use `next_cursor` for more discussions. `notes_truncated` reports
+    omitted nested notes or content cut by the body limits. `discussions_complete` reports whether all discussions
+    were read.
+    """
+    return await _work_items.read_work_item_notes(get_client(ctx), project, iid, scope, cursor, max_body_chars)
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def edit_merge_request_description(
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    old_text: Annotated[str, Field(description="Text that must appear exactly once in the description.")],
+    new_text: Annotated[str, Field(description="Replacement text. Empty text deletes the match.")],
+) -> _description_edits.DescriptionEditResult:
+    """Replace one exact text match, like a guarded `glab api --method PUT projects/:id/merge_requests/:iid`.
+
+    The full description is read and written, and replacement cannot be automatically undone. `old_text` must match
+    exactly once, including overlapping matches. GitLab has no compare-and-swap, so a concurrent edit may be
+    overwritten. Require explicit user `APPROVE` before writing. Writes are never retried. `status` is `applied`,
+    `failed`, or `unknown`; re-read before retrying unknown.
+    """
+    return await _description_edits.edit_merge_request_description(get_client(ctx), project, iid, old_text, new_text)
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument is a user-facing edit option.
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    old_text: Annotated[str, Field(description="Text that must appear exactly once in the description.")],
+    new_text: Annotated[str, Field(description="Replacement text. Empty text deletes the match.")],
+    scope: _work_items.WorkItemScope = "project",
+) -> _description_edits.DescriptionEditResult:
+    """Replace one exact text match with the `glab api graphql` WorkItemUpdate equivalent.
+
+    `scope="group"` supports group work items such as epics. Group work-item support is experimental in GitLab 18.1
+    and later, so permission or API errors can occur. The full description is read and written. `old_text` must match
+    exactly once, including overlapping matches. The replacement cannot be automatically undone. GitLab has no
+    compare-and-swap, so a concurrent edit may be overwritten. Require explicit user `APPROVE` before writing. Writes
+    are never retried. `status` is `applied`,
+    `failed`, or `unknown`; re-read before retrying unknown.
+    """
+    return await _description_edits.edit_work_item_description(get_client(ctx), project, iid, old_text, new_text, scope)

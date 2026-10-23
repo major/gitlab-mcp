@@ -36,19 +36,24 @@ Example MCP client config:
 
 ## Tools
 
-| Tool                        | Same as                                         | Returns                                                              |
-| --------------------------- | ----------------------------------------------- | -------------------------------------------------------------------- |
-| `get_current_user`          | `glab api user --jq .username`                  | `{"username", "id"}`                                                 |
-| `list_merge_requests`       | `glab mr list` + filters                        | `{"web_url_prefix", "merge_requests": "<TSV>", "has_more"}`          |
-| `list_merge_train`          | `glab api projects/:id/merge_trains?scope=active&sort=asc` | `{"web_url_prefix", "entries": "<TSV>", "has_more"}`                |
-| `get_merge_request`         | `glab mr view`                                  | `{"iid", "title", "merge_status", "threads", ...}`                   |
-| `get_merge_requests`        | GitLab GraphQL batch lookup                     | `{"merge_requests": [...], "missing_iids": [...]}`                   |
-| `get_merge_request_threads` | `glab mr note list` / `glab mr view --comments` | `{"threads", "next_cursor", "not_found_ids"}`                        |
-| `reply_to_thread`           | `glab mr note create --reply` / `glab mr note resolve` | Reply, resolve-only, or reply then resolve; `{"thread_id", "note_id?", "resolved?", "warning?"}` |
-| `get_merge_request_diff`    | `glab mr diff`                                  | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}` |
-| `post_review_notes`         | GitLab diff discussion API                      | Per-note `posted`, `failed`, `unknown`, `unverified`, or `unattempted` status |
-| `land_merge_request`        | `glab mr merge`                                 | `{"result", "state", "merge_status", ...}`                           |
-| `update_merge_request`      | `glab mr update` / `approve` / `rebase`         | `{"applied", "pending", "unknown", "failed", ...}`                   |
+| Tool                             | Same as                                                    | Returns                                                                                          |
+| -------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `get_current_user`               | `glab api user --jq .username`                             | `{"username", "id"}`                                                                             |
+| `list_merge_requests`            | `glab mr list` + filters                                   | `{"web_url_prefix", "merge_requests": "<TSV>", "has_more"}`                                      |
+| `list_merge_train`               | `glab api projects/:id/merge_trains?scope=active&sort=asc` | `{"web_url_prefix", "entries": "<TSV>", "has_more"}`                                             |
+| `get_merge_request`              | `glab mr view`                                             | `{"iid", "title", "merge_status", "threads", ...}`                                               |
+| `get_merge_requests`             | GitLab GraphQL batch lookup                                | `{"merge_requests": [...], "missing_iids": [...]}`                                               |
+| `get_merge_request_threads`      | `glab mr note list` / `glab mr view --comments`            | `{"threads", "next_cursor", "not_found_ids"}`                                                    |
+| `reply_to_thread`                | `glab mr note create --reply` / `glab mr note resolve`     | Reply, resolve-only, or reply then resolve; `{"thread_id", "note_id?", "resolved?", "warning?"}` |
+| `get_merge_request_diff`         | `glab mr diff`                                             | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}`                             |
+| `post_review_notes`              | GitLab diff discussion API                                 | Per-note `posted`, `failed`, `unknown`, `unverified`, or `unattempted` status                    |
+| `land_merge_request`             | `glab mr merge`                                            | `{"result", "state", "merge_status", ...}`                                                       |
+| `update_merge_request`           | `glab mr update` / `approve` / `rebase`                    | `{"applied", "pending", "unknown", "failed", ...}`                                               |
+| `get_work_item`                  | GitLab GraphQL work item lookup                            | Work item details; `linked` and `children` are bounded pages with cursors                        |
+| `list_work_item_notes`           | GitLab GraphQL work item notes                             | Bounded human notes; system notes are skipped; resumable with `cursor`                           |
+| `edit_work_item_description`     | Read, replace one exact match, write back                  | Match counts and a changed-line diff (max 4000 characters)                                       |
+| `edit_merge_request_description` | Read, replace one exact match, write back                  | Match counts and a changed-line diff (max 4000 characters)                                       |
+| `create_merge_request`           | `glab mr create`                                           | Separate creation and `blocked_by` outcomes, plus label results                                  |
 
 `get_merge_request_threads` removes trailing `review-bot:finding` markers from
 note bodies. `max_body_chars` accepts 0 through 4000 and defaults to 4000 per
@@ -100,6 +105,13 @@ Every row has every column, and an empty cell means none.
 Use `list_merge_requests(search="LWLP-36")` to search merge request titles or
 descriptions. GitLab applies this search server-side.
 
+`list_merge_requests` also takes `created_after`, `updated_after`, and
+`target_branch`. Dates must be timezone-aware ISO 8601 datetimes, like
+`2026-10-01T00:00:00+00:00`. Date-only and timezone-naive values are rejected.
+`include_source_branch=true` and `include_labels=true` are opt-in and append
+columns. Labels are a JSON array in one cell. `labels_complete` is `false` when
+a label list was cut at its first 100 labels. The default TSV does not change.
+
 `get_merge_request` includes descriptions by default for compatibility. Set
 `include_description=false` to skip them. `get_merge_requests` skips descriptions
 by default; set `include_description=true` to include them. Both tools cap descriptions with
@@ -120,6 +132,69 @@ or thread indexes. Use `get_merge_request` when those details are needed.
 
 `list_merge_train` lists active merge train cars on GitLab Premium and Ultimate.
 Its `position` is one-based within each `target_branch`, not a global queue position.
+
+### Work items 🧩
+
+`get_work_item(project="group/project", iid=42)` returns the title, type, state,
+labels, assignees, linked items, and children. `linked_items` and `children` are
+bounded pages. When a page is cut short, pass the returned cursor back with the
+same arguments. Use `scope="group"` for group-level work items. Set
+`include_description=false` to skip the description, or cap it with
+`description_limit` (0 through 4000 characters).
+Group epics need GitLab 18.1 or later and the required license and permissions.
+The work-item GraphQL API is experimental, so availability can vary by instance.
+
+`list_work_item_notes(project="group/project", iid=42)` returns human notes
+only. System notes, such as label changes, are skipped. `max_body_chars` caps
+each note at 4000 characters. Continue with `cursor`.
+Each discussion includes at most 50 notes. `notes_truncated` reports omitted
+notes or text; the discussion cursor does not retrieve omitted nested notes.
+
+### Editing descriptions ✏️
+
+`edit_work_item_description` and `edit_merge_request_description` replace one
+exact, literal piece of a description. Both take `old_text` and `new_text`.
+The rules are:
+
+- The old text must not be empty, and the new text must differ from it. A no-op is rejected.
+- The old text must match exactly one place. Zero matches or several matches fail, and nothing is written.
+- Match counts include overlapping matches.
+- The result includes a changed-line diff, capped at 4000 characters.
+- The tool reads the description, edits it, and writes it back. There is no
+  atomic concurrency guard. If someone else edits the same description during
+  that window, their change can be lost. Read the description again after the call.
+- Get explicit user approval before editing.
+
+### Creating merge requests 🆕
+
+`create_merge_request` needs `project`, `source_branch`, `target_branch`, and
+`title`. Pass exactly one of:
+
+- `description`: inline text
+- `description_file`: an absolute, server-local path to a regular UTF-8 file of at most 100000 bytes
+
+Optional arguments are `labels`, `remove_source_branch`, and `blocked_by`, a
+list of up to 20 IIDs from the same project.
+
+- The tool never pushes. The source branch must already exist on GitLab.
+- Description-file and blocker preflight failures prevent creation.
+- Creation and dependency results are separate. If the merge request is
+  created but a `blocked_by` link fails, the merge request stays. Do not create
+  it again. Check the result and fix the link.
+- Unknown labels are reported as failed `labels:<name>` items. The tool never
+  creates labels silently. Valid labels and unrelated updates still apply.
+- Get explicit user approval before creating a merge request.
+
+### Reloading after server changes 🔄
+
+An MCP client reads the tool catalog when it starts the server. After you
+change this repo, reload the MCP server in your client. A missing tool can mean
+an older running process, a cached catalog, or client filtering. Compare both
+tool names and schemas with the local inventory after reloading.
+
+The client runs the checkout named in `--directory`. Make sure that path is the
+worktree you are testing. The `gitlab-mcp` entry point runs `gitlab_mcp:main`
+from that checkout.
 
 ## Development
 
