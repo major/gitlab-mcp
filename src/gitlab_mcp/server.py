@@ -134,6 +134,8 @@ THREAD_INDEX_CAP = 20
 # Long note bodies are cut to this many characters, then marked with THREAD_CUT_MARKER.
 NOTE_CAP = 4000
 THREAD_CUT_MARKER = " [truncated]"
+# Do not let a malformed marker consume a later HTML comment.
+REVIEW_BOT_FINDING_PATTERN = re.compile(r"<!-- review-bot:finding\s(?:(?!-->|<!--).)*-->\s*$", re.DOTALL)
 # Total characters of note bodies that one thread call may return. Keeps one tool result small.
 THREAD_BODY_BUDGET = 30000
 # Discussion GIDs start with this. Output IDs are bare SHAs, so the prefix is only stripped from input.
@@ -325,7 +327,7 @@ class Note(BaseModel):
     """One human note."""
 
     by: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the author was deleted or banned.
-    body: str  # Cut at NOTE_CAP characters, then marked with THREAD_CUT_MARKER.
+    body: str  # Cut at the requested max_body_chars, then marked with THREAD_CUT_MARKER.
     at: str  # Date only, YYYY-MM-DD.
 
 
@@ -344,6 +346,15 @@ class ThreadList(BaseModel):
     threads: list[Thread]
     next_cursor: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the scan finished.
     not_found_ids: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+
+class ThreadReplyResult(BaseModel):
+    """The result of replying to or resolving one discussion thread."""
+
+    thread_id: str
+    note_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    resolved: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
 class DiffSummary(BaseModel):
@@ -845,24 +856,29 @@ def _thread_status(discussion: dict[str, Any]) -> ThreadStatus:
     return "resolved" if discussion["resolved"] else "open"
 
 
-def _cap_note_body(body: str) -> str:
-    """Cut a note body to `NOTE_CAP` characters and mark the cut."""
-    if len(body) <= NOTE_CAP:
+def _cap_note_body(body: str, max_body_chars: int = NOTE_CAP) -> str:
+    """Remove a trailing review finding, then cap the remaining note body."""
+    finding = REVIEW_BOT_FINDING_PATTERN.search(body)
+    if finding:
+        body = body[: finding.start()].rstrip()
+    if max_body_chars == 0:
+        return ""
+    if len(body) <= max_body_chars:
         return body
-    return body[:NOTE_CAP] + THREAD_CUT_MARKER
+    return body[:max_body_chars] + THREAD_CUT_MARKER
 
 
-def _to_note(node: dict[str, Any]) -> Note:
+def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Note:
     """Convert one GraphQL note into a note with a capped body and a date-only timestamp."""
     author = node["author"]  # A deleted or banned author comes back as null.
     return Note(
         by=author["username"] if author else "",
-        body=_cap_note_body(node["body"]),
+        body=_cap_note_body(node["body"], max_body_chars=max_body_chars),
         at=node["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
     )
 
 
-def _to_thread(discussion: dict[str, Any]) -> Thread | None:
+def _to_thread(discussion: dict[str, Any], max_body_chars: int = NOTE_CAP) -> Thread | None:
     """Convert one discussion into a thread, or return None when it has no human notes.
 
     System notes, like "assigned to @user", are dropped. The location comes
@@ -875,7 +891,7 @@ def _to_thread(discussion: dict[str, Any]) -> Thread | None:
     return Thread(
         id=_bare_id(discussion["id"]),
         status=_thread_status(discussion),
-        notes=[_to_note(node) for node in human],
+        notes=[_to_note(node, max_body_chars=max_body_chars) for node in human],
         # GitLab only returns the first 50 notes, so more may exist.
         notes_truncated=notes["pageInfo"]["hasNextPage"],
         **_position_fields(human[0]["position"]),
@@ -905,12 +921,13 @@ class _ThreadFilter:
         return self.author is None or any(note.by == self.author for note in thread.notes)
 
 
-async def _scan_threads(
+async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the scan.
     client: GitLabClient,
     project: str,
     iid: int,
     thread_filter: _ThreadFilter,
     start: tuple[str | None, int],
+    max_body_chars: int = NOTE_CAP,
 ) -> tuple[list[Thread], str, set[str]]:
     """Read discussion pages from `start` and collect the matching threads.
 
@@ -928,7 +945,7 @@ async def _scan_threads(
         nodes = connection["nodes"]
         for index in range(skip, len(nodes)):
             seen.add(_bare_id(nodes[index]["id"]))
-            thread = _to_thread(nodes[index])
+            thread = _to_thread(nodes[index], max_body_chars=max_body_chars)
             if thread is None or not thread_filter.matches(thread):
                 continue
             size = sum(len(note.body) for note in thread.notes)
@@ -954,7 +971,14 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     ids: Annotated[list[str] | None, Field(description="Thread IDs from threads.open. Ignores state.")] = None,
     file: Annotated[str | None, Field(description="Only threads on this path, old or new.")] = None,
     author: Annotated[str | None, Field(description="Only threads with a note by this user.")] = None,
-    cursor: Annotated[str | None, Field(description="next_cursor from an earlier call, with the same filters.")] = None,
+    max_body_chars: Annotated[
+        int,
+        Field(ge=0, le=NOTE_CAP, description="Maximum body characters per note. Zero omits bodies."),
+    ] = NOTE_CAP,
+    cursor: Annotated[
+        str | None,
+        Field(description="next_cursor from an earlier call. Repeat the filters and max_body_chars."),
+    ] = None,
 ) -> ThreadList:
     """Read review thread notes, with filters and a size budget. Like `glab mr note list`.
 
@@ -962,7 +986,9 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     - System notes and threads with no human notes are skipped.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - `notes_truncated`: over 50 notes, so `author` can miss a late reply.
-    - Bodies are cut at 4000 characters. A call returns about 30000. Continue with `next_cursor` and the same filters.
+    - Trailing `review-bot:finding` comments are removed.
+    - Note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits body text. A call returns
+      about 30000 body characters. Continue with `next_cursor` using the same filters and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
     """
     client = get_client(ctx)
@@ -970,13 +996,87 @@ async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument i
     # An empty list means no IDs were given, so the state filter applies.
     wanted = _bare_ids(ids) if ids else None
     thread_filter = _ThreadFilter(state=state, ids=wanted, file=file, author=author)
-    threads, next_cursor, seen = await _scan_threads(client, project, iid, thread_filter, start)
+    threads, next_cursor, seen = await _scan_threads(client, project, iid, thread_filter, start, max_body_chars)
 
     # A resumed call did not read the first page, so it cannot prove an ID is missing.
     not_found_ids: list[str] = []
     if wanted and cursor is None and not next_cursor:
         not_found_ids = [thread_id for thread_id in wanted if thread_id not in seen]
     return ThreadList(threads=threads, next_cursor=next_cursor, not_found_ids=not_found_ids)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def reply_to_thread(  # noqa: C901, PLR0913, PLR0917 - user-facing inputs and distinct write outcomes.
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    thread_id: str,
+    body: Annotated[str | None, Field(description="Reply text. Omit only when resolving the thread.")] = None,
+    resolve: Annotated[
+        bool,
+        Field(description="Resolve the thread after a successful reply, or resolve it alone."),
+    ] = False,
+) -> ThreadReplyResult:
+    """Reply to or resolve a review thread. Like `glab mr note create --reply` and `glab mr note resolve`.
+
+    Get user approval before posting a reply or resolving a thread. A missing body is allowed only with `resolve=True`.
+    `resolve=False` leaves the current resolution state unchanged and never reopens a thread. Replying and resolving
+    are separate GitLab writes. If resolution fails after a reply, the result says not to repost the reply.
+    """
+    bare_thread_id = _bare_id(thread_id)
+    if not bare_thread_id.strip():
+        raise ToolError("thread_id must not be empty.")  # noqa: TRY003
+    if body is not None and not body.strip():
+        raise ToolError("body must not be empty or whitespace.")  # noqa: TRY003
+    if body is None and not resolve:
+        raise ToolError("Provide a reply body or set resolve=True.")  # noqa: TRY003
+
+    client = get_client(ctx)
+    discussion_path = f"{_mr_rest_path(project, iid)}/discussions/{quote(bare_thread_id, safe='')}"
+    note_id: int | None = None
+
+    if body is not None:
+        try:
+            note = await client.request("POST", f"{discussion_path}/notes", json={"body": body})
+        except GitLabConnectionError as exc:
+            raise ToolError(  # noqa: TRY003
+                f"{exc} Reply outcome is unknown. Check get_merge_request_threads before retrying."
+            ) from exc
+        note_id = note.get("id") if isinstance(note, dict) else None
+
+    if resolve:
+        try:
+            await client.request("PUT", discussion_path, json={"resolved": True})
+        except GitLabConnectionError as exc:
+            if body is None:
+                raise ToolError(  # noqa: TRY003
+                    f"{exc} Resolution outcome is unknown. Check get_merge_request_threads before retrying."
+                ) from exc
+            return ThreadReplyResult(
+                thread_id=bare_thread_id,
+                note_id=note_id,
+                warning=(
+                    f"Reply was posted (note ID {note_id}) but resolution outcome is unknown: {exc} "
+                    "Check get_merge_request_threads before retrying. Do not repost the reply."
+                ),
+            )
+        except ToolError as exc:
+            if body is None:
+                raise
+            return ThreadReplyResult(
+                thread_id=bare_thread_id,
+                note_id=note_id,
+                warning=f"Reply was posted (note ID {note_id}) but resolution failed: {exc} Do not repost the reply.",
+            )
+
+    return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=True if resolve else None)
 
 
 def _to_file_stats(stats: list[dict[str, Any]] | None) -> list[FileStat]:

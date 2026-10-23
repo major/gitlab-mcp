@@ -375,6 +375,123 @@ async def test_note_bodies_are_capped_with_a_marker(gitlab_env, length, expected
     assert data["threads"][0]["notes"][0]["body"] == "x" * NOTE_CAP + expected_suffix
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Review this. \n<!-- review-bot:finding detail -->  \n", "Review this."),
+        ("<!-- review-bot:finding detail -->", ""),
+        ("Before <!-- review-bot:finding detail -->\nAfter", "Before <!-- review-bot:finding detail -->\nAfter"),
+        ("Before <!-- another comment -->", "Before <!-- another comment -->"),
+        (
+            "Before <!-- review-bot:finding detail --> <!-- another comment -->",
+            "Before <!-- review-bot:finding detail --> <!-- another comment -->",
+        ),
+        ("Before <!-- review-bot:finding detail", "Before <!-- review-bot:finding detail"),
+        (
+            "Before <!-- review-bot:finding malformed <!-- another comment -->",
+            "Before <!-- review-bot:finding malformed <!-- another comment -->",
+        ),
+        ("Before <!-- review-bot:findingXYZ detail -->", "Before <!-- review-bot:findingXYZ detail -->"),
+        ("Before <!-- review-bot:finding--> detail -->", "Before <!-- review-bot:finding--> detail -->"),
+        ("Body with ordinary whitespace \n", "Body with ordinary whitespace \n"),
+    ],
+    ids=[
+        "trailing",
+        "only-marker",
+        "embedded",
+        "other-comment",
+        "other-trailing-comment",
+        "unclosed",
+        "malformed-before-comment",
+        "no-boundary",
+        "empty-boundary",
+        "whitespace",
+    ],
+)
+@respx.mock
+async def test_only_trailing_finding_comments_are_removed(gitlab_env, body, expected):
+    """Only a well-formed trailing review-bot finding comment and its preceding whitespace are removed."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", make_note(body)))))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == expected
+
+
+@pytest.mark.parametrize(
+    ("max_body_chars", "body", "expected"),
+    [
+        (0, "abcdef", ""),
+        (3, "abcdef", "abc [truncated]"),
+        (3, "abc", "abc"),
+        (NOTE_CAP, "x" * (NOTE_CAP + 1), "x" * NOTE_CAP + " [truncated]"),
+    ],
+    ids=["omit", "short-cap", "at-cap", "maximum-cap"],
+)
+@respx.mock
+async def test_max_body_chars_controls_truncation(gitlab_env, max_body_chars, body, expected):
+    """The requested body cap truncates after marker removal, while zero omits all body text."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", make_note(body)))))
+
+    # Act
+    data = await call_tool(max_body_chars=max_body_chars)
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == expected
+
+
+@pytest.mark.parametrize("max_body_chars", [-1, NOTE_CAP + 1])
+@respx.mock
+async def test_max_body_chars_rejects_values_outside_bounds(gitlab_env, max_body_chars):
+    """The requested body cap must be between zero and NOTE_CAP, inclusive."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1"))))
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(max_body_chars=max_body_chars)
+
+
+@respx.mock
+async def test_marker_is_removed_before_body_budget_and_cursor_accounting(gitlab_env):
+    """Stripped finding comments do not consume the thread body budget or cause an early cursor."""
+    # Arrange
+    body = "x" * 3500 + " <!-- review-bot:finding " + "d" * 500 + " -->"
+    notes = [make_note(body) for _ in range(4)]
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", *notes), make_discussion("t2", *notes))))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert thread_ids(data) == ["t1", "t2"]
+    assert not data.get("next_cursor")
+    assert all(note["body"] == "x" * 3500 for thread in data["threads"] for note in thread["notes"])
+
+
+@respx.mock
+async def test_custom_body_cap_is_used_when_resuming_budget_cursor(gitlab_env):
+    """A resumed scan uses the caller's cap to budget bodies and return the remaining threads."""
+    # Arrange: each of 50 threads has 50 notes, so a cap of three allows exactly 40 threads in the first result.
+    discussions = [make_discussion(f"t{index}", *(make_note("xxxx") for _ in range(50))) for index in range(50)]
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
+
+    # Act
+    first = await call_tool(max_body_chars=3)
+    second = await call_tool(max_body_chars=3, cursor=first["next_cursor"])
+
+    # Assert
+    assert thread_ids(first) == [f"t{index}" for index in range(40)]
+    assert thread_ids(second) == [f"t{index}" for index in range(40, 50)]
+    assert all(note["body"] == "xxx [truncated]" for thread in second["threads"] for note in thread["notes"])
+    assert not second.get("next_cursor")
+    assert requested_afters(route) == [None, None]
+
+
 @pytest.mark.parametrize(("notes_have_next", "expected"), [(True, True), (False, None)])
 @respx.mock
 async def test_notes_truncated_flags_more_than_fifty_notes(gitlab_env, notes_have_next, expected):

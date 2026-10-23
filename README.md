@@ -43,9 +43,19 @@ Example MCP client config:
 | `list_merge_train`          | `glab api projects/:id/merge_trains?scope=active&sort=asc` | `{"web_url_prefix", "entries": "<TSV>", "has_more"}`                |
 | `get_merge_request`         | `glab mr view`                                  | `{"iid", "title", "merge_status", "threads", ...}`                   |
 | `get_merge_request_threads` | `glab mr note list` / `glab mr view --comments` | `{"threads", "next_cursor", "not_found_ids"}`                        |
+| `reply_to_thread`           | `glab mr note create --reply` / `glab mr note resolve` | Reply, resolve-only, or reply then resolve; `{"thread_id", "note_id?", "resolved?", "warning?"}` |
 | `get_merge_request_diff`    | `glab mr diff`                                  | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}` |
 | `land_merge_request`        | `glab mr merge`                                 | `{"result", "state", "merge_status", ...}`                           |
 | `update_merge_request`      | `glab mr update` / `approve` / `rebase`         | `{"applied", "pending", "unknown", "failed", ...}`                   |
+
+`get_merge_request_threads` removes trailing `review-bot:finding` markers from
+note bodies. `max_body_chars` accepts 0 through 4000 and defaults to 4000 per
+note. Set it to 0 to omit note text.
+
+Get user approval before posting a reply or resolving a thread. Replying and
+resolving are two GitLab writes. If a reply succeeds but resolution fails, the
+result includes a warning. Check the thread before retrying, and do not repost
+the reply.
 
 `list_merge_requests` needs a token with the `read_api` scope. Pass `project`
 as the full path, like `group/subgroup/project`, not the numeric ID or the
