@@ -41,12 +41,12 @@ Example MCP client config:
 | `get_current_user`               | `glab api user --jq .username`                             | `{"username", "id"}`                                                                             |
 | `list_merge_requests`            | `glab mr list` + filters                                   | `{"web_url_prefix", "merge_requests": "<TSV>", "has_more"}`                                      |
 | `list_merge_train`               | `glab api projects/:id/merge_trains?scope=active&sort=asc` | `{"web_url_prefix", "entries": "<TSV>", "has_more"}`                                             |
-| `get_merge_request`              | `glab mr view`                                             | `{"iid", "title", "merge_status", "threads", ...}`                                               |
+| `get_merge_request`              | `glab mr view`                                             | `{"iid", "title", "merge_status", "threads", ...}`; `include_jobs=true` adds failed job IDs and names as TSV |
 | `get_merge_requests`             | GitLab GraphQL batch lookup                                | `{"merge_requests": [...], "missing_iids": [...]}`                                               |
 | `get_merge_request_threads`      | `glab mr note list` / `glab mr view --comments`            | `{"threads", "next_cursor", "not_found_ids"}`                                                    |
 | `reply_to_thread`                | `glab mr note create --reply` / `glab mr note resolve`     | Reply, resolve-only, or reply then resolve; `{"thread_id", "note_id?", "resolved?", "warning?"}` |
-| `get_merge_request_diff`         | `glab mr diff`                                             | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}`                             |
-| `post_review_notes`              | GitLab diff discussion API                                 | Per-note `posted`, `failed`, `unknown`, `unverified`, or `unattempted` status                    |
+| `get_merge_request_diff`         | `glab mr diff`                                             | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}`; file rows include `new_line_ranges` and `ranges_complete` |
+| `post_review_notes`              | GitLab diff discussion API                                 | Per-note `validated`, `posted`, `failed`, `unknown`, `unverified`, or `unattempted` status       |
 | `land_merge_request`             | `glab mr merge`                                            | `{"result", "state", "merge_status", ...}`                                                       |
 | `update_merge_request`           | `glab mr update` / `approve` / `rebase`                    | `{"applied", "pending", "unknown", "failed", ...}`                                               |
 | `get_work_item`                  | GitLab GraphQL work item lookup                            | Work item details; `linked` and `children` are bounded pages with cursors                        |
@@ -79,11 +79,19 @@ can replace the existing list.
 `post_review_notes` posts inline review notes. Pass
 `post_review_notes(project="group/project", iid=36, head_sha="<full SHA>",
 notes=[{"file": "src/file.py", "line": 12, "body_path": "/absolute/path/note.txt"}])`.
-Use the full 40-character `head_sha` from the diff you reviewed, and post no
-more than 20 notes per call. `file` must be an old or new diff path. Supply
+Use the full 40-character `head_sha` from `get_merge_request` or
+`get_merge_request_diff`, and post no more than 20 notes per call. `file` must be
+an old or new diff path. Supply
 exactly one of `line` or `old_line`, and exactly one of inline `body` or
 `body_path`. A body file must be an absolute, server-local path to a regular
 UTF-8 file no larger than 100000 bytes. Use `body` for inline text instead.
+
+Validate a batch before requesting approval by setting `validate_only=true`.
+This runs the same body, path, line-position, and SHA preflight as posting and
+returns the proposed positions, but it creates no discussions. Validation does
+not need `APPROVE`. After reviewing the results, get explicit user `APPROVE`
+before posting. The posting call repeats the preflight, including its SHA checks,
+so a changed merge request stops the batch without writing notes.
 
 All notes are preflighted before any writes. Diff paths are checked across all
 available pages, up to five. If GitLab reports more pages at that limit, the
@@ -91,10 +99,23 @@ scan is incomplete and no notes are posted. Scanning all available pages also
 checks for duplicate old or new path matches. The tool rechecks the diff head
 before posting, but this is not atomic with the writes. Notes are posted
 sequentially, and the first failure stops the call. Results report each note's
-status (`posted`, `failed`, `unknown`, `unverified`, or `unattempted`) and its
-GitLab ID and position when available. Get explicit user `APPROVE` before
-posting. Never blindly retry `unknown` or `unverified` notes, and do not repost
-notes already marked `posted`.
+status (`validated`, `posted`, `failed`, `unknown`, `unverified`, or
+`unattempted`) and its GitLab ID and position when available. Never blindly
+retry `unknown` or `unverified` notes, and do not repost notes already marked
+`posted`.
+
+In file-list mode, `get_merge_request_diff` includes `new_line_ranges`, the
+inclusive new-side ranges for each nonempty hunk, including context lines.
+Deletion-only hunks have no new-side ranges. `ranges_complete` is false when a
+file's patch was not scanned or GitLab did not provide usable patch text, so an
+empty range list is not treated as proof that no anchors exist in those cases.
+Use `post_review_notes(validate_only=true)` to check exact comment positions.
+
+`get_merge_request(include_jobs=true)` adds failed pipeline jobs in the
+`failed_jobs` TSV, with `id` and `name` columns. The list is omitted when jobs
+are not requested, the merge request has no pipeline, or no failed jobs are
+found. `jobs_complete` is false only when the failed-job scan reaches its page
+cap; otherwise it is omitted.
 
 `list_merge_requests` needs a token with the `read_api` scope. Pass `project`
 as the full path, like `group/subgroup/project`, not the numeric ID or the

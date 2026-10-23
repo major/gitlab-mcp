@@ -66,7 +66,7 @@ query(
 
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
-query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!) {
+query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeJobs: Boolean! = false) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
       iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
@@ -75,7 +75,7 @@ query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!) {
       detailedMergeStatus shouldBeRebased conflicts
       approved approvedBy { nodes { username } }
       reviewers { nodes { username mergeRequestInteraction { reviewState } } }
-      headPipeline { status }
+      headPipeline { status id @include(if: $includeJobs) }
       autoMergeStrategy
       diffStatsSummary { additions deletions fileCount }
       resolvableDiscussionsCount resolvedDiscussionsCount
@@ -229,7 +229,11 @@ mcp = FastMCP(
     name="gitlab-mcp",
     instructions=(
         "Tools for GitLab developer workflows on gitlab.com or self-managed "
-        "GitLab. Call get_current_user first to learn who you are acting as."
+        "GitLab. Call get_current_user first to learn who you are acting as. "
+        "For merge request review, use get_merge_request and get_merge_request_diff. "
+        "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
+        "Get the user's explicit APPROVE before posting notes with post_review_notes. "
+        "Use update_merge_request for reviewer, assignee, and approval changes."
     ),
     lifespan=gitlab_lifespan,
 )
@@ -430,11 +434,19 @@ class DiffSummary(BaseModel):
 
 
 class FileStat(BaseModel):
-    """A changed file."""
+    """A changed file and the new-side ranges found in its patch."""
 
     path: str
     additions: int
     deletions: int
+    new_line_ranges: list[tuple[int, int]] = Field(
+        default_factory=list,
+        description="Inclusive new-side line ranges for each nonempty hunk, including context lines.",
+    )
+    ranges_complete: bool = Field(
+        default=True,
+        description="False when the patch was not scanned or GitLab did not provide usable patch text.",
+    )
 
 
 # What happened to a file. GitLab sets one flag for added, deleted, or renamed files, and none for a plain edit.
@@ -494,7 +506,7 @@ class ReviewNote(BaseModel):
         return self
 
 
-ReviewNoteStatus = Literal["posted", "failed", "unknown", "unverified", "unattempted"]
+ReviewNoteStatus = Literal["validated", "posted", "failed", "unknown", "unverified", "unattempted"]
 
 
 class ReviewNotePostResult(BaseModel):
@@ -544,6 +556,8 @@ class MergeRequestDetail(BaseModel):
     approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     reviewers: list[Reviewer] = Field(default_factory=list, exclude_if=lambda v: not v)
     pipeline_status: str = Field(default="", exclude_if=lambda v: not v)  # Head pipeline, lowercased.
+    failed_jobs: str = Field(default="", exclude_if=lambda value: not value)
+    jobs_complete: bool = Field(default=True, exclude_if=lambda value: value)
     auto_merge_strategy: str = Field(default="", exclude_if=lambda v: not v)
     changes: DiffSummary | None = Field(default=None, exclude_if=lambda v: v is None)
     threads: ThreadIndex
@@ -1069,17 +1083,21 @@ def _to_compact_detail(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
-async def get_merge_request(
+async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls one optional detail.
     ctx: Context,
     project: Project,
     iid: Iid,
+    include_jobs: Annotated[
+        bool,
+        Field(description="Include failed job IDs and names as TSV. Defaults to false to keep output compact."),
+    ] = False,
     include_description: Annotated[bool, Field(description="False skips the description to save tokens.")] = True,
     description_limit: Annotated[
         int,
         Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
     ] = DESCRIPTION_CAP,
 ) -> MergeRequestDetail:
-    """Show one merge request's status, approvals, and open threads. Like `glab mr view`.
+    """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
     - `merge_status` is the source of truth for mergeability. Open threads and failed CI do not always block a merge.
     - `approved`: Free means one approval. Premium and Ultimate mean all approval rules pass.
@@ -1088,16 +1106,51 @@ async def get_merge_request(
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
     - `description_limit` controls description length. Zero skips it; the default is 4000 characters.
+    - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
+      the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
     """
     include_description = include_description and description_limit > 0
+    client = get_client(ctx)
     node = await _fetch_merge_request(
-        get_client(ctx),
+        client,
         MERGE_REQUEST_QUERY,
         project,
         iid,
         includeDescription=include_description,
+        includeJobs=include_jobs,
     )
-    return _to_detail(node, include_description=include_description, description_limit=description_limit)
+    detail = _to_detail(node, include_description=include_description, description_limit=description_limit)
+    pipeline = node["headPipeline"]
+    if not include_jobs or pipeline is None:
+        return detail
+
+    pipeline_gid = pipeline.get("id")
+    pipeline_match = (
+        re.fullmatch(r"gid://gitlab/Ci::Pipeline/([0-9]+)", pipeline_gid) if isinstance(pipeline_gid, str) else None
+    )
+    if pipeline_match is None:
+        raise ToolError("The pipeline ID format is invalid; expected a numeric pipeline GID.")  # noqa: TRY003
+
+    pipeline_id = pipeline_match.group(1)
+    jobs: list[dict[str, Any]] = []
+    page = 1
+    for _ in range(MAX_PAGES):
+        page_jobs, next_page = await client.get_page(
+            f"/projects/{quote(project, safe='')}/pipelines/{pipeline_id}/jobs",
+            **{"scope[]": "failed", "per_page": 100, "page": page},
+        )
+        jobs.extend(page_jobs)
+        if next_page is None:
+            break
+        page = next_page
+    else:
+        detail.jobs_complete = False
+
+    if jobs:
+        detail.failed_jobs = "\n".join(
+            ["id\tname", *("\t".join((_cell(job["id"]), _cell(job["name"]))) for job in jobs)],
+        )
+    return detail
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
@@ -1480,11 +1533,65 @@ async def reply_to_thread(  # noqa: C901, PLR0913, PLR0917 - user-facing inputs 
     return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=True if resolve else None)
 
 
-def _to_file_stats(stats: list[dict[str, Any]] | None) -> list[FileStat]:
-    """Convert the diffStats list. GitLab can return null, which means no files are known."""
-    return [
-        FileStat(path=stat["path"], additions=stat["additions"], deletions=stat["deletions"]) for stat in stats or []
-    ]
+def _new_line_ranges(diff: str) -> list[tuple[int, int]]:
+    """Return inclusive new-side line ranges for each nonempty unified diff hunk."""
+    ranges = []
+    for line in diff.splitlines():
+        match = DIFF_HUNK_PATTERN.match(line)
+        if match is None:
+            continue
+        start = int(match.group(3))
+        length = int(match.group(4) or 1)
+        if length:
+            ranges.append((start, start + length - 1))
+    return ranges
+
+
+def _to_file_stats(
+    stats: list[dict[str, Any]] | None,
+    patch_ranges: dict[str, tuple[list[tuple[int, int]], bool]],
+) -> list[FileStat]:
+    """Convert GraphQL stats and attach patch ranges, keeping all original file rows."""
+    file_stats = []
+    for file_stat in stats or []:
+        ranges, complete = patch_ranges.get(file_stat["path"], ([], False))
+        file_stats.append(
+            FileStat(
+                path=file_stat["path"],
+                additions=file_stat["additions"],
+                deletions=file_stat["deletions"],
+                new_line_ranges=ranges,
+                ranges_complete=complete,
+            ),
+        )
+    return file_stats
+
+
+async def _scan_file_stat_ranges(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    stats: list[dict[str, Any]],
+) -> dict[str, tuple[list[tuple[int, int]], bool]]:
+    """Read at most MAX_PAGES of REST diffs and extract ranges for known GraphQL file paths."""
+    known_paths = {stat["path"] for stat in stats}
+    patch_ranges: dict[str, tuple[list[tuple[int, int]], bool]] = {}
+    page = 1
+    for _ in range(MAX_PAGES):
+        files, next_page = await _fetch_diff_page(client, project, iid, page)
+        for raw in files:
+            if not isinstance(raw, dict):
+                continue
+            path = raw.get("new_path")
+            if not isinstance(path, str) or path not in known_paths or path in patch_ranges:
+                continue
+            diff = raw.get("diff")
+            available = isinstance(diff, str) and bool(diff) and not raw.get("collapsed") and not raw.get("too_large")
+            patch_ranges[path] = (_new_line_ranges(diff) if available else [], available)
+        if next_page is None:
+            break
+        page = next_page
+    return patch_ranges
 
 
 def _diff_status(raw: dict[str, Any]) -> DiffStatus:
@@ -1592,9 +1699,14 @@ async def get_merge_request_diff(
     ] = None,
     cursor: Annotated[str | None, Field(description="next_cursor from an earlier call, with the same paths.")] = None,
 ) -> MergeRequestDiff:
-    """List a merge request's changed files, or read patches of chosen files. Like `glab mr diff`.
+    """Review inline comment anchors and patches.
 
-    - Call without `paths` for a file list with +/- counts, then with `paths` for patches.
+    Like `glab mr diff`, this lists changed files or reads patches of chosen files.
+    - Call without `paths` for a file list with +/- counts and `new_line_ranges`, then with `paths` for patches.
+    - Ranges include context lines and are candidate new-side anchors. `ranges_complete` is false if a patch was not
+      scanned or GitLab did not provide usable patch text. A complete empty range list means no new-side hunk lines.
+    - Ranges are not proof that a line is a valid comment position. Use `post_review_notes(validate_only=true)` to
+      validate exact patch positions; its result is the final authority before posting.
     - `head_sha` changes when new commits are pushed, so older patches may be stale.
     - `status`: added, deleted, renamed, or modified. `old_path` is only set when it differs.
     - `collapsed`: hidden as big, the web UI may show it. `too_large`: never shown. `generated`: usually skippable.
@@ -1609,7 +1721,9 @@ async def get_merge_request_diff(
     head_sha = _head_sha(node["diffRefs"])
 
     if not wanted:
-        return MergeRequestDiff(head_sha=head_sha, files=_to_file_stats(node["diffStats"]))
+        stats = node["diffStats"]
+        patch_ranges = await _scan_file_stat_ranges(client, project, iid, stats) if stats else {}
+        return MergeRequestDiff(head_sha=head_sha, files=_to_file_stats(stats, patch_ranges))
 
     diffs, next_cursor, matched = await _scan_diffs(client, project, iid, set(wanted), start)
     # A resumed call did not read the first page, so it cannot prove a path is missing.
@@ -1992,21 +2106,29 @@ async def _post_review_note_batch(
         "openWorldHint": True,
     }
 )
-async def post_review_notes(
+async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing arguments describe the requested batch.
     ctx: Context,
     project: Project,
     iid: Iid,
-    head_sha: Annotated[str, Field(description="Full 40-character head SHA from get_merge_request_diff.")],
+    head_sha: Annotated[
+        str,
+        Field(description="Full 40-character head SHA from get_merge_request or get_merge_request_diff."),
+    ],
     notes: Annotated[list[ReviewNote], Field(min_length=1, max_length=20)],
+    validate_only: Annotated[
+        bool,
+        Field(description="Run all preflight checks and return positions without posting any notes."),
+    ] = False,
 ) -> PostReviewNotesResult:
-    """Post validated inline review notes as a sequential, bounded batch.
+    """Review inline comments: validate or post a sequential, bounded batch.
 
-    Like `glab mr note create`, but creates diff discussions. Require the user's explicit `APPROVE` before posting.
-    `head_sha` must be the full SHA from `get_merge_request_diff`. A `body_path` is an absolute path on this server,
-    which is useful with stdio but is not a path on the agent's computer. All bodies, diff lines, and paths are
-    checked before the first post. A second head check is preflight only, not an atomic lock, because GitLab has no
-    expected-head guard for discussion creation. Writes are sequential and never retried. Check every result before
-    deciding what to do next.
+    Like `glab mr note create`, but creates diff discussions. Set `validate_only` to true to run all body, path, line,
+    and SHA checks without writing; validation does not need the user's `APPROVE`. Actual posting still requires the
+    user's explicit `APPROVE`. `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
+    A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
+    computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
+    only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
+    and never retried. Check every result before deciding what to do next.
     """
     if not _full_sha(head_sha):
         return _unattempted_review_notes(
@@ -2024,6 +2146,26 @@ async def post_review_notes(
     prepared, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, bodies)
     if warning:
         return _unattempted_review_notes(len(notes), warning)
+    if validate_only:
+        return PostReviewNotesResult(
+            results=[
+                ReviewNotePostResult(
+                    index=index,
+                    status="validated",
+                    position={
+                        key: value
+                        for key, value in {
+                            **location,
+                            "base_sha": refs["base_sha"],
+                            "start_sha": refs["start_sha"],
+                            "head_sha": refs["head_sha"],
+                        }.items()
+                        if value is not None
+                    },
+                )
+                for index, (_, location) in enumerate(prepared)
+            ],
+        )
     return await _post_review_note_batch(client, project, iid, prepared, refs)
 
 
@@ -2685,7 +2827,9 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     ] = None,
     rebase: Annotated[bool, Field(description="True asks GitLab to rebase the source branch.")] = False,
 ) -> MergeRequestUpdate:
-    """Change one merge request. Like `glab mr update`, `glab mr approve`, and `glab mr rebase`.
+    """Reviewer and assignee changes for merge request review. Like `glab mr update`.
+
+    Also like `glab mr approve` and `glab mr rebase`.
 
     Lower risk than a merge, but not always reversible. A rebase rewrites the
     source branch. An approval can let an auto-merge that is already enabled go through.

@@ -69,6 +69,42 @@ async def test_post_review_notes_is_registered(tools):
     assert "post_review_notes" in tools
 
 
+async def test_server_instructions_describe_the_review_workflow(gitlab_env):
+    """The MCP instructions name the review tools and require validation before approval and posting."""
+    # Arrange / Act
+    async with Client(mcp) as client:
+        await client.list_tools()
+        instructions = client.instructions
+
+    # Assert
+    assert instructions is not None
+    for name in ("get_merge_request", "get_merge_request_diff", "post_review_notes", "update_merge_request"):
+        assert name in instructions
+    assert "post_review_notes(validate_only=true)" in instructions
+    assert instructions.index("validate_only=true") < instructions.index("APPROVE")
+    assert "explicit APPROVE before posting" in instructions
+
+
+@pytest.mark.parametrize(
+    ("name", "search_terms"),
+    [
+        ("get_merge_request", ("review",)),
+        ("get_merge_request_diff", ("review", "inline comment")),
+        ("post_review_notes", ("review", "inline comment")),
+        ("update_merge_request", ("review", "reviewer and assignee")),
+    ],
+)
+async def test_review_tools_have_searchable_first_line_descriptions(tools, name, search_terms):
+    """Review tool first lines include search terms surfaced by the MCP inventory."""
+    # Arrange
+    first_line = tools[name].description.splitlines()[0].lower()
+
+    # Act / Assert
+    assert all(term in first_line for term in search_terms)
+    if name == "update_merge_request":
+        assert "glab mr update" in tools[name].description
+
+
 @pytest.mark.parametrize("name", sorted(EXPECTED_READ_ONLY_TOOLS))
 async def test_read_only_tools_are_marked_read_only(tools, name):
     """Read tools advertise readOnlyHint and openWorldHint, since they call GitLab."""

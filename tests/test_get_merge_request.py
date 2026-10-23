@@ -9,11 +9,12 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import DESCRIPTION_CAP, THREAD_INDEX_CAP, mcp
+from gitlab_mcp.server import DESCRIPTION_CAP, MAX_PAGES, THREAD_INDEX_CAP, mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
+PIPELINE_JOBS = "https://gitlab.example.com/api/v4/projects/group%2Fproject/pipelines/123/jobs"
 HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA. Write tools need it exact, so output keeps all of it.
 POSITION = {"oldPath": "docs/sop.md", "newPath": "docs/sop.md", "oldLine": None, "newLine": 212}
 RENAMED_POSITION = {"oldPath": "docs/old.md", "newPath": "docs/new.md", "oldLine": None, "newLine": 3}
@@ -121,7 +122,12 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
 
     # Assert
     assert route.calls.last.request.headers["PRIVATE-TOKEN"] == "glpat-test"
-    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includeDescription": True}
+    assert sent_variables(route) == {
+        "fullPath": PROJECT,
+        "iid": str(IID),
+        "includeDescription": True,
+        "includeJobs": False,
+    }
     assert data == {
         "iid": IID,
         "title": "Rebuild support",
@@ -150,6 +156,164 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
             "index_complete": True,
         },
     }
+
+
+@respx.mock
+async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
+    """Explicit job lookup returns failed job IDs and names, even for a successful pipeline."""
+    # Arrange
+    node = make_mr(headPipeline={"status": "SUCCESS", "id": "gid://gitlab/Ci::Pipeline/123"})
+    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+    jobs = respx.get(PIPELINE_JOBS).mock(
+        return_value=httpx.Response(200, json=[{"id": 456, "name": "unit tests"}]),
+    )
+
+    # Act
+    data = await call_tool(include_jobs=True)
+
+    # Assert
+    assert sent_variables(graphql)["includeJobs"] is True
+    assert dict(jobs.calls.last.request.url.params) == {"scope[]": "failed", "per_page": "100", "page": "1"}
+    assert (
+        "headPipeline { status id @include(if: $includeJobs) }"
+        in json.loads(
+            graphql.calls.last.request.content,
+        )["query"]
+    )
+    assert data["failed_jobs"] == "id\tname\n456\tunit tests"
+    assert "jobs_complete" not in data
+
+
+@respx.mock
+async def test_default_does_not_request_pipeline_jobs(gitlab_env):
+    """The default lookup keeps the existing response and makes no REST jobs request."""
+    # Arrange
+    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+    jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert sent_variables(graphql)["includeJobs"] is False
+    assert jobs.call_count == 0
+    assert "failed_jobs" not in data
+    assert "jobs_complete" not in data
+
+
+@respx.mock
+async def test_include_jobs_without_pipeline_makes_no_rest_request(gitlab_env):
+    """An explicitly requested job lookup skips REST when the merge request has no pipeline."""
+    # Arrange
+    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(headPipeline=None)))
+    jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
+
+    # Act
+    data = await call_tool(include_jobs=True)
+
+    # Assert
+    assert sent_variables(graphql)["includeJobs"] is True
+    assert jobs.call_count == 0
+    assert "pipeline_status" not in data
+    assert "failed_jobs" not in data
+    assert "jobs_complete" not in data
+
+
+@respx.mock
+async def test_include_jobs_omits_empty_failed_job_list(gitlab_env):
+    """An empty failed-job result is omitted and remains complete."""
+    # Arrange
+    respx.post(GRAPHQL).mock(
+        return_value=graphql_response(
+            make_mr(headPipeline={"status": "SUCCESS", "id": "gid://gitlab/Ci::Pipeline/123"})
+        ),
+    )
+    jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
+
+    # Act
+    data = await call_tool(include_jobs=True)
+
+    # Assert
+    assert jobs.call_count == 1
+    assert "failed_jobs" not in data
+    assert "jobs_complete" not in data
+
+
+@respx.mock
+async def test_include_jobs_reads_multiple_pages(gitlab_env):
+    """Failed jobs are returned in page order after all pages are read."""
+    # Arrange
+    respx.post(GRAPHQL).mock(
+        return_value=graphql_response(
+            make_mr(headPipeline={"status": "FAILED", "id": "gid://gitlab/Ci::Pipeline/123"})
+        ),
+    )
+
+    def serve_page(request: httpx.Request) -> httpx.Response:
+        """Return the failed job row for the requested page and link to the next page."""
+        page = int(request.url.params["page"])
+        next_page = "2" if page == 1 else ""
+        return httpx.Response(
+            200,
+            json=[{"id": page, "name": f"failed-{page}"}],
+            headers={"X-Next-Page": next_page},
+        )
+
+    jobs = respx.get(PIPELINE_JOBS).mock(side_effect=serve_page)
+
+    # Act
+    data = await call_tool(include_jobs=True)
+
+    # Assert
+    assert [call.request.url.params["page"] for call in jobs.calls] == ["1", "2"]
+    assert data["failed_jobs"] == "id\tname\n1\tfailed-1\n2\tfailed-2"
+    assert "jobs_complete" not in data
+
+
+@respx.mock
+async def test_include_jobs_reports_incomplete_at_page_cap(gitlab_env):
+    """The scan stops at MAX_PAGES and marks the returned failed-job list incomplete."""
+    # Arrange
+    respx.post(GRAPHQL).mock(
+        return_value=graphql_response(
+            make_mr(headPipeline={"status": "FAILED", "id": "gid://gitlab/Ci::Pipeline/123"})
+        ),
+    )
+
+    def serve_page(request: httpx.Request) -> httpx.Response:
+        """Keep returning a next-page marker so the bounded scan reaches its cap."""
+        page = int(request.url.params["page"])
+        return httpx.Response(
+            200,
+            json=[{"id": page, "name": f"failed-{page}"}],
+            headers={"X-Next-Page": str(page + 1)},
+        )
+
+    jobs = respx.get(PIPELINE_JOBS).mock(side_effect=serve_page)
+
+    # Act
+    data = await call_tool(include_jobs=True)
+
+    # Assert
+    assert jobs.call_count == MAX_PAGES
+    assert data["jobs_complete"] is False
+    assert data["failed_jobs"].splitlines()[0] == "id\tname"
+
+
+@pytest.mark.parametrize("pipeline_id", ["123", "gid://gitlab/Ci::Pipeline/not-a-number", "gid://gitlab/Other/123"])
+@respx.mock
+async def test_include_jobs_rejects_malformed_pipeline_id(gitlab_env, pipeline_id):
+    """A malformed pipeline GID raises an error instead of hiding failed jobs."""
+    # Arrange
+    respx.post(GRAPHQL).mock(
+        return_value=graphql_response(make_mr(headPipeline={"status": "FAILED", "id": pipeline_id})),
+    )
+    jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="pipeline ID format"):
+        await call_tool(include_jobs=True)
+    assert jobs.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -256,7 +420,12 @@ async def test_description_obeys_requested_limit(
     data = await call_tool(description_limit=description_limit)
 
     # Assert
-    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includeDescription": True}
+    assert sent_variables(route) == {
+        "fullPath": PROJECT,
+        "iid": str(IID),
+        "includeDescription": True,
+        "includeJobs": False,
+    }
     assert len(data["description"]) == expected_length
     assert ("description_truncated" in data) is expected_truncated
     request = json.loads(route.calls.last.request.content)
@@ -276,7 +445,12 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
     data = await call_tool(**skip_args)
 
     # Assert
-    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includeDescription": False}
+    assert sent_variables(route) == {
+        "fullPath": PROJECT,
+        "iid": str(IID),
+        "includeDescription": False,
+        "includeJobs": False,
+    }
     assert {"description", "description_truncated"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"
 

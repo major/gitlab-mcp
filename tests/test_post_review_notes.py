@@ -98,20 +98,112 @@ def review_note(file: str, line: int, body: str = "Please check this.", **extra:
     return {"file": file, "line": line, "body": body, **extra}
 
 
-async def call_tool(*, notes: list[dict[str, Any]], head_sha: str = HEAD) -> dict[str, Any]:
+async def call_tool(
+    *, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False
+) -> dict[str, Any]:
     """Call post_review_notes through the real in-memory MCP client."""
-    result = await call_tool_result(notes=notes, head_sha=head_sha)
+    result = await call_tool_result(notes=notes, head_sha=head_sha, validate_only=validate_only)
     return result.structured_content
 
 
-async def call_tool_result(*, notes: list[dict[str, Any]], head_sha: str = HEAD) -> Any:
+async def call_tool_result(*, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False) -> Any:
     """Call the tool and return its protocol result, including input validation errors."""
     async with Client(mcp) as client:
         return await client.call_tool(
             "post_review_notes",
-            {"project": PROJECT, "iid": IID, "head_sha": head_sha, "notes": notes},
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "head_sha": head_sha,
+                "notes": notes,
+                "validate_only": validate_only,
+            },
             raise_on_error=False,
         )
+
+
+@respx.mock
+async def test_validate_only_checks_new_and_old_side_positions_without_posting(gitlab_env):
+    """Validation returns each exact position after both SHA checks, without writes."""
+    # Arrange
+    patch = "@@ -5 +5,2 @@\n context\n+added"
+    mr_route, diff_route = add_preflight([([diff_file("src.py", patch=patch)], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [
+        review_note("src.py", 6),
+        {"file": "src.py", "old_line": 5, "body": "Review the existing line."},
+    ]
+
+    # Act
+    data = await call_tool(notes=notes, validate_only=True)
+
+    # Assert
+    assert data["results"] == [
+        {
+            "index": 0,
+            "status": "validated",
+            "position": {
+                "position_type": "text",
+                "base_sha": BASE_SHA,
+                "start_sha": START_SHA,
+                "head_sha": HEAD,
+                "old_path": "src.py",
+                "new_path": "src.py",
+                "new_line": 6,
+            },
+        },
+        {
+            "index": 1,
+            "status": "validated",
+            "position": {
+                "position_type": "text",
+                "base_sha": BASE_SHA,
+                "start_sha": START_SHA,
+                "head_sha": HEAD,
+                "old_path": "src.py",
+                "new_path": "src.py",
+                "old_line": 5,
+                "new_line": 5,
+            },
+        },
+    ]
+    assert "warning" not in data
+    assert len(mr_route.calls) == TWO_POSTS
+    assert len(diff_route.calls) == 1
+    assert not post_route.called
+
+
+@pytest.mark.parametrize("failure", ["invalid-line", "stale-sha", "invalid-body"])
+@respx.mock
+async def test_validate_only_failures_remain_unattempted_without_posting(gitlab_env, failure):
+    """Validation failures keep unattempted results and never create discussions."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    head_sha = "d" * 40 if failure == "stale-sha" else HEAD
+    note = review_note("src.py", 99 if failure == "invalid-line" else 1)
+    if failure == "invalid-body":
+        note["body"] = " \n\t"
+
+    # Act
+    data = await call_tool(notes=[note], head_sha=head_sha, validate_only=True)
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["warning"]
+    assert not post_route.called
+    if failure == "invalid-body":
+        assert "Body preflight failed" in data["warning"]
+        assert not mr_route.called
+        assert not diff_route.called
+    elif failure == "stale-sha":
+        assert "stale" in data["warning"]
+        assert len(mr_route.calls) == 1
+        assert not diff_route.called
+    else:
+        assert "not a usable diff line" in data["warning"]
+        assert len(mr_route.calls) == 1
+        assert len(diff_route.calls) == 1
 
 
 @respx.mock

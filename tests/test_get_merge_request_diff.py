@@ -128,12 +128,17 @@ def files_query() -> httpx.Response:
 @pytest.mark.parametrize("arguments", [{}, {"paths": []}], ids=["no-paths", "empty-paths"])
 @respx.mock
 async def test_file_list_mode_maps_diff_stats_and_head_sha(gitlab_env, arguments):
-    """Without paths, the tool returns the diffStats as a file list and never calls the REST diffs endpoint."""
-    # Arrange: no REST route is registered, so a REST call would fail the test.
+    """Without paths, GraphQL stats stay intact and REST patches enrich known file anchors."""
+    # Arrange
     graphql = respx.post(GRAPHQL).mock(
         return_value=httpx.Response(
             200,
             json=graphql_body(HEAD_REFS, [make_stat("a.py", 3, 1), make_stat("docs/b.md", 0, 7)]),
+        ),
+    )
+    rest = respx.get(DIFFS_URL).mock(
+        side_effect=serve_pages(
+            {1: [make_file("a.py"), make_file("docs/b.md", diff="@@ -1,2 +1,0 @@\n-old\n-old2\n")]},
         ),
     )
 
@@ -142,12 +147,18 @@ async def test_file_list_mode_maps_diff_stats_and_head_sha(gitlab_env, arguments
 
     # Assert
     assert sent_variables(graphql) == [{"fullPath": PROJECT, "iid": str(IID)}]
-    assert [call.request.url.path for call in respx.calls] == ["/api/graphql"]
+    assert requested_pages(rest) == [1]
     assert data == {
         "head_sha": HEAD_SHA,
         "files": [
-            {"path": "a.py", "additions": 3, "deletions": 1},
-            {"path": "docs/b.md", "additions": 0, "deletions": 7},
+            {"path": "a.py", "additions": 3, "deletions": 1, "new_line_ranges": [[1, 1]], "ranges_complete": True},
+            {
+                "path": "docs/b.md",
+                "additions": 0,
+                "deletions": 7,
+                "new_line_ranges": [],
+                "ranges_complete": True,
+            },
         ],
     }
 
@@ -178,13 +189,124 @@ async def test_file_list_mode_ignores_cursor(gitlab_env):
     """The cursor only matters for patches, so a bad cursor does not fail the file list."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=files_query())
+    rest = respx.get(DIFFS_URL).mock(side_effect=serve_pages({1: [make_file("a.py")]}))
 
     # Act
     data = await call_tool(cursor="not base64!!")
 
     # Assert
-    assert data["files"] == [{"path": "a.py", "additions": 3, "deletions": 1}]
-    assert [call.request.url.path for call in respx.calls] == ["/api/graphql"]
+    assert data["files"] == [
+        {"path": "a.py", "additions": 3, "deletions": 1, "new_line_ranges": [[1, 1]], "ranges_complete": True},
+    ]
+    assert requested_pages(rest) == [1]
+
+
+@respx.mock
+async def test_file_list_ranges_include_context_and_follow_multiple_hunks(gitlab_env):
+    """Each nonempty new-side hunk is an inclusive range, including its context lines."""
+    # Arrange
+    stats = [make_stat("src.py", 2, 2)]
+    patch = "@@ -2,3 +2,4 @@\n context\n-old\n+new\n context\n@@ -20 +21 @@\n-old\n+new\n"
+    respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=graphql_body(HEAD_REFS, stats)))
+    rest = respx.get(DIFFS_URL).mock(side_effect=serve_pages({1: [make_file("src.py", diff=patch)]}))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert requested_pages(rest) == [1]
+    assert data["files"] == [
+        {
+            "path": "src.py",
+            "additions": 2,
+            "deletions": 2,
+            "new_line_ranges": [[2, 5], [21, 21]],
+            "ranges_complete": True,
+        },
+    ]
+
+
+@respx.mock
+async def test_file_list_marks_missing_patch_ranges_incomplete(gitlab_env):
+    """A GraphQL file with no returned REST patch cannot be treated as having no anchors."""
+    # Arrange
+    stats = [make_stat("present.py"), make_stat("missing.py")]
+    respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=graphql_body(HEAD_REFS, stats)))
+    rest = respx.get(DIFFS_URL).mock(side_effect=serve_pages({1: [make_file("present.py")]}))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert requested_pages(rest) == [1]
+    assert data["files"] == [
+        {
+            "path": "present.py",
+            "additions": 1,
+            "deletions": 0,
+            "new_line_ranges": [[1, 1]],
+            "ranges_complete": True,
+        },
+        {
+            "path": "missing.py",
+            "additions": 1,
+            "deletions": 0,
+            "new_line_ranges": [],
+            "ranges_complete": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "file_options",
+    [{"diff": ""}, {"collapsed": True}, {"too_large": True}],
+    ids=["empty", "collapsed", "too-large"],
+)
+@respx.mock
+async def test_file_list_marks_unavailable_patch_ranges_incomplete(gitlab_env, file_options):
+    """Empty, collapsed, and too-large patches do not prove that a file has no anchors."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=files_query())
+    respx.get(DIFFS_URL).mock(side_effect=serve_pages({1: [make_file("a.py", **file_options)]}))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert data["files"] == [
+        {"path": "a.py", "additions": 3, "deletions": 1, "new_line_ranges": [], "ranges_complete": False},
+    ]
+
+
+@respx.mock
+async def test_file_list_page_limit_marks_unscanned_ranges_incomplete(gitlab_env):
+    """Files beyond the bounded REST scan keep their GraphQL stats and unknown range status."""
+    # Arrange
+    stats = [make_stat("f1.py"), make_stat(f"f{MAX_PAGES + 1}.py")]
+    respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=graphql_body(HEAD_REFS, stats)))
+    rest = respx.get(DIFFS_URL).mock(side_effect=serve_pages(PAGE_LIMIT_PAGES))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert requested_pages(rest) == list(range(1, MAX_PAGES + 1))
+    assert data["files"] == [
+        {
+            "path": "f1.py",
+            "additions": 1,
+            "deletions": 0,
+            "new_line_ranges": [[1, 1]],
+            "ranges_complete": True,
+        },
+        {
+            "path": f"f{MAX_PAGES + 1}.py",
+            "additions": 1,
+            "deletions": 0,
+            "new_line_ranges": [],
+            "ranges_complete": False,
+        },
+    ]
 
 
 @respx.mock
