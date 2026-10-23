@@ -7,10 +7,10 @@ lazy from collections.abc import Callable
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_PAGES, REBASE_POLL_ATTEMPTS, REBASE_POLL_DELAY, mcp
+from gitlab_mcp.server import MAX_PAGES, REBASE_POLL_ATTEMPTS, REBASE_POLL_DELAY
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 MR = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187"
@@ -42,10 +42,8 @@ def router(gitlab_env):
 
 
 async def call_tool(**arguments: Any) -> dict[str, Any]:
-    """Call update_merge_request through the MCP protocol and return its data."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("update_merge_request", {"project": PROJECT, "iid": IID, **arguments})
-    return result.structured_content
+    """Call update_merge_request with the default project and IID and return its data."""
+    return await call_mcp_tool("update_merge_request", {"project": PROJECT, "iid": IID, **arguments})
 
 
 def operation(request: httpx.Request) -> str:

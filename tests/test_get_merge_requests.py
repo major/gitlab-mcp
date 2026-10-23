@@ -6,10 +6,10 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import DESCRIPTION_CAP, mcp
+from gitlab_mcp.server import DESCRIPTION_CAP
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -52,10 +52,8 @@ def sent_request(route: respx.Route) -> dict[str, Any]:
 
 
 async def call_tool(iids: list[Any], **extra: Any) -> dict[str, Any]:
-    """Call get_merge_requests through the MCP protocol and return its structured data."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("get_merge_requests", {"project": PROJECT, "iids": iids, **extra})
-    return result.structured_content
+    """Call get_merge_requests with the default project and return its structured data."""
+    return await call_mcp_tool("get_merge_requests", {"project": PROJECT, "iids": iids, **extra})
 
 
 @respx.mock

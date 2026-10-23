@@ -6,9 +6,9 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 
-from gitlab_mcp.server import MAX_PAGES, mcp
+from gitlab_mcp.server import MAX_PAGES
+from mcp_helpers import call_tool_result as call_mcp_tool_result
 
 BASE = "https://gitlab.example.com/api/v4"
 PROJECT = "group/project"
@@ -108,18 +108,17 @@ async def call_tool(
 
 async def call_tool_result(*, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False) -> Any:
     """Call the tool and return its protocol result, including input validation errors."""
-    async with Client(mcp) as client:
-        return await client.call_tool(
-            "post_review_notes",
-            {
-                "project": PROJECT,
-                "iid": IID,
-                "head_sha": head_sha,
-                "notes": notes,
-                "validate_only": validate_only,
-            },
-            raise_on_error=False,
-        )
+    return await call_mcp_tool_result(
+        "post_review_notes",
+        {
+            "project": PROJECT,
+            "iid": IID,
+            "head_sha": head_sha,
+            "notes": notes,
+            "validate_only": validate_only,
+        },
+        raise_on_error=False,
+    )
 
 
 @respx.mock

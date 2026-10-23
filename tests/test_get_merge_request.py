@@ -10,6 +10,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from gitlab_mcp.server import DESCRIPTION_CAP, MAX_PAGES, THREAD_INDEX_CAP, mcp
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -91,10 +92,8 @@ def sent_variables(route: respx.Route) -> dict[str, Any]:
 
 
 async def call_tool(**extra: Any) -> dict:
-    """Call get_merge_request through the MCP protocol and return its data."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("get_merge_request", {"project": PROJECT, "iid": IID, **extra})
-    return result.structured_content
+    """Call get_merge_request with the default project and IID and return its data."""
+    return await call_mcp_tool("get_merge_request", {"project": PROJECT, "iid": IID, **extra})
 
 
 @respx.mock

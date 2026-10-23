@@ -6,11 +6,11 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 lazy from mcp.types import CallToolResult, TextContent
 
-from gitlab_mcp.server import MAX_PAGES, TSV_COLUMNS, mcp
+from gitlab_mcp.server import MAX_PAGES, TSV_COLUMNS
+from mcp_helpers import call_tool_result as call_mcp_tool_result
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -57,13 +57,12 @@ def sent_variables(route: respx.Route, index: int = -1) -> dict[str, Any]:
 
 
 async def call_tool_result(arguments: dict[str, Any] | None = None) -> CallToolResult:
-    """Call list_merge_requests through the MCP protocol and return the raw result."""
-    async with Client(mcp) as client:
-        return await client.call_tool("list_merge_requests", {"project": PROJECT} | (arguments or {}))
+    """Call list_merge_requests with the default project and return the raw result."""
+    return await call_mcp_tool_result("list_merge_requests", {"project": PROJECT} | (arguments or {}))
 
 
 async def call_tool(arguments: dict[str, Any] | None = None) -> dict:
-    """Call list_merge_requests through the MCP protocol and return its data."""
+    """Call list_merge_requests with the default project and return its data."""
     result = await call_tool_result(arguments)
     return result.structured_content
 

@@ -7,10 +7,9 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import mcp
+from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -26,10 +25,8 @@ def router(gitlab_env):
 
 
 async def call_tool(**arguments: Any) -> dict[str, Any]:
-    """Call the work-item edit tool through the in-memory MCP client."""
-    async with Client(mcp) as client:
-        result = await client.call_tool("edit_work_item_description", arguments)
-    return result.structured_content
+    """Call the work-item edit tool with keyword arguments and return its structured content."""
+    return await call_mcp_tool("edit_work_item_description", arguments)
 
 
 def graphql_operation(request: httpx.Request) -> str:

@@ -7,6 +7,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from gitlab_mcp.server import MAX_PAGES, mcp
+from mcp_helpers import call_tool as call_mcp_tool
 
 API = "https://gitlab.example.com/api/v4"
 PROJECT = "group/nested project"
@@ -14,15 +15,13 @@ LABELS_URL = f"{API}/projects/group%2Fnested%20project/labels"
 
 
 async def call_tool(search: str | None = None, names: list[str] | None = None) -> dict:
-    """Call list_labels through the MCP protocol and return its structured data."""
-    async with Client(mcp) as client:
-        arguments = {"project": PROJECT}
-        if search is not None:
-            arguments["search"] = search
-        if names is not None:
-            arguments["names"] = names
-        result = await client.call_tool("list_labels", arguments)
-    return result.structured_content
+    """Call list_labels with the default project, sending only the filters that are set."""
+    arguments = {"project": PROJECT}
+    if search is not None:
+        arguments["search"] = search
+    if names is not None:
+        arguments["names"] = names
+    return await call_mcp_tool("list_labels", arguments)
 
 
 @respx.mock

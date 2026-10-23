@@ -8,7 +8,7 @@ from typing import Any, Literal, cast
 import httpx
 import pytest
 import respx
-from fastmcp import Client, FastMCP
+from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from gitlab_mcp.work_items import (
@@ -17,6 +17,7 @@ from gitlab_mcp.work_items import (
     read_work_item_for_edit,
     read_work_item_notes,
 )
+from mcp_helpers import call_tool as call_mcp_tool
 lazy from gitlab_mcp.client import GitLabClient
 lazy from gitlab_mcp.config import Settings
 
@@ -176,10 +177,8 @@ def request_variables(route: respx.Route) -> list[dict[str, Any]]:
 
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Call one helper through the test MCP client and return its structured result."""
-    async with Client(TEST_APP) as client:
-        result = await client.call_tool(name, arguments)
-    return result.structured_content
+    """Call one helper on the test-only FastMCP app and return its structured result."""
+    return await call_mcp_tool(name, arguments, app=TEST_APP)
 
 
 @pytest.mark.parametrize(
