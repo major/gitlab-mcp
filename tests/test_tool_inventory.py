@@ -23,7 +23,12 @@ EXISTING_WRITE_TOOLS = {
     "update_merge_request",
 }
 NEW_READ_ONLY_TOOLS = {"get_work_item", "list_work_item_notes"}
-NEW_WRITE_TOOLS = {"edit_work_item_description", "edit_merge_request_description", "create_merge_request"}
+NEW_WRITE_TOOLS = {
+    "edit_work_item_description",
+    "edit_merge_request_description",
+    "create_merge_request",
+    "reply_to_threads",
+}
 
 EXPECTED_READ_ONLY_TOOLS = EXISTING_READ_ONLY_TOOLS | NEW_READ_ONLY_TOOLS
 EXPECTED_WRITE_TOOLS = EXISTING_WRITE_TOOLS | NEW_WRITE_TOOLS
@@ -31,8 +36,8 @@ EXPECTED_TOOLS = EXPECTED_READ_ONLY_TOOLS | EXPECTED_WRITE_TOOLS
 
 # Counts are kept as names so a drift shows up as a readable set difference.
 EXISTING_TOOL_COUNT = 11
-NEW_TOOL_COUNT = 5
-TOTAL_TOOL_COUNT = 16
+NEW_TOOL_COUNT = 6
+TOTAL_TOOL_COUNT = 17
 
 
 @pytest.fixture
@@ -52,7 +57,7 @@ def test_expected_counts_add_up():
 
 
 async def test_registered_tool_names_match_inventory_exactly(tools):
-    """The server exposes exactly the 11 existing tools plus the 5 planned tools."""
+    """The server exposes exactly the 11 existing tools plus the 6 planned tools."""
     # Act
     names = set(tools)
 
@@ -144,6 +149,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"project", "source_branch", "target_branch", "title"},
             {"description", "description_file", "labels", "remove_source_branch", "blocked_by"},
         ),
+        ("reply_to_threads", {"project", "replies"}, set()),
         (
             "list_merge_requests",
             set(),
