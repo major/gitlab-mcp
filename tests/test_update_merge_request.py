@@ -9,7 +9,8 @@ import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import MAX_PAGES, REBASE_POLL_ATTEMPTS, REBASE_POLL_DELAY
+from gitlab_mcp.common import MAX_PAGES
+from gitlab_mcp.tools.mr_update import REBASE_POLL_ATTEMPTS, REBASE_POLL_DELAY
 from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -522,7 +523,7 @@ def waits(monkeypatch):
     async def fake_wait(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("gitlab_mcp.server._wait", fake_wait)
+    monkeypatch.setattr("gitlab_mcp.tools.mr_update._wait", fake_wait)
     return recorded
 
 
