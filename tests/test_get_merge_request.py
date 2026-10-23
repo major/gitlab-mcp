@@ -121,7 +121,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
 
     # Assert
     assert route.calls.last.request.headers["PRIVATE-TOKEN"] == "glpat-test"
-    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID)}
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includeDescription": True}
     assert data == {
         "iid": IID,
         "title": "Rebuild support",
@@ -236,36 +236,62 @@ async def test_auto_merge_strategy_is_returned_raw(gitlab_env, strategy):
 
 
 @pytest.mark.parametrize(
-    ("length", "expected_truncated"),
-    [(DESCRIPTION_CAP, False), (DESCRIPTION_CAP + 1, True)],
+    ("description_limit", "length", "expected_length", "expected_truncated"),
+    [
+        (1, 1, 1, False),
+        (1, 2, 1, True),
+        (DESCRIPTION_CAP, DESCRIPTION_CAP, DESCRIPTION_CAP, False),
+        (DESCRIPTION_CAP, DESCRIPTION_CAP + 1, DESCRIPTION_CAP, True),
+    ],
 )
 @respx.mock
-async def test_description_is_capped(gitlab_env, length, expected_truncated):
-    """A description longer than the cap is cut, and the flag says so."""
+async def test_description_obeys_requested_limit(
+    gitlab_env, description_limit, length, expected_length, expected_truncated
+):
+    """Descriptions stop at the requested limit and report whether text was cut."""
     # Arrange
-    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description="d" * length)))
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description="d" * length)))
 
     # Act
-    data = await call_tool()
+    data = await call_tool(description_limit=description_limit)
 
     # Assert
-    assert len(data["description"]) == DESCRIPTION_CAP
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includeDescription": True}
+    assert len(data["description"]) == expected_length
     assert ("description_truncated" in data) is expected_truncated
+    request = json.loads(route.calls.last.request.content)
+    assert "description @include(if: $includeDescription)" in request["query"]
 
 
+@pytest.mark.parametrize("skip_args", [{"include_description": False}, {"description_limit": 0}])
 @respx.mock
-async def test_include_description_false_skips_description(gitlab_env):
-    """With include_description=False, a long description and its cut flag are both left out."""
+async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
+    """Skipping the description also skips the GraphQL field and cut flag."""
     # Arrange
-    long_description = "d" * (DESCRIPTION_CAP + 1)
-    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=long_description)))
+    node = make_mr()
+    del node["description"]
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
 
     # Act
-    data = await call_tool(include_description=False)
+    data = await call_tool(**skip_args)
 
     # Assert
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includeDescription": False}
     assert {"description", "description_truncated"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"
+
+
+@pytest.mark.parametrize("description_limit", [-1, DESCRIPTION_CAP + 1])
+@respx.mock
+async def test_description_limit_must_be_between_zero_and_cap(gitlab_env, description_limit):
+    """The requested description limit cannot exceed the supported range."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(description_limit=description_limit)
+    assert route.call_count == 0
 
 
 @pytest.mark.parametrize(

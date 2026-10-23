@@ -19,12 +19,17 @@ from gitlab_mcp.config import ConfigError, Settings
 # Upper bound on GraphQL pages scanned when approved, has_open_threads, or
 # thread filters run on our side. Keeps one tool call from walking a huge project.
 MAX_PAGES = 5
+MAX_BATCH_MERGE_REQUESTS = 20
 
 # One request per page. `open_threads` is computed from the two counts.
 MERGE_REQUESTS_QUERY = """
-query($fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $first: Int!, $after: String) {
+query(
+  $fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $search: String, $first: Int!, $after: String
+) {
   project(fullPath: $fullPath) {
-    mergeRequests(state: $state, authorUsername: $authorUsername, first: $first, after: $after, sort: UPDATED_DESC) {
+    mergeRequests(
+      state: $state, authorUsername: $authorUsername, search: $search, first: $first, after: $after, sort: UPDATED_DESC
+    ) {
       pageInfo { hasNextPage endCursor }
       nodes {
         iid title state draft updatedAt
@@ -40,10 +45,10 @@ query($fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $first
 
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
-query($fullPath: ID!, $iid: String!) {
+query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
-      iid title description state draft sourceBranch targetBranch
+      iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
       author { username }
       diffRefs { headSha }
       detailedMergeStatus shouldBeRebased conflicts
@@ -65,6 +70,18 @@ query($fullPath: ID!, $iid: String!) {
       }
     }
   }
+}
+"""
+
+# Shared fields for compact batch lookups. Keep discussion, reviewer, and change data out. 📦
+COMPACT_MERGE_REQUEST_FRAGMENT = """
+fragment CompactMergeRequest on MergeRequest {
+  iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
+  author { username }
+  diffRefs { headSha }
+  detailedMergeStatus shouldBeRebased conflicts
+  approved approvedBy { nodes { username } }
+  headPipeline { status }
 }
 """
 
@@ -159,6 +176,7 @@ TSV_COLUMNS = ("iid", "title", "author", "state", "draft", "approved", "approved
 # Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
 Project = Annotated[str, Field(description="Project path, like group/project.")]
 Iid = Annotated[int, Field(description="MR number.")]
+PositiveIid = Annotated[int, Field(strict=True, ge=1)]
 
 
 @lifespan
@@ -425,6 +443,34 @@ class MergeRequestDetail(BaseModel):
     threads: ThreadIndex
 
 
+class CompactMergeRequest(BaseModel):
+    """One merge request's compact status facts, without reviewers or threads."""
+
+    iid: int
+    title: str
+    state: str
+    draft: bool = Field(default=False, exclude_if=lambda v: not v)
+    author: str = Field(default="", exclude_if=lambda v: not v)
+    source_branch: str
+    target_branch: str
+    head_sha: str = Field(default="", exclude_if=lambda v: not v)
+    merge_status: str = Field(default="", exclude_if=lambda v: not v)
+    should_be_rebased: bool = Field(default=False, exclude_if=lambda v: not v)
+    conflicts: bool = Field(default=False, exclude_if=lambda v: not v)
+    approved: bool
+    approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
+    pipeline_status: str = Field(default="", exclude_if=lambda v: not v)
+    description: str = Field(default="", exclude_if=lambda v: not v)
+    description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
+
+
+class MergeRequestBatch(BaseModel):
+    """Compact results and the requested IIDs GitLab did not return."""
+
+    merge_requests: list[CompactMergeRequest]
+    missing_iids: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+
 def _cell(value: object) -> str:
     """Render one value as a TSV cell.
 
@@ -499,6 +545,10 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
     project: Project,
     state: MergeRequestState = "opened",
     author: Annotated[str | None, Field(description="Author username.")] = None,
+    search: Annotated[
+        str | None,
+        Field(description="Search merge request titles or descriptions."),
+    ] = None,
     approved: Annotated[
         bool | None,
         Field(description="True: only fully approved. False: only not fully approved."),
@@ -519,6 +569,8 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
 
     `approved` follows the instance rules: on Free it means at least one
     approval, on Premium and Ultimate it means all approval rules are met.
+    `search` uses GitLab's `Project.mergeRequests(search:)` filter, which matches
+    text in the title or description.
     `approved` and `has_open_threads` are filtered after fetching, so the tool
     scans at most 5 pages. If `has_more` is true but fewer than `limit` MRs
     came back, the scan stopped early and more matches may exist.
@@ -530,6 +582,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         "fullPath": project,
         "state": state,
         "authorUsername": author,
+        "search": search,
         "after": None,
         "first": 100 if filtered else limit,
     }
@@ -633,14 +686,14 @@ def _lower(value: str | None) -> str:
     return (value or "").lower()
 
 
-def _cap_description(description: str | None) -> tuple[str, bool]:
-    """Cut a description to `DESCRIPTION_CAP` characters.
+def _cap_description(description: str | None, limit: int = DESCRIPTION_CAP) -> tuple[str, bool]:
+    """Cut a description to the requested number of characters.
 
     Returns the text and whether it was cut. Empty text stays empty, so it is left out.
     """
-    if not description:
+    if not description or limit == 0:
         return "", False
-    return description[:DESCRIPTION_CAP], len(description) > DESCRIPTION_CAP
+    return description[:limit], len(description) > limit
 
 
 def _to_reviewer(node: dict[str, Any]) -> Reviewer:
@@ -752,16 +805,24 @@ def _head_sha(diff_refs: dict[str, Any] | None) -> str:
     return diff_refs["headSha"] if diff_refs else ""
 
 
-def _to_detail(node: dict[str, Any], *, include_description: bool) -> MergeRequestDetail:
+def _to_detail(
+    node: dict[str, Any],
+    *,
+    include_description: bool,
+    description_limit: int,
+) -> MergeRequestDetail:
     """Convert one GraphQL merge request node into the detail shape.
 
-    When `include_description` is False, the description and its flag are left out.
+    When the description was skipped or is absent from the query result, it and its flag are left out.
     """
     # A deleted or banned author comes back as null.
     author = node["author"]
     # headPipeline can be null, so check before reading it.
     pipeline = node["headPipeline"]
-    description, description_truncated = _cap_description(node["description"] if include_description else None)
+    description, description_truncated = _cap_description(
+        node.get("description") if include_description else None,
+        description_limit,
+    )
     return MergeRequestDetail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
@@ -786,12 +847,51 @@ def _to_detail(node: dict[str, Any], *, include_description: bool) -> MergeReque
     )
 
 
+def _to_compact_detail(
+    node: dict[str, Any],
+    *,
+    include_description: bool,
+    description_limit: int,
+) -> CompactMergeRequest:
+    """Convert one compact GraphQL merge request node to its output model."""
+    # A deleted or banned author comes back as null.
+    author = node["author"]
+    # headPipeline can be null, so check before reading it.
+    pipeline = node["headPipeline"]
+    description, description_truncated = _cap_description(
+        node.get("description") if include_description else None,
+        description_limit,
+    )
+    return CompactMergeRequest(
+        iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
+        title=node["title"],
+        state=node["state"],
+        draft=node["draft"],
+        author=author["username"] if author else "",
+        source_branch=node["sourceBranch"],
+        target_branch=node["targetBranch"],
+        head_sha=_head_sha(node["diffRefs"]),
+        merge_status=_lower(node["detailedMergeStatus"]),
+        should_be_rebased=node["shouldBeRebased"],
+        conflicts=node["conflicts"],
+        approved=node["approved"],
+        approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
+        pipeline_status=_lower(pipeline["status"]) if pipeline else "",
+        description=description,
+        description_truncated=description_truncated,
+    )
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_request(
     ctx: Context,
     project: Project,
     iid: Iid,
     include_description: Annotated[bool, Field(description="False skips the description to save tokens.")] = True,
+    description_limit: Annotated[
+        int,
+        Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
+    ] = DESCRIPTION_CAP,
 ) -> MergeRequestDetail:
     """Show one merge request's status, approvals, and open threads. Like `glab mr view`.
 
@@ -801,9 +901,83 @@ async def get_merge_request(
     - `threads.open` IDs go to get_merge_request_threads. `index_complete` false means some are missing.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
+    - `description_limit` controls description length. Zero skips it; the default is 4000 characters.
     """
-    node = await _fetch_merge_request(get_client(ctx), MERGE_REQUEST_QUERY, project, iid)
-    return _to_detail(node, include_description=include_description)
+    include_description = include_description and description_limit > 0
+    node = await _fetch_merge_request(
+        get_client(ctx),
+        MERGE_REQUEST_QUERY,
+        project,
+        iid,
+        includeDescription=include_description,
+    )
+    return _to_detail(node, include_description=include_description, description_limit=description_limit)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def get_merge_requests(
+    ctx: Context,
+    project: Project,
+    iids: Annotated[list[PositiveIid], Field(description="Positive merge request IIDs. Up to 20 unique IIDs.")],
+    include_description: Annotated[bool, Field(description="True includes descriptions. Defaults to false.")] = False,
+    description_limit: Annotated[
+        int,
+        Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
+    ] = DESCRIPTION_CAP,
+) -> MergeRequestBatch:
+    """Return compact status for up to 20 merge requests, similar to `glab mr view`.
+
+    IIDs are deduplicated in requested order. More than 20 raw IIDs are accepted when there are at most 20 unique
+    values. Missing IIDs are listed separately. This compact result has no reviewers, changes, or discussion/thread
+    indexes. Descriptions are skipped by default; set `include_description` to true to include up to 4000 characters.
+    Set `description_limit` to zero to skip descriptions even when requested.
+    """
+    unique_iids = list(dict.fromkeys(iids))
+    if not unique_iids:
+        raise ToolError("Pass at least one merge request IID.")  # noqa: TRY003
+    if len(unique_iids) > MAX_BATCH_MERGE_REQUESTS:
+        raise ToolError("Pass no more than 20 unique merge request IIDs.")  # noqa: TRY003
+
+    include_description = include_description and description_limit > 0
+    declarations = ["$fullPath: ID!", "$includeDescription: Boolean!"]
+    variables: dict[str, Any] = {
+        "fullPath": project,
+        "includeDescription": include_description,
+    }
+    selections = []
+    for index, iid in enumerate(unique_iids):
+        variable = f"iid{index}"
+        declarations.append(f"${variable}: String!")
+        variables[variable] = str(iid)
+        selections.append(f"mr_{index}: mergeRequest(iid: ${variable}) {{ ...CompactMergeRequest }}")
+
+    query = (
+        f"query({', '.join(declarations)}) {{\n"
+        "  project(fullPath: $fullPath) {\n"
+        f"    {' '.join(selections)}\n"
+        "  }\n"
+        "}\n"
+        f"{COMPACT_MERGE_REQUEST_FRAGMENT}"
+    )
+    data = await get_client(ctx).graphql(query, variables)
+    if data["project"] is None:
+        raise ProjectNotFoundError(project)
+
+    merge_requests = []
+    missing_iids = []
+    for index, iid in enumerate(unique_iids):
+        node = data["project"][f"mr_{index}"]
+        if node is None:
+            missing_iids.append(iid)
+            continue
+        merge_requests.append(
+            _to_compact_detail(
+                node,
+                include_description=include_description,
+                description_limit=description_limit,
+            ),
+        )
+    return MergeRequestBatch(merge_requests=merge_requests, missing_iids=missing_iids)
 
 
 def _bare_id(thread_id: str) -> str:

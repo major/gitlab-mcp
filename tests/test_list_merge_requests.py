@@ -104,6 +104,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "fullPath": PROJECT,
         "state": "opened",
         "authorUsername": "jdoe",
+        "search": None,
         "after": None,
         "first": 5,
     }
@@ -128,6 +129,7 @@ async def test_defaults_list_open_mrs_by_any_author(gitlab_env):
         "fullPath": PROJECT,
         "state": "opened",
         "authorUsername": None,  # GitLab treats null as "no author filter".
+        "search": None,
         "after": None,
         "first": 20,
     }
@@ -355,6 +357,46 @@ async def test_follows_end_cursor_until_limit_is_filled(gitlab_env):
     # Assert
     afters = [sent_variables(route, index=i)["after"] for i in range(route.call_count)]
     assert afters == [None, "c1"]
+    assert iids(data) == [2, 3]
+    assert data["has_more"] is True
+
+
+@respx.mock
+async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
+    """Search is sent on every page alongside the existing server-side filters."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            make_page(make_node(1, approved=False), make_node(2, approved=True), has_next=True, cursor="c1"),
+            make_page(make_node(3, approved=True), has_next=True, cursor="c2"),
+        ],
+    )
+
+    # Act
+    data = await call_tool(
+        {"author": "jdoe", "approved": True, "limit": 2, "search": "release note", "state": "closed"},
+    )
+
+    # Assert
+    variables = [sent_variables(route, index=index) for index in range(route.call_count)]
+    assert variables == [
+        {
+            "fullPath": PROJECT,
+            "state": "closed",
+            "authorUsername": "jdoe",
+            "search": "release note",
+            "after": None,
+            "first": FULL_PAGE,
+        },
+        {
+            "fullPath": PROJECT,
+            "state": "closed",
+            "authorUsername": "jdoe",
+            "search": "release note",
+            "after": "c1",
+            "first": FULL_PAGE,
+        },
+    ]
     assert iids(data) == [2, 3]
     assert data["has_more"] is True
 
