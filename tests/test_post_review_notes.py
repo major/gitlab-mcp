@@ -22,6 +22,7 @@ RESPONSE_NOTE_ID = 909
 MISMATCHED_LINE = 99
 TWO_POSTS = 2
 THREE_PAGES = 3
+REASON_CAP = 200
 OLD_CONTEXT_LINE = 8
 NEW_CONTEXT_LINE = 11
 MR_URL = f"{BASE}/projects/{ENCODED_PROJECT}/merge_requests/{IID}"
@@ -155,37 +156,177 @@ async def test_validate_only_checks_new_and_old_side_positions_without_posting(g
     assert not post_route.called
 
 
-@pytest.mark.parametrize("failure", ["invalid-line", "stale-sha", "invalid-body"])
 @respx.mock
-async def test_validate_only_failures_remain_unattempted_without_posting(gitlab_env, failure):
-    """Validation failures keep unattempted results and never create discussions."""
+async def test_validate_only_stale_head_sha_remains_unattempted_without_posting(gitlab_env):
+    """A stale head SHA is a batch-wide problem, so validation returns unattempted rows and no discussions."""
     # Arrange
     mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
-    head_sha = "d" * 40 if failure == "stale-sha" else HEAD
-    note = review_note("src.py", 99 if failure == "invalid-line" else 1)
-    if failure == "invalid-body":
-        note["body"] = " \n\t"
 
     # Act
-    data = await call_tool(notes=[note], head_sha=head_sha, validate_only=True)
+    data = await call_tool(notes=[review_note("src.py", 1)], head_sha="d" * 40, validate_only=True)
 
     # Assert
     assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert data["warning"]
+    assert "stale" in data["warning"]
+    assert len(mr_route.calls) == 1
+    assert not diff_route.called
     assert not post_route.called
-    if failure == "invalid-body":
-        assert "Body preflight failed" in data["warning"]
-        assert not mr_route.called
-        assert not diff_route.called
-    elif failure == "stale-sha":
-        assert "stale" in data["warning"]
-        assert len(mr_route.calls) == 1
-        assert not diff_route.called
-    else:
-        assert "not a usable diff line" in data["warning"]
-        assert len(mr_route.calls) == 1
-        assert len(diff_route.calls) == 1
+
+
+@pytest.mark.parametrize("validate_only", [True, False], ids=["validate-only", "post-mode"])
+@respx.mock
+async def test_every_bad_note_is_reported_and_no_note_is_posted(gitlab_env, validate_only):
+    """A bad line and a missing path each fail their own row, and the valid note is not posted either."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [
+        review_note("src.py", 1, "Good note."),
+        review_note("src.py", 99, "Bad line."),
+        review_note("absent.py", 1, "Missing path."),
+    ]
+
+    # Act
+    data = await call_tool(notes=notes, validate_only=validate_only)
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}},
+        {
+            "index": 1,
+            "status": "failed",
+            "reason": "line 99 on the new side is not a usable diff line in 'src.py'",
+        },
+        {
+            "index": 2,
+            "status": "failed",
+            "reason": f"Diff preflight could not find 'absent.py' within {MAX_PAGES} pages",
+        },
+    ]
+    assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
+    assert len(mr_route.calls) == TWO_POSTS
+    assert len(diff_route.calls) == 1
+    assert not post_route.called
+
+
+@respx.mock
+async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
+    """A bad body does not hide a bad diff line on another note, and each failed row explains itself."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [
+        {"file": "src.py", "line": 1, "body_path": "relative-body.txt"},
+        review_note("src.py", 99),
+        review_note("src.py", 1, "Good note."),
+    ]
+
+    # Act
+    data = await call_tool(notes=notes)
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "failed", "reason": "body_path must be an absolute server-local path"},
+        {
+            "index": 1,
+            "status": "failed",
+            "reason": "line 99 on the new side is not a usable diff line in 'src.py'",
+        },
+        {"index": 2, "status": "validated", "position": {"path": "src.py", "line": 1}},
+    ]
+    assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
+    assert len(mr_route.calls) == TWO_POSTS
+    assert len(diff_route.calls) == 1
+    assert not post_route.called
+
+
+@respx.mock
+async def test_file_level_note_is_validated_from_its_path_alone(gitlab_env):
+    """A file-level note needs only its path in the diff, so validation returns just the path."""
+    # Arrange
+    _, diff_route = add_preflight([([diff_file("src.py", patch="")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(
+        notes=[{"file": "src.py", "body": "Finding outside the hunks."}],
+        validate_only=True,
+    )
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py"}}]
+    assert "warning" not in data
+    assert len(diff_route.calls) == 1
+    assert not post_route.called
+
+
+@pytest.mark.parametrize(
+    "file_diff",
+    [
+        diff_file("src.py", patch="@@ -1 +1 @@\n-old\n+new"),
+        diff_file("src.py", patch="", collapsed=True),
+        diff_file("src.py", patch="", too_large=True),
+    ],
+    ids=["usable-patch", "collapsed", "too-large"],
+)
+@respx.mock
+async def test_file_level_note_ignores_patch_usability(gitlab_env, file_diff):
+    """Collapsed and too-large patches fail line notes only; a file-level note still validates."""
+    # Arrange
+    add_preflight([([file_diff], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[{"file": "src.py", "body": "File finding."}], validate_only=True)
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["validated"]
+    assert not post_route.called
+
+
+@pytest.mark.parametrize("null_line_keys", [False, True], ids=["omitted-line-keys", "null-line-keys"])
+@respx.mock
+async def test_file_level_post_sends_file_position_and_verifies_echo(gitlab_env, null_line_keys):
+    """The request has no line keys, and GitLab's echo verifies whether it omits or nulls them."""
+    # Arrange
+    add_preflight([([diff_file("old.py", "new.py", patch="")], None)])
+
+    def echo_position(request: httpx.Request) -> httpx.Response:
+        """Echo the requested file position, optionally with null line keys as GitLab may return them."""
+        position = json.loads(request.content)["position"]
+        if null_line_keys:
+            position = {**position, "old_line": None, "new_line": None}
+        return response(
+            {"id": "discussion-1", "notes": [{"id": POSTED_NOTE_ID, "position": position}]},
+            status=201,
+        )
+
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=echo_position)
+
+    # Act
+    data = await call_tool(notes=[{"file": "new.py", "body": "File-level finding."}])
+
+    # Assert
+    sent = json.loads(post_route.calls[0].request.content)["position"]
+    assert sent == {
+        "position_type": "file",
+        "old_path": "old.py",
+        "new_path": "new.py",
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+    }
+    assert data["results"] == [
+        {
+            "index": 0,
+            "status": "posted",
+            "note_id": POSTED_NOTE_ID,
+            "discussion_id": "discussion-1",
+            "position": {"path": "new.py", "old_path": "old.py"},
+        },
+    ]
+    assert len(post_route.calls) == 1
 
 
 @respx.mock
@@ -281,13 +422,13 @@ async def test_validates_lines_and_derives_positions_from_added_context_removed_
 
 
 @respx.mock
-async def test_reads_all_file_bodies_before_any_gitlab_request(gitlab_env, tmp_path):
-    """A bad later body path prevents even the preflight reads and all writes."""
+async def test_missing_body_file_fails_only_its_note_and_posts_nothing(gitlab_env, tmp_path):
+    """A missing body file fails its own note; the valid note is validated but still not posted."""
     # Arrange
     first_body = tmp_path / "first.txt"
     first_body.write_text("valid body", encoding="utf-8")
     mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
-    post_route = respx.post(DISCUSSIONS_URL).mock(return_value=response({"id": "unused", "notes": []}, status=201))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     notes = [
         {"file": "src.py", "line": 1, "body_path": str(first_body)},
         {"file": "src.py", "line": 1, "body_path": str(tmp_path / "missing.txt")},
@@ -297,11 +438,28 @@ async def test_reads_all_file_bodies_before_any_gitlab_request(gitlab_env, tmp_p
     data = await call_tool(notes=notes)
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["unattempted", "unattempted"]
-    assert "Body preflight failed" in data["warning"]
-    assert not mr_route.called
-    assert not diff_route.called
+    assert [item["status"] for item in data["results"]] == ["validated", "failed"]
+    assert data["results"][1]["reason"].startswith("body_path could not be read: ")
+    assert data["warning"] == "1 of 2 notes failed preflight. No notes were posted."
+    assert len(mr_route.calls) == TWO_POSTS
+    assert len(diff_route.calls) == 1
     assert not post_route.called
+
+
+@respx.mock
+async def test_long_body_read_reason_is_capped_at_200_characters(gitlab_env, tmp_path):
+    """An OS error that quotes a long path keeps only the first 200 characters of its reason."""
+    # Arrange
+    long_path = tmp_path / ("a" * 190 + ".txt")
+    note = {"file": "src.py", "line": 1, "body_path": str(long_path)}
+
+    # Act
+    data = await call_tool(notes=[note])
+
+    # Assert
+    reason = data["results"][0]["reason"]
+    assert reason.startswith("body_path could not be read: ")
+    assert len(reason) == REASON_CAP
 
 
 @respx.mock
@@ -397,8 +555,8 @@ async def test_diff_scan_checks_all_pages_to_confirm_path_is_unique(gitlab_env):
 
 
 @respx.mock
-async def test_missing_path_scan_stops_at_page_cap(gitlab_env):
-    """A path absent from a completed scan is rejected before any write."""
+async def test_missing_path_fails_its_note_after_a_complete_scan(gitlab_env):
+    """A path absent from a completed scan fails only its note, and nothing is posted."""
     # Arrange
     missing_pages: list[tuple[list[dict[str, Any]], int | None]] = [
         ([diff_file(f"other-{index}.py")], index + 2) for index in range(2)
@@ -411,16 +569,17 @@ async def test_missing_path_scan_stops_at_page_cap(gitlab_env):
     missing = await call_tool(notes=[review_note("absent.py", 1)])
 
     # Assert
-    assert [item["status"] for item in missing["results"]] == ["unattempted"]
+    assert [item["status"] for item in missing["results"]] == ["failed"]
+    assert "absent.py" in missing["results"][0]["reason"]
+    assert missing["warning"] == "1 of 1 notes failed preflight. No notes were posted."
     assert len(missing_diff.calls) == TWO_POSTS
-    assert len(missing_mr.calls) == 1
-    assert "absent.py" in missing["warning"]
+    assert len(missing_mr.calls) == TWO_POSTS
     assert not missing_post.called
 
 
 @respx.mock
-async def test_same_path_on_later_page_is_rejected_as_ambiguous(gitlab_env):
-    """A second old or new path match on a later page invalidates the full batch."""
+async def test_same_path_on_later_page_fails_its_note_as_ambiguous(gitlab_env):
+    """A second old or new path match on a later page makes the note ambiguous, so nothing is posted."""
     # Arrange
     mr_route, diff_route = add_preflight(
         [
@@ -434,10 +593,12 @@ async def test_same_path_on_later_page_is_rejected_as_ambiguous(gitlab_env):
     data = await call_tool(notes=[review_note("wanted.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert "ambiguous" in data["warning"]
+    assert data["results"] == [
+        {"index": 0, "status": "failed", "reason": "Diff preflight found ambiguous path 'wanted.py'"},
+    ]
+    assert data["warning"] == "1 of 1 notes failed preflight. No notes were posted."
     assert len(diff_route.calls) == TWO_POSTS
-    assert len(mr_route.calls) == 1
+    assert len(mr_route.calls) == TWO_POSTS
     assert not post_route.called
 
 
@@ -463,28 +624,7 @@ async def test_matching_path_at_page_cap_is_rejected_when_more_pages_remain(gitl
 
 
 @respx.mock
-async def test_collapsed_patch_stops_all_notes_before_post(gitlab_env):
-    """A collapsed patch cannot safely provide a discussion position."""
-    # Arrange
-    files = [
-        diff_file("collapsed.py", "collapsed.py", "@@ -1 +1 @@\n-old\n+new", collapsed=True),
-    ]
-    add_preflight([(files, None)])
-    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
-
-    # Act
-    data = await call_tool(
-        notes=[review_note("collapsed.py", 1)],
-    )
-
-    # Assert
-    assert [item["status"] for item in data["results"]] == ["unattempted"]
-    assert "collapsed" in data["warning"]
-    assert not post_route.called
-
-
-@respx.mock
-async def test_line_on_wrong_diff_side_stops_before_any_post(gitlab_env):
+async def test_line_on_wrong_diff_side_fails_its_note_before_any_post(gitlab_env):
     """An added line has no old-side coordinate, so it cannot take old_line."""
     # Arrange
     add_preflight([([diff_file("added.py", patch="@@ -0,0 +1 @@\n+new", new_file=True)], None)])
@@ -494,8 +634,13 @@ async def test_line_on_wrong_diff_side_stops_before_any_post(gitlab_env):
     data = await call_tool(notes=[{"file": "added.py", "old_line": 1, "body": "Wrong side."}])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert "not a usable diff line" in data["warning"]
+    assert data["results"] == [
+        {
+            "index": 0,
+            "status": "failed",
+            "reason": "line 1 on the old side is not a usable diff line in 'added.py'",
+        },
+    ]
     assert not post_route.called
 
 
@@ -615,7 +760,7 @@ async def test_mismatched_success_response_is_unverified_with_returned_ids(gitla
 
 
 @respx.mock
-async def test_ambiguous_path_is_rejected_before_any_post(gitlab_env):
+async def test_ambiguous_path_fails_its_note_before_any_post(gitlab_env):
     """Two diff entries matching the same requested path are not guessed between."""
     # Arrange
     add_preflight([([diff_file("src.py"), diff_file("src.py")], None)])
@@ -625,8 +770,9 @@ async def test_ambiguous_path_is_rejected_before_any_post(gitlab_env):
     data = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert "ambiguous" in data["warning"]
+    assert data["results"] == [
+        {"index": 0, "status": "failed", "reason": "Diff preflight found ambiguous path 'src.py'"},
+    ]
     assert not post_route.called
 
 
@@ -636,7 +782,6 @@ async def test_ambiguous_path_is_rejected_before_any_post(gitlab_env):
         {"file": "", "line": 1, "body": "Review."},
         {"file": "   ", "line": 1, "body": "Review."},
         {"file": "src.py", "line": 1, "old_line": 1, "body": "Review."},
-        {"file": "src.py", "body": "Review."},
         {"file": "src.py", "line": 0, "body": "Review."},
         {"file": "src.py", "old_line": 0, "body": "Review."},
         {"file": "src.py", "line": 1, "body": "Review.", "body_path": "relative-review.txt"},
@@ -646,7 +791,6 @@ async def test_ambiguous_path_is_rejected_before_any_post(gitlab_env):
         "empty-file",
         "blank-file",
         "both-line-sides",
-        "missing-line-side",
         "zero-new-line",
         "zero-old-line",
         "both-body-sources",
@@ -688,12 +832,26 @@ async def test_invalid_head_sha_returns_unattempted_without_requests(gitlab_env,
 
 
 @pytest.mark.parametrize(
-    "body_kind",
-    ["relative", "directory", "oversize", "invalid-utf8", "blank-file", "blank-inline", "oversize-inline"],
+    ("body_kind", "expected_reason"),
+    [
+        ("relative", "body_path must be an absolute server-local path"),
+        ("directory", "body_path must point to a regular file"),
+        ("oversize", "body exceeds 100000 UTF-8 bytes"),
+        ("invalid-utf8", "body_path is not valid UTF-8"),
+        ("blank-file", "body must not be blank"),
+        ("blank-inline", "body must not be blank"),
+        ("oversize-inline", "body exceeds 100000 UTF-8 bytes"),
+    ],
+    ids=["relative", "directory", "oversize", "invalid-utf8", "blank-file", "blank-inline", "oversize-inline"],
 )
 @respx.mock
-async def test_note_bodies_must_be_regular_utf8_nonblank_and_bounded(gitlab_env, tmp_path, body_kind):
-    """Both inline and file-backed bodies obey the same UTF-8 size and nonblank limits."""
+async def test_unusable_note_body_fails_its_note_without_any_gitlab_request(
+    gitlab_env,
+    tmp_path,
+    body_kind,
+    expected_reason,
+):
+    """Inline and file-backed bodies share the size and nonblank limits, and bad bodies send no GitLab request."""
     # Arrange
     body_path = tmp_path / "body.txt"
     note: dict[str, Any] = {"file": "src.py", "line": 1}
@@ -721,8 +879,8 @@ async def test_note_bodies_must_be_regular_utf8_nonblank_and_bounded(gitlab_env,
     data = await call_tool(notes=[note])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert "Body preflight failed" in data["warning"]
+    assert data["results"] == [{"index": 0, "status": "failed", "reason": expected_reason}]
+    assert data["warning"] == "1 of 1 notes failed preflight. No notes were posted."
     assert not mr_route.called
     assert not post_route.called
 
@@ -756,8 +914,26 @@ async def test_missing_refs_or_malformed_merge_request_stops_preflight(gitlab_en
     assert not post_route.called
 
 
+@respx.mock
+async def test_line_repeated_in_two_hunks_fails_its_note_as_ambiguous(gitlab_env):
+    """The same new-side line in two hunks has two possible coordinates, so the note is not guessed."""
+    # Arrange
+    patch = "@@ -0,0 +1 @@\n+first\n@@ -0,0 +1 @@\n+second"
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)])
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "failed", "reason": "line 1 on the new side is ambiguous in 'src.py'"},
+    ]
+    assert not post_route.called
+
+
 @pytest.mark.parametrize(
-    ("file_diff", "expected_warning"),
+    ("file_diff", "expected_reason"),
     [
         (diff_file("src.py", collapsed=True), "collapsed"),
         (diff_file("src.py", too_large=True), "too large"),
@@ -766,7 +942,7 @@ async def test_missing_refs_or_malformed_merge_request_stops_preflight(gitlab_en
     ids=["collapsed", "too-large", "empty-patch"],
 )
 @respx.mock
-async def test_unavailable_patch_is_rejected_before_post(gitlab_env, file_diff, expected_warning):
+async def test_unavailable_patch_fails_its_line_note_before_post(gitlab_env, file_diff, expected_reason):
     """Collapsed, oversized, and empty patches cannot provide a safe line position."""
     # Arrange
     add_preflight([([file_diff], None)])
@@ -776,13 +952,14 @@ async def test_unavailable_patch_is_rejected_before_post(gitlab_env, file_diff, 
     data = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert expected_warning in data["warning"]
+    assert data["results"][0]["status"] == "failed"
+    assert expected_reason in data["results"][0]["reason"]
+    assert data["warning"] == "1 of 1 notes failed preflight. No notes were posted."
     assert not post_route.called
 
 
 @pytest.mark.parametrize(
-    ("patch", "note", "expected_warning"),
+    ("patch", "note", "expected_reason"),
     [
         ("@@ malformed\n+line", review_note("src.py", 1), "invalid unified hunk header"),
         ("@@ -1,2 +1,2 @@\n one", review_note("src.py", 1), "incomplete unified hunk"),
@@ -805,7 +982,7 @@ async def test_unavailable_patch_is_rejected_before_post(gitlab_env, file_diff, 
     ],
 )
 @respx.mock
-async def test_malformed_unified_hunk_is_rejected_before_post(gitlab_env, patch, note, expected_warning):
+async def test_malformed_unified_hunk_fails_its_note_before_post(gitlab_env, patch, note, expected_reason):
     """Malformed hunk headers and line counts do not produce guessed coordinates."""
     # Arrange
     add_preflight([([diff_file("src.py", patch=patch)], None)])
@@ -815,8 +992,8 @@ async def test_malformed_unified_hunk_is_rejected_before_post(gitlab_env, patch,
     data = await call_tool(notes=[note])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert expected_warning in data["warning"]
+    assert data["results"][0]["status"] == "failed"
+    assert expected_reason in data["results"][0]["reason"]
     assert not post_route.called
 
 
@@ -888,8 +1065,8 @@ async def test_diff_entry_with_invalid_old_or_new_path_is_rejected(gitlab_env):
     data = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert "diff paths" in data["warning"]
+    assert data["results"][0]["status"] == "failed"
+    assert "diff paths" in data["results"][0]["reason"]
     assert not post_route.called
 
 

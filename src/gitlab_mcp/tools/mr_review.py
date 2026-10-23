@@ -1,5 +1,6 @@
 """Merge request inline review note tools: validate and post diff comments 📝."""
 
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
 from fastmcp.exceptions import ToolError
@@ -23,22 +24,26 @@ from gitlab_mcp.mr_common import (
     mr_rest_path,
 )
 
+REVIEW_NOTE_REASON_CAP = 200
+
 
 class ReviewNote(BaseModel):
-    """One inline note with exactly one positive line side and one nonblank body source.
+    """One inline note on a diff line, or a file-level note when no line is set.
 
-    Set exactly one of ``line`` or ``old_line``, and exactly one of ``body`` or ``body_path``. The body may contain
-    up to 100000 UTF-8 bytes. ``body_path`` must be an absolute server-local path to a regular UTF-8 file.
+    Set at most one of ``line`` or ``old_line``. Set neither for a file-level note: it needs only a diff path, so it
+    works for findings on lines outside the diff hunks and for collapsed or too-large diffs. Set exactly one of
+    ``body`` or ``body_path``. The body may contain up to 100000 UTF-8 bytes. ``body_path`` must be an absolute
+    server-local path to a regular UTF-8 file.
     """
 
     file: str = Field(min_length=1, description="Diff path.")
     line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
         default=None,
-        description="New-side line.",
+        description="New-side line. Omit line and old_line for a file-level note.",
     )
     old_line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
         default=None,
-        description="Old-side line.",
+        description="Old-side line. Omit line and old_line for a file-level note.",
     )
     body: str | None = Field(
         default=None,
@@ -54,8 +59,8 @@ class ReviewNote(BaseModel):
         """Require exactly one line side and exactly one body source."""
         if not self.file.strip():
             raise_review_preflight_error("file must not be blank")
-        if (self.line is None) == (self.old_line is None):
-            raise_review_preflight_error("Set exactly one of line or old_line")
+        if self.line is not None and self.old_line is not None:
+            raise_review_preflight_error("Set at most one of line or old_line")
         if (self.body is None) == (self.body_path is None):
             raise_review_preflight_error("Set exactly one of body or body_path")
         return self
@@ -72,6 +77,16 @@ class ReviewNotePostResult(BaseModel):
     note_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
     discussion_id: str = Field(default="", exclude_if=lambda value: not value)
     position: dict[str, str | int] = Field(default_factory=dict, exclude_if=lambda value: not value)
+    reason: str = Field(default="", exclude_if=lambda value: not value)
+
+
+@dataclass(frozen=True)
+class _CheckedNote:
+    """One requested note after preflight: its body and GitLab position, or the reason it cannot be posted."""
+
+    body: str = ""
+    position: dict[str, str | int | None] = field(default_factory=dict)
+    reason: str = ""
 
 
 class PostReviewNotesResult(BaseModel):
@@ -96,27 +111,40 @@ def _unattempted_review_notes(
     )
 
 
-def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
-    """Read and validate every note body before the tool sends any GitLab request."""
-    bodies: list[str] = []
-    for index, note in enumerate(notes):
-        if note.body is not None:
-            body = note.body
-            size = len(body.encode("utf-8"))
-        else:
-            body = read_server_local_utf8_file(
-                note.body_path or "",
-                path_field=f"note {index} body_path",
-                size_field=f"note {index} body",
-                byte_limit=REVIEW_NOTE_BODY_CAP,
-            )
-            size = len(body.encode("utf-8"))
-        if not body.strip():
-            raise_review_preflight_error(f"note {index} body must not be blank")
-        if size > REVIEW_NOTE_BODY_CAP:
-            raise_review_preflight_error(f"note {index} body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
-        bodies.append(body)
-    return bodies
+def _note_reason(message: str) -> str:
+    """Cap one note's reason so a long OS error message cannot flood the result."""
+    return message[:REVIEW_NOTE_REASON_CAP]
+
+
+def _read_review_note_body(note: ReviewNote) -> str:
+    """Return one usable note body, or raise a ValueError or OSError that says why it is not usable."""
+    if note.body is not None:
+        body = note.body
+    else:
+        body = read_server_local_utf8_file(
+            note.body_path or "",
+            path_field="body_path",
+            size_field="body",
+            byte_limit=REVIEW_NOTE_BODY_CAP,
+        )
+    if not body.strip():
+        raise_review_preflight_error("body must not be blank")
+    if len(body.encode("utf-8")) > REVIEW_NOTE_BODY_CAP:
+        raise_review_preflight_error(f"body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
+    return body
+
+
+def _read_review_note_bodies(notes: list[ReviewNote]) -> list[_CheckedNote]:
+    """Read every note body before any GitLab request, recording a reason for each unusable one."""
+    checks: list[_CheckedNote] = []
+    for note in notes:
+        try:
+            checks.append(_CheckedNote(body=_read_review_note_body(note)))
+        except OSError as exc:
+            checks.append(_CheckedNote(reason=_note_reason(f"body_path could not be read: {exc}")))
+        except ValueError as exc:
+            checks.append(_CheckedNote(reason=_note_reason(str(exc))))
+    return checks
 
 
 async def _get_review_diff_refs(client: GitLabClient, project: str, iid: int) -> dict[str, str]:
@@ -190,16 +218,23 @@ def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:
     return positions
 
 
-def _review_position(raw: dict[str, Any], note: ReviewNote) -> dict[str, str | int | None]:
-    """Find the requested old- or new-side line in a file's unified patch."""
+def _diff_paths(raw: dict[str, Any], file: str) -> tuple[str, str]:
+    """Return the old and new paths of one REST diff entry, or reject malformed path data."""
+    old_path, new_path = raw.get("old_path"), raw.get("new_path")
+    if not isinstance(old_path, str) or not isinstance(new_path, str):
+        raise_review_preflight_error(f"diff paths for {file!r} are invalid")
+    return old_path, new_path
+
+
+def _matching_line(raw: dict[str, Any], note: ReviewNote) -> tuple[int | None, int | None]:
+    """Find the one diff line that matches a line note's side and number, or say why it cannot be used."""
     if raw.get("collapsed") or raw.get("too_large"):
         raise_review_preflight_error(f"diff for {note.file!r} is collapsed or too large to position safely")
     diff = raw.get("diff")
     if not isinstance(diff, str) or not diff:
         raise_review_preflight_error(f"diff for {note.file!r} has no usable patch")
-    locations = _diff_line_positions(diff)
-    matches = []
-    for kind, old_line, new_line in locations:
+    matches: list[tuple[int | None, int | None]] = []
+    for kind, old_line, new_line in _diff_line_positions(diff):
         if note.line is not None and new_line == note.line and kind in ("added", "context"):
             matches.append((old_line, new_line))
         if note.old_line is not None and old_line == note.old_line and kind in ("removed", "context"):
@@ -210,10 +245,25 @@ def _review_position(raw: dict[str, Any], note: ReviewNote) -> dict[str, str | i
         if matches:
             raise_review_preflight_error(f"line {line} on the {side} side is ambiguous in {note.file!r}")
         raise_review_preflight_error(f"line {line} on the {side} side is not a usable diff line in {note.file!r}")
-    old_path, new_path = raw.get("old_path"), raw.get("new_path")
-    if not isinstance(old_path, str) or not isinstance(new_path, str):
-        raise_review_preflight_error(f"diff paths for {note.file!r} are invalid")
-    old_line, new_line = matches[0]
+    return matches[0]
+
+
+def _note_position(matches: list[dict[str, Any]], note: ReviewNote) -> dict[str, str | int | None]:
+    """Return the GitLab position for one note, or raise why GitLab would not accept it.
+
+    A file-level note (no line) needs only its path to appear once in the diff. A line note also needs a usable
+    hunk, so collapsed or too-large patches fail only that note.
+    """
+    if not matches:
+        raise_review_preflight_error(f"Diff preflight could not find {note.file!r} within {MAX_PAGES} pages")
+    if len(matches) != 1:
+        raise_review_preflight_error(f"Diff preflight found ambiguous path {note.file!r}")
+    raw = matches[0]
+    old_path, new_path = _diff_paths(raw, note.file)
+    if note.line is None and note.old_line is None:
+        # Omit the line keys entirely: _review_response_matches treats a missing key and a null key the same way.
+        return {"position_type": "file", "old_path": old_path, "new_path": new_path}
+    old_line, new_line = _matching_line(raw, note)
     return {
         "position_type": "text",
         "old_path": old_path,
@@ -229,7 +279,11 @@ async def _scan_review_paths(
     iid: int,
     requested_paths: set[str],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Collect requested old/new paths from at most MAX_PAGES REST diff pages."""
+    """Collect every diff entry that matches each requested path across at most MAX_PAGES REST pages.
+
+    Missing and ambiguous paths are returned as they are, so each note can report its own reason. An incomplete
+    scan still fails the whole batch, because a later page could hold a second match.
+    """
     path_matches: dict[str, list[dict[str, Any]]] = {path: [] for path in requested_paths}
     page = 1
     for _ in range(MAX_PAGES):
@@ -246,16 +300,22 @@ async def _scan_review_paths(
 
     if next_page is not None:
         raise_review_preflight_error(f"Diff path scan is incomplete after {MAX_PAGES} pages. No notes were posted.")
-
-    missing = sorted(path for path, matches in path_matches.items() if not matches)
-    if missing:
-        raise_review_preflight_error(
-            f"Diff preflight could not find requested path(s) within {MAX_PAGES} pages: {', '.join(missing)}"
-        )
-    ambiguous = sorted(path for path, matches in path_matches.items() if len(matches) != 1)
-    if ambiguous:
-        raise_review_preflight_error(f"Diff preflight found ambiguous requested path(s): {', '.join(ambiguous)}")
     return path_matches
+
+
+def _check_note_position(
+    matches: list[dict[str, Any]],
+    note: ReviewNote,
+    check: _CheckedNote,
+) -> _CheckedNote:
+    """Add a GitLab position to a note whose body is usable, or record why its diff position fails."""
+    if check.reason:
+        return check
+    try:
+        position = _note_position(matches, note)
+    except ValueError as exc:
+        return _CheckedNote(reason=_note_reason(str(exc)))
+    return _CheckedNote(body=check.body, position=position)
 
 
 async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the preflight contract.
@@ -264,23 +324,26 @@ async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is pa
     iid: int,
     head_sha: str,
     notes: list[ReviewNote],
-    bodies: list[str],
-) -> tuple[list[tuple[str, dict[str, str | int | None]]], dict[str, str], str]:
-    """Validate every requested path and coordinate against a stable preflight snapshot."""
+    checks: list[_CheckedNote],
+) -> tuple[list[_CheckedNote], dict[str, str], str]:
+    """Check every note's path and coordinate against a stable preflight snapshot.
+
+    Batch-wide problems return a warning and no per-note results. Per-note problems stay on each returned check.
+    """
     try:
         refs = await _get_review_diff_refs(client, project, iid)
         if refs["sha"] != head_sha.lower() or refs["head_sha"] != head_sha.lower():
             return [], refs, "The supplied head_sha is stale. No notes were posted."
         paths = await _scan_review_paths(client, project, iid, {note.file for note in notes})
-        prepared = [
-            (body, _review_position(paths[note.file][0], note)) for note, body in zip(notes, bodies, strict=True)
+        checked = [
+            _check_note_position(paths[note.file], note, check) for note, check in zip(notes, checks, strict=True)
         ]
         current_refs = await _get_review_diff_refs(client, project, iid)
         if current_refs != refs:
             return [], {}, "The merge request or its diff refs changed during preflight. No notes were posted."
     except (ToolError, OSError, ValueError, KeyError, TypeError) as exc:
         return [], {}, f"Review-note preflight failed: {exc}. No notes were posted."
-    return prepared, refs, ""
+    return checked, refs, ""
 
 
 def _review_response_ids(response: Any) -> tuple[str, int | None, dict[str, Any] | None]:
@@ -398,24 +461,40 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
     )
 
 
+def _review_preflight_result(checks: list[_CheckedNote]) -> PostReviewNotesResult:
+    """Return one row per note: validated when it can be posted, failed with a reason when it cannot.
+
+    The warning appears only when at least one note failed, and it says that nothing was posted.
+    """
+    results = [
+        ReviewNotePostResult(index=index, status="failed", reason=check.reason)
+        if check.reason
+        else ReviewNotePostResult(index=index, status="validated", position=_review_response_position(check.position))
+        for index, check in enumerate(checks)
+    ]
+    failed = sum(1 for check in checks if check.reason)
+    warning = f"{failed} of {len(checks)} notes failed preflight. No notes were posted." if failed else ""
+    return PostReviewNotesResult(results=results, warning=warning[:500])
+
+
 async def _post_review_note_batch(
     client: GitLabClient,
     project: str,
     iid: int,
-    prepared: list[tuple[str, dict[str, str | int | None]]],
+    checks: list[_CheckedNote],
     refs: dict[str, str],
 ) -> PostReviewNotesResult:
-    """Post prepared notes one at a time and stop at the first unverified outcome."""
+    """Post checked notes one at a time and stop at the first unverified outcome."""
     results: list[ReviewNotePostResult] = []
     warning = ""
-    for index, (body, location) in enumerate(prepared):
+    for index, check in enumerate(checks):
         position: dict[str, str | int | None] = {
-            **location,
+            **check.position,
             "base_sha": refs["base_sha"],
             "start_sha": refs["start_sha"],
             "head_sha": refs["head_sha"],
         }
-        result, reason = await _post_one_review_note(client, project, iid, index, body, position)
+        result, reason = await _post_one_review_note(client, project, iid, index, check.body, position)
         results.append(result)
         if reason:
             warning = f"Stopped at note index {index} ({result.status}): {reason} Later notes were not attempted."
@@ -423,7 +502,7 @@ async def _post_review_note_batch(
                 warning += " Do not retry this note until its outcome is checked."
             results.extend(
                 ReviewNotePostResult(index=later_index, status="unattempted")
-                for later_index in range(index + 1, len(prepared))
+                for later_index in range(index + 1, len(checks))
             )
             break
     return PostReviewNotesResult(results=results, warning=warning[:500])
@@ -458,6 +537,11 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     user's explicit `APPROVE`. After APPROVE, call this tool directly; it reruns the same checks before the first
     write. Do not call `validate_only` again. `head_sha` must be the full SHA from `get_merge_request` or
     `get_merge_request_diff`.
+    Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
+    for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
+    `head_sha`, returns `unattempted` for every note and a `warning`.
+    Omit both `line` and `old_line` to create a file-level note. Use it for findings on lines outside the diff hunks.
+    It needs only the file's path in the diff, so it also works for collapsed or too-large diffs.
     A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
     computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
@@ -467,28 +551,18 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         return _unattempted_review_notes(
             len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
         )
-    try:
-        bodies = _read_review_note_bodies(notes)
-    except (OSError, ValueError) as exc:
-        return _unattempted_review_notes(len(notes), f"Body preflight failed: {exc}. No notes were posted.")
+    checks = _read_review_note_bodies(notes)
+    if all(check.reason for check in checks):
+        return _review_preflight_result(checks)
 
     try:
         client = get_client(ctx)
     except ToolError as exc:
         return _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted.")
-    prepared, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, bodies)
+    checks, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, checks)
     if warning:
         current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
         return _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
-    if validate_only:
-        return PostReviewNotesResult(
-            results=[
-                ReviewNotePostResult(
-                    index=index,
-                    status="validated",
-                    position=_review_response_position(location),
-                )
-                for index, (_, location) in enumerate(prepared)
-            ],
-        )
-    return await _post_review_note_batch(client, project, iid, prepared, refs)
+    if validate_only or any(check.reason for check in checks):
+        return _review_preflight_result(checks)
+    return await _post_review_note_batch(client, project, iid, checks, refs)
