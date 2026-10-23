@@ -1,41 +1,66 @@
 """FastMCP server with GitLab tools for fast developer workflows 🚀."""
 
 import asyncio
-import base64
 import json
-import os
 import re
-import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
-lazy from collections.abc import AsyncIterator, Awaitable, Sequence
+lazy from collections.abc import Awaitable, Sequence
 
-from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.lifespan import lifespan
 from pydantic import BaseModel, Field, model_validator
+lazy from fastmcp import Context
 
 from gitlab_mcp import description_edits as _description_edits
 from gitlab_mcp import description_tables as _description_tables
 from gitlab_mcp import findings as _findings
 from gitlab_mcp import work_items as _work_items
+from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
-from gitlab_mcp.config import ConfigError, Settings
+from gitlab_mcp.common import (
+    DIFF_PAGE_SIZE,
+    HTTP_REQUEST_TIMEOUT,
+    HTTP_SERVER_ERROR,
+    MAX_BATCH_MERGE_REQUESTS,
+    MAX_PAGES,
+    REVIEW_NOTE_BODY_CAP,
+    Iid,
+    PositiveIid,
+    Project,
+    bare_id,
+    decode_cursor,
+    encode_cursor,
+    is_int_at_least,
+    lower_or_empty,
+    read_server_local_utf8_file,
+)
+from gitlab_mcp.errors import (
+    InvalidCursorError,
+    MergeRequestNotFoundError,
+    ProjectNotFoundError,
+    raise_review_preflight_error,
+)
+from gitlab_mcp.mr_common import (
+    DIFF_HUNK_PATTERN,
+    ThreadIndex,
+    ThreadLocation,
+    ThreadRef,
+    author_display,
+    diff_refs_head_sha,
+    fetch_diff_page,
+    fetch_merge_request,
+    full_sha,
+    mr_rest_path,
+    position_fields,
+)
 
-# Upper bound on GraphQL pages scanned when approved, has_open_threads, or
-# thread filters run on our side. Keeps one tool call from walking a huge project.
-MAX_PAGES = 5
-MAX_BATCH_MERGE_REQUESTS = 20
 MAX_CREATE_BLOCKERS = 20
 MAX_CREATE_LABELS = 100
 MAX_CREATE_ASSIGNEES = 100
 HTTP_NOT_FOUND = 404
-HTTP_REQUEST_TIMEOUT = 408
 HTTP_CONFLICT = 409
-HTTP_SERVER_ERROR = 500
 
 # One request per page. `open_threads` is computed from the two counts.
 MERGE_REQUESTS_QUERY = """
@@ -202,16 +227,9 @@ THREAD_BODY_BUDGET = 30000
 THREAD_HEADING_BUDGET = 30000
 # Headings are capped so one unusually long note cannot dominate a compact result.
 THREAD_HEADING_CAP = 160
-# Discussion GIDs start with this. Output IDs are bare SHAs, so the prefix is only stripped from input.
-DISCUSSION_PREFIX = "gid://gitlab/Discussion/"
 
 # Total patch characters that one diff call may return. A single patch is cut to this too.
 DIFF_BUDGET = 40000
-# Files per page of the REST diffs endpoint, the largest page GitLab serves.
-DIFF_PAGE_SIZE = 100
-# Bodies are small enough to bound memory and request size, including file-backed notes.
-REVIEW_NOTE_BODY_CAP = 100000
-DIFF_HUNK_PATTERN = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 DIFF_HUNK_NORMALIZE_PATTERN = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
 INVALID_SINCE_SHA_MESSAGE = "since_sha must be a full 40-character commit SHA."
 
@@ -223,59 +241,7 @@ MergeRequestState = Literal["opened", "closed", "locked", "merged", "all"]
 # never have to guess whether a missing key means "empty" or "not sent".
 TSV_COLUMNS = ("iid", "title", "author", "state", "draft", "approved", "approved_by", "open_threads", "updated")
 
-# Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
-Project = Annotated[str, Field(description="Project path, like group/project.")]
-Iid = Annotated[int, Field(description="MR number.")]
 WorkItemIid = Annotated[int, Field(description="Work item (issue) number.")]
-PositiveIid = Annotated[int, Field(strict=True, ge=1)]
-
-
-@lifespan
-async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-    """Open one shared GitLab client for the life of the server.
-
-    A config problem does not crash the server. Instead, tools report it,
-    so the agent can tell the user exactly what to fix.
-    """
-    try:
-        client = GitLabClient(Settings.from_env())
-    except ConfigError as exc:
-        yield {"client": None, "config_error": str(exc)}
-        return
-    try:
-        yield {"client": client, "config_error": None}
-    finally:
-        await client.aclose()
-
-
-mcp = FastMCP(
-    name="gitlab-mcp",
-    instructions=(
-        "Tools for GitLab developer workflows on gitlab.com or self-managed "
-        "GitLab. Call get_current_user first to learn who you are acting as. "
-        "For merge request lifecycle work, push the branch before create_merge_request; "
-        "use list_labels(search=...) to find labels, "
-        'get_merge_request_threads(state="open") to triage, reply_to_thread(resolve=true) to respond or resolve, and '
-        "edit_merge_request_description to update the description. "
-        "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
-        "Use get_merge_request for approvals and jobs (add include_description=true for the description), "
-        "and get_merge_request_diff for patches. "
-        "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
-        "Get the user's explicit APPROVE before posting notes with post_review_notes. "
-        "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "
-        "Do not call validate_only again. "
-        "Use update_merge_request for reviewer, assignee, and approval changes."
-    ),
-    lifespan=gitlab_lifespan,
-)
-
-
-def get_client(ctx: Context) -> GitLabClient:
-    """Return the shared GitLab client or raise a helpful ToolError."""
-    state = ctx.lifespan_context
-    if state.get("client") is None:
-        raise ToolError(state.get("config_error") or "GitLab client is not configured.")
-    return state["client"]
 
 
 class CurrentUser(BaseModel):
@@ -431,61 +397,11 @@ class MergeTrainList(BaseModel):
     has_more: bool
 
 
-class ProjectNotFoundError(ToolError):
-    """The project does not exist, or the token cannot see it."""
-
-    def __init__(self, project: str) -> None:
-        """Name the project so the user can check the path."""
-        super().__init__(f"Project {project!r} not found, or the token cannot see it.")
-
-
-class MergeRequestNotFoundError(ToolError):
-    """The merge request does not exist, or the token cannot see it."""
-
-    def __init__(self, project: str, iid: int) -> None:
-        """Name the IID and project so the user can check both."""
-        super().__init__(f"Merge request !{iid} not found in {project!r}, or the token cannot see it.")
-
-
-class InvalidCursorError(ToolError):
-    """The cursor was not made by the tool it was passed to, or was changed."""
-
-    def __init__(self, tool: str) -> None:
-        """Tell the agent to pass next_cursor back unchanged to the same tool."""
-        super().__init__(f"Invalid cursor. Pass next_cursor from an earlier {tool} call, unchanged.")
-
-
 class Reviewer(BaseModel):
     """A requested reviewer."""
 
     username: str
     review_state: str = Field(default="", exclude_if=lambda v: not v)  # Lowercased, like "reviewed".
-
-
-class ThreadLocation(BaseModel):
-    """Where a thread points. General threads have none of these fields."""
-
-    path: str = Field(default="", exclude_if=lambda v: not v)  # The new path, or the old one if the file is gone.
-    old_path: str = Field(default="", exclude_if=lambda v: not v)  # Only when it differs from `path`.
-    line: int = Field(default=0, exclude_if=lambda v: not v)  # New-file line.
-    old_line: int = Field(default=0, exclude_if=lambda v: not v)  # Only for a comment on a deleted line.
-
-
-class ThreadRef(ThreadLocation):
-    """An open thread."""
-
-    id: str
-    by: str = Field(default="", exclude_if=lambda v: not v)  # Author of the first note.
-    notes: int  # Notes in the thread, including replies.
-
-
-class ThreadIndex(BaseModel):
-    """Thread counts and open threads."""
-
-    open_count: int
-    resolved_count: int
-    open: list[ThreadRef] = Field(default_factory=list, exclude_if=lambda v: not v)
-    index_complete: bool
 
 
 # "comment" means the discussion cannot be resolved, like a plain MR comment.
@@ -603,7 +519,7 @@ class ThreadReplyRequest(BaseModel):
     @model_validator(mode="after")
     def validate_reply(self) -> ThreadReplyRequest:
         """Reject malformed entries before any batch item can be written."""
-        if not _bare_id(self.thread_id).strip():
+        if not bare_id(self.thread_id).strip():
             raise ValueError("thread_id must not be empty")  # noqa: TRY003
         if self.body is not None and not self.body.strip():
             raise ValueError("body must not be empty or whitespace")  # noqa: TRY003
@@ -674,13 +590,6 @@ class FileDiff(BaseModel):
     too_large: bool = Field(default=False, exclude_if=lambda v: not v)
 
 
-def _raise_review_preflight_error(message: str, *, cause: BaseException | None = None) -> NoReturn:
-    """Stop review-note processing with a caller-facing validation reason."""
-    if cause is None:
-        raise ValueError(message)
-    raise ValueError(message) from cause
-
-
 class ReviewNote(BaseModel):
     """One inline note with exactly one positive line side and one nonblank body source.
 
@@ -710,11 +619,11 @@ class ReviewNote(BaseModel):
     def validate_sources_and_location(self) -> ReviewNote:
         """Require exactly one line side and exactly one body source."""
         if not self.file.strip():
-            _raise_review_preflight_error("file must not be blank")
+            raise_review_preflight_error("file must not be blank")
         if (self.line is None) == (self.old_line is None):
-            _raise_review_preflight_error("Set exactly one of line or old_line")
+            raise_review_preflight_error("Set exactly one of line or old_line")
         if (self.body is None) == (self.body_path is None):
-            _raise_review_preflight_error("Set exactly one of body or body_path")
+            raise_review_preflight_error("Set exactly one of body or body_path")
         return self
 
 
@@ -897,9 +806,9 @@ def _to_merge_train_entry(target_branch: str, position: int, car: dict[str, Any]
         merge_request["iid"],
         merge_request["title"],
         author["username"] if author else None,
-        _lower(car["status"]),
+        lower_or_empty(car["status"]),
         pipeline_id,
-        _lower(pipeline["status"]) if pipeline else "",
+        lower_or_empty(pipeline["status"]) if pipeline else "",
     )
     return "\t".join(_cell(value) for value in values)
 
@@ -1100,11 +1009,6 @@ async def list_merge_train(
     )
 
 
-def _lower(value: str | None) -> str:
-    """Lowercase a GitLab enum value. Null means unknown, so it becomes empty and is left out."""
-    return (value or "").lower()
-
-
 def _cap_description(description: str | None, limit: int = DESCRIPTION_CAP) -> tuple[str, bool]:
     """Cut a description to the requested number of characters.
 
@@ -1119,7 +1023,7 @@ def _to_reviewer(node: dict[str, Any]) -> Reviewer:
     """Convert one reviewer node. A null interaction means GitLab has no review state for them."""
     interaction = node["mergeRequestInteraction"]
     review_state = interaction["reviewState"] if interaction else None
-    return Reviewer(username=node["username"], review_state=_lower(review_state))
+    return Reviewer(username=node["username"], review_state=lower_or_empty(review_state))
 
 
 def _to_diff_summary(stats: dict[str, Any] | None) -> DiffSummary | None:
@@ -1139,56 +1043,16 @@ def _is_open_thread(discussion: dict[str, Any]) -> bool:
     return discussion["resolvable"] and not discussion["resolved"] and not first["system"]
 
 
-def _position_fields(position: dict[str, Any] | None) -> dict[str, Any]:
-    """Map a GraphQL note position to the location fields, stating each fact once.
-
-    Only fields with a value are returned, so the models fill in the rest.
-    General threads have no position, so the result is empty.
-    """
-    position = position or {}
-    old_path, new_path = position.get("oldPath"), position.get("newPath")
-    path = new_path or old_path
-    new_line, old_line = position.get("newLine"), position.get("oldLine")
-    fields: dict[str, Any] = {}
-    if path:
-        fields["path"] = path
-    if old_path and old_path != path:
-        fields["old_path"] = old_path
-    # A comment on an unchanged line has both line numbers, and the new one is enough.
-    # A comment on a deleted line has only oldLine, so that one is kept.
-    if new_line is not None:
-        fields["line"] = new_line
-    elif old_line is not None:
-        fields["old_line"] = old_line
-    return fields
-
-
-def _author_display(author: dict[str, Any] | None) -> str:
-    """Return a short display label for a note author, or empty for a deleted author."""
-    if author is None:
-        return ""
-    if author.get("bot") is not True:
-        return author.get("username") or ""
-
-    name = author.get("name")
-    if isinstance(name, str) and name.strip() and name.strip() != "****":
-        return name
-
-    author_id = author.get("id")
-    id_fragment = str(author_id).rsplit("/", 1)[-1] if author_id else "unknown"
-    return f"bot:{id_fragment}"
-
-
 def _to_thread_ref(discussion: dict[str, Any]) -> ThreadRef:
     """Convert one open discussion into a thread ref, using its first note for the details."""
     notes = discussion["notes"]
     first = notes["nodes"][0]
     author = first["author"]  # A deleted or banned author comes back as null.
     return ThreadRef(
-        id=_bare_id(discussion["id"]),
-        by=_author_display(author),
+        id=bare_id(discussion["id"]),
+        by=author_display(author),
         notes=notes["count"],
-        **_position_fields(first["position"]),
+        **position_fields(first["position"]),
     )
 
 
@@ -1209,35 +1073,6 @@ def _to_thread_index(node: dict[str, Any]) -> ThreadIndex:
         open=[_to_thread_ref(discussion) for discussion in open_discussions[:THREAD_INDEX_CAP]],
         index_complete=len(open_discussions) <= THREAD_INDEX_CAP and not discussions["pageInfo"]["hasNextPage"],
     )
-
-
-async def _fetch_merge_request(
-    client: GitLabClient,
-    query: str,
-    project: str,
-    iid: int,
-    **variables: Any,
-) -> dict[str, Any]:
-    """Run a query for one merge request and return its node.
-
-    Raises ProjectNotFoundError or MergeRequestNotFoundError when GitLab has no
-    such project or merge request, because it returns null for both.
-    """
-    data = await client.graphql(query, {"fullPath": project, "iid": str(iid), **variables})
-    if data["project"] is None:
-        raise ProjectNotFoundError(project)
-    node = data["project"]["mergeRequest"]
-    if node is None:
-        raise MergeRequestNotFoundError(project, iid)
-    return node
-
-
-def _head_sha(diff_refs: dict[str, Any] | None) -> str:
-    """Return the full head commit SHA. Null diffRefs means unknown, so it is empty.
-
-    The full SHA is kept on purpose. Write tools send it back as a guard, and GitLab compares it exactly.
-    """
-    return diff_refs["headSha"] if diff_refs else ""
 
 
 def _merged_metadata(node: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -1278,16 +1113,16 @@ def _to_detail(
         author=author["username"] if author else "",
         source_branch=node["sourceBranch"],
         target_branch=node["targetBranch"],
-        head_sha=_head_sha(node["diffRefs"]),
+        head_sha=diff_refs_head_sha(node["diffRefs"]),
         description=description,
         description_truncated=description_truncated,
-        merge_status=_lower(node["detailedMergeStatus"]),
+        merge_status=lower_or_empty(node["detailedMergeStatus"]),
         should_be_rebased=node["shouldBeRebased"],
         conflicts=node["conflicts"],
         approved=node["approved"],
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
         reviewers=[_to_reviewer(reviewer) for reviewer in node["reviewers"]["nodes"]],
-        pipeline_status=_lower(pipeline["status"]) if pipeline else "",
+        pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
         auto_merge_strategy=node["autoMergeStrategy"] or "",
         changes=_to_diff_summary(node["diffStatsSummary"]),
         threads=_to_thread_index(node),
@@ -1320,13 +1155,13 @@ def _to_compact_detail(
         author=author["username"] if author else "",
         source_branch=node["sourceBranch"],
         target_branch=node["targetBranch"],
-        head_sha=_head_sha(node["diffRefs"]),
-        merge_status=_lower(node["detailedMergeStatus"]),
+        head_sha=diff_refs_head_sha(node["diffRefs"]),
+        merge_status=lower_or_empty(node["detailedMergeStatus"]),
         should_be_rebased=node["shouldBeRebased"],
         conflicts=node["conflicts"],
         approved=node["approved"],
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
-        pipeline_status=_lower(pipeline["status"]) if pipeline else "",
+        pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
         description=description,
         description_truncated=description_truncated,
     )
@@ -1366,7 +1201,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     """
     include_description = include_description and description_limit > 0
     client = get_client(ctx)
-    node = await _fetch_merge_request(
+    node = await fetch_merge_request(
         client,
         MERGE_REQUEST_QUERY,
         project,
@@ -1474,45 +1309,16 @@ async def get_merge_requests(
     return MergeRequestBatch(merge_requests=merge_requests, missing_iids=missing_iids)
 
 
-def _bare_id(thread_id: str) -> str:
-    """Strip the discussion GID prefix. Bare SHAs pass through unchanged."""
-    return thread_id.removeprefix(DISCUSSION_PREFIX)
-
-
 def _bare_ids(ids: list[str]) -> list[str]:
     """Return bare discussion SHAs in input order, without duplicates. Full GIDs and bare SHAs both work."""
-    return list(dict.fromkeys(_bare_id(thread_id) for thread_id in ids))
-
-
-def _encode_cursor(data: dict[str, Any]) -> str:
-    """Pack a tool's resume position into one opaque, URL-safe string."""
-    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
-
-
-def _decode_cursor(cursor: str, tool: str) -> dict[str, Any]:
-    """Unpack a cursor made by `_encode_cursor`. Each tool checks the keys it needs.
-
-    Anything that is not base64 JSON holding an object raises InvalidCursorError.
-    """
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(cursor))
-    except ValueError as exc:  # Bad base64 and bad JSON both raise ValueError subclasses.
-        raise InvalidCursorError(tool) from exc
-    if not isinstance(payload, dict):
-        raise InvalidCursorError(tool)
-    return payload
-
-
-def _is_int_at_least(value: Any, minimum: int) -> bool:
-    """Return True for an int of at least `minimum`. Booleans are ints in Python, so they are rejected too."""
-    return type(value) is int and value >= minimum
+    return list(dict.fromkeys(bare_id(thread_id) for thread_id in ids))
 
 
 def _thread_cursor_start(cursor: str) -> tuple[str | None, int]:
     """Return the page cursor and skip count for a threads call. Anything else is an InvalidCursorError."""
-    payload = _decode_cursor(cursor, "get_merge_request_threads")
+    payload = decode_cursor(cursor, "get_merge_request_threads")
     after = payload.get("after")
-    if not (after is None or isinstance(after, str)) or not _is_int_at_least(payload.get("skip"), 0):
+    if not (after is None or isinstance(after, str)) or not is_int_at_least(payload.get("skip"), 0):
         raise InvalidCursorError("get_merge_request_threads")
     return after, payload["skip"]
 
@@ -1569,7 +1375,7 @@ def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP, compact_findi
     if compact_findings and author is not None and author.get("bot") is True:
         body = _findings.compact_finding_body(body)
     return Note(
-        by=_author_display(author),
+        by=author_display(author),
         body=_cap_note_body(body, max_body_chars=max_body_chars),
         at=node["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
     )
@@ -1590,12 +1396,12 @@ def _to_thread(
     if not human:
         return None
     return Thread(
-        id=_bare_id(discussion["id"]),
+        id=bare_id(discussion["id"]),
         status=_thread_status(discussion),
         notes=[_to_note(node, max_body_chars=max_body_chars, compact_findings=compact_findings) for node in human],
         # GitLab only returns the first 50 notes, so more may exist.
         notes_truncated=notes["pageInfo"]["hasNextPage"],
-        **_position_fields(human[0]["position"]),
+        **position_fields(human[0]["position"]),
     )
 
 
@@ -1617,9 +1423,9 @@ def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHead
         path=thread.path,
         line=thread.line,
         old_line=thread.old_line,
-        by=_author_display(author),
+        by=author_display(author),
         heading=_thread_heading(root_note["body"]),
-        last_by=_author_display(last_author),
+        last_by=author_display(last_author),
         last_at=last_note["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
         note_count=len(human_notes),
         notes_truncated=notes["pageInfo"]["hasNextPage"],
@@ -1676,12 +1482,12 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     full_view = view in {"full", "finding"}
     output_size = 2 if view == "headings" else 0  # Count the serialized list brackets.
     for _ in range(MAX_PAGES):
-        node = await _fetch_merge_request(client, THREADS_QUERY, project, iid, after=after)
+        node = await fetch_merge_request(client, THREADS_QUERY, project, iid, after=after)
         mr_headers = _thread_mr_headers(node)
         connection = node["discussions"]
         nodes = connection["nodes"]
         for index in range(skip, len(nodes)):
-            seen.add(_bare_id(nodes[index]["id"]))
+            seen.add(bare_id(nodes[index]["id"]))
             thread = _to_thread(
                 nodes[index],
                 max_body_chars=max_body_chars,
@@ -1698,7 +1504,7 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
             budget = THREAD_BODY_BUDGET if full_view else THREAD_HEADING_BUDGET
             # Always return at least one thread, even when that thread alone is over budget.
             if threads and output_size + size > budget:
-                return threads, _encode_cursor({"after": after, "skip": index}), seen, mr_headers
+                return threads, encode_cursor({"after": after, "skip": index}), seen, mr_headers
             threads.append(output_thread)
             output_size += size
         page_info = connection["pageInfo"]
@@ -1706,17 +1512,17 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
             return threads, "", seen, mr_headers
         after, skip = page_info["endCursor"], 0
     # The page limit was hit. `after` is now the cursor of the next unread page.
-    return threads, _encode_cursor({"after": after, "skip": 0}), seen, mr_headers
+    return threads, encode_cursor({"after": after, "skip": 0}), seen, mr_headers
 
 
 def _thread_mr_headers(node: dict[str, Any]) -> dict[str, str]:
     """Convert compact MR status fields returned with a discussion page."""
     pipeline = node.get("headPipeline")
     return {
-        "head_sha": _head_sha(node.get("diffRefs")),
+        "head_sha": diff_refs_head_sha(node.get("diffRefs")),
         "source_branch": node.get("sourceBranch") or "",
-        "merge_status": _lower(node.get("detailedMergeStatus")),
-        "pipeline_status": _lower(pipeline.get("status")) if pipeline else "",
+        "merge_status": lower_or_empty(node.get("detailedMergeStatus")),
+        "pipeline_status": lower_or_empty(pipeline.get("status")) if pipeline else "",
     }
 
 
@@ -1742,7 +1548,7 @@ async def _get_thread_counts(
 ) -> ThreadCounts | MergeRequestThreadCountsBatch:
     """Fetch exact thread counts for one MR or a batch, retaining existing missing-IID behavior."""
     if iid is not None:
-        node = await _fetch_merge_request(client, THREAD_COUNTS_QUERY, project, iid)
+        node = await fetch_merge_request(client, THREAD_COUNTS_QUERY, project, iid)
         return _to_thread_counts(node, iid)
 
     unique_iids = list(dict.fromkeys(iids or []))
@@ -1755,7 +1561,7 @@ async def _get_thread_counts(
     missing_iids: list[int] = []
     for requested_iid in unique_iids:
         try:
-            node = await _fetch_merge_request(client, THREAD_COUNTS_QUERY, project, requested_iid)
+            node = await fetch_merge_request(client, THREAD_COUNTS_QUERY, project, requested_iid)
         except MergeRequestNotFoundError:
             missing_iids.append(requested_iid)
             continue
@@ -1921,7 +1727,7 @@ async def _read_open_threads(client: GitLabClient, project: str, iid: int) -> in
     the field out. The totals match `get_merge_request_threads(count_only=true)`.
     """
     try:
-        node = await _fetch_merge_request(client, THREAD_COUNTS_QUERY, project, iid)
+        node = await fetch_merge_request(client, THREAD_COUNTS_QUERY, project, iid)
         return _to_thread_counts(node, iid).open
     except ToolError:
         return None
@@ -1947,7 +1753,7 @@ async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write 
 
     The public tools add the count. A batch reads it once per MR instead of once per item.
     """
-    bare_thread_id = _bare_id(thread_id)
+    bare_thread_id = bare_id(thread_id)
     if not bare_thread_id.strip():
         raise ToolError("thread_id must not be empty.")  # noqa: TRY003
     if body is not None and not body.strip():
@@ -1955,7 +1761,7 @@ async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write 
     if body is None and not resolve:
         raise ToolError("Provide a reply body or set resolve=True.")  # noqa: TRY003
 
-    discussion_path = f"{_mr_rest_path(project, iid)}/discussions/{quote(bare_thread_id, safe='')}"
+    discussion_path = f"{mr_rest_path(project, iid)}/discussions/{quote(bare_thread_id, safe='')}"
     note_id: int | None = None
 
     if body is not None:
@@ -2059,7 +1865,7 @@ async def reply_to_threads(
     last_resolve = _last_resolve_positions(replies)
     results: list[ThreadReplyBatchItem] = []
     for position, reply in enumerate(replies):
-        thread_id = _bare_id(reply.thread_id)
+        thread_id = bare_id(reply.thread_id)
         try:
             outcome = await _write_thread_reply(
                 client,
@@ -2164,7 +1970,7 @@ async def _scan_file_stat_ranges(
     patch_ranges: dict[str, tuple[list[tuple[int, int]], bool]] = {}
     page = 1
     for _ in range(MAX_PAGES):
-        files, next_page = await _fetch_diff_page(client, project, iid, page)
+        files, next_page = await fetch_diff_page(client, project, iid, page)
         for raw in files:
             if not isinstance(raw, dict):
                 continue
@@ -2216,24 +2022,10 @@ def _requested_hits(raw: dict[str, Any], wanted: set[str]) -> set[str]:
 
 def _diff_cursor_start(cursor: str) -> tuple[int, int]:
     """Return the REST page and skip count for a diff call. Anything else is an InvalidCursorError."""
-    payload = _decode_cursor(cursor, "get_merge_request_diff")
-    if not _is_int_at_least(payload.get("page"), 1) or not _is_int_at_least(payload.get("skip"), 0):
+    payload = decode_cursor(cursor, "get_merge_request_diff")
+    if not is_int_at_least(payload.get("page"), 1) or not is_int_at_least(payload.get("skip"), 0):
         raise InvalidCursorError("get_merge_request_diff")
     return payload["page"], payload["skip"]
-
-
-async def _fetch_diff_page(
-    client: GitLabClient,
-    project: str,
-    iid: int,
-    page: int,
-) -> tuple[list[dict[str, Any]], int | None]:
-    """Fetch one page of merge request diffs and return the files and the next page number."""
-    return await client.get_page(
-        f"{_mr_rest_path(project, iid)}/diffs",
-        per_page=DIFF_PAGE_SIZE,
-        page=page,
-    )
 
 
 async def _scan_diffs(
@@ -2254,7 +2046,7 @@ async def _scan_diffs(
     matched: set[str] = set()
     total = 0
     for _ in range(MAX_PAGES):
-        files, next_page = await _fetch_diff_page(client, project, iid, page)
+        files, next_page = await fetch_diff_page(client, project, iid, page)
         for index in range(skip, len(files)):
             hits = _requested_hits(files[index], wanted)
             if not hits:
@@ -2262,7 +2054,7 @@ async def _scan_diffs(
             diff = _to_file_diff(files[index])
             # Always return at least one patch, even when that one alone is over budget.
             if diffs and total + len(diff.diff) > DIFF_BUDGET:
-                return diffs, _encode_cursor({"page": page, "skip": index}), matched
+                return diffs, encode_cursor({"page": page, "skip": index}), matched
             diffs.append(diff)
             total += len(diff.diff)
             matched |= hits
@@ -2271,7 +2063,7 @@ async def _scan_diffs(
         # Later pages start at their first file.
         page, skip = next_page, 0
     # The page limit was hit. `page` is now the next unread page.
-    return diffs, _encode_cursor({"page": page, "skip": 0}), matched
+    return diffs, encode_cursor({"page": page, "skip": 0}), matched
 
 
 async def _scan_diff_versions(
@@ -2284,7 +2076,7 @@ async def _scan_diff_versions(
     page = 1
     for _ in range(MAX_PAGES):
         body, next_page = await client.get_page(
-            f"{_mr_rest_path(project, iid)}/versions",
+            f"{mr_rest_path(project, iid)}/versions",
             per_page=DIFF_PAGE_SIZE,
             page=page,
         )
@@ -2310,7 +2102,7 @@ async def _get_version_detail(
     version_id: int,
 ) -> Any:
     """Fetch the full file snapshot for one merge request diff version."""
-    return await client.get(f"{_mr_rest_path(project, iid)}/versions/{version_id}")
+    return await client.get(f"{mr_rest_path(project, iid)}/versions/{version_id}")
 
 
 def _validate_version_snapshot(  # noqa: C901, PLR0911 - each check prevents an unsafe comparison.
@@ -2413,14 +2205,14 @@ def _snapshot_file_stat(raw: dict[str, Any], *, reverted: bool = False) -> FileS
 
 def _since_cursor_start(cursor: str, since_sha: str, wanted: list[str]) -> dict[str, Any]:
     """Validate the since cursor inputs before requests and return its decoded payload."""
-    payload = _decode_cursor(cursor, "get_merge_request_diff")
+    payload = decode_cursor(cursor, "get_merge_request_diff")
     if (
         payload.get("mode") != "since"
         or payload.get("since_sha") != since_sha
         or payload.get("paths") != wanted
-        or not _is_int_at_least(payload.get("index"), 0)
-        or not _is_int_at_least(payload.get("version_id"), 0)
-        or not _full_sha(payload.get("head_sha"))
+        or not is_int_at_least(payload.get("index"), 0)
+        or not is_int_at_least(payload.get("version_id"), 0)
+        or not full_sha(payload.get("head_sha"))
     ):
         raise InvalidCursorError("get_merge_request_diff")
     return payload
@@ -2428,7 +2220,7 @@ def _since_cursor_start(cursor: str, since_sha: str, wanted: list[str]) -> dict[
 
 def _since_cursor(index: int, since_sha: str, wanted: list[str], head_sha: str, version_id: int) -> str:
     """Encode a bounded-scan cursor tied to its inputs and the current diff version."""
-    return _encode_cursor(
+    return encode_cursor(
         {
             "mode": "since",
             "index": index,
@@ -2483,7 +2275,7 @@ async def _get_since_diff(  # noqa: C901, PLR0911, PLR0913, PLR0917 - keep compa
     cursor: str | None,
 ) -> MergeRequestDiff:
     """Compare two complete diff-version snapshots and return changed MR-relative files."""
-    if not _full_sha(since_sha):
+    if not full_sha(since_sha):
         raise ToolError(INVALID_SINCE_SHA_MESSAGE)
     cursor_payload = _since_cursor_start(cursor, since_sha, wanted) if cursor is not None else None
     if cursor is not None and not wanted:
@@ -2495,7 +2287,7 @@ async def _get_since_diff(  # noqa: C901, PLR0911, PLR0913, PLR0917 - keep compa
             since_version_found=None,
             warning=f"Diff version scan stopped after {MAX_PAGES} pages or returned an unusable page.",
         )
-    if any(_version_id(version) is None or not _full_sha(version.get("head_commit_sha")) for version in versions):
+    if any(_version_id(version) is None or not full_sha(version.get("head_commit_sha")) for version in versions):
         return MergeRequestDiff(
             since_version_found=None,
             warning="GitLab returned diff versions without usable IDs or commit SHAs.",
@@ -2613,8 +2405,8 @@ async def get_merge_request_diff(  # noqa: PLR0913, PLR0917 - these are the publ
         return await _get_since_diff(client, project, iid, since_sha, wanted, cursor)
     # Decode the cursor before any request, so a bad one fails fast. The file list ignores it.
     start = _diff_cursor_start(cursor) if wanted and cursor is not None else (1, 0)
-    node = await _fetch_merge_request(client, DIFF_FILES_QUERY, project, iid)
-    head_sha = _head_sha(node["diffRefs"])
+    node = await fetch_merge_request(client, DIFF_FILES_QUERY, project, iid)
+    head_sha = diff_refs_head_sha(node["diffRefs"])
 
     if not wanted:
         stats = node["diffStats"]
@@ -2625,11 +2417,6 @@ async def get_merge_request_diff(  # noqa: PLR0913, PLR0917 - these are the publ
     # A resumed call did not read the first page, so it cannot prove a path is missing.
     not_found = [path for path in wanted if path not in matched] if cursor is None and not next_cursor else []
     return MergeRequestDiff(head_sha=head_sha, diffs=diffs, next_cursor=next_cursor, paths_not_found=not_found)
-
-
-def _full_sha(value: Any) -> bool:
-    """Return whether a value is exactly a 40-character hexadecimal commit SHA."""
-    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
 
 
 def _unattempted_review_notes(
@@ -2646,35 +2433,6 @@ def _unattempted_review_notes(
     )
 
 
-def _read_server_local_utf8_file(
-    path_value: str,
-    *,
-    path_field: str,
-    size_field: str,
-    byte_limit: int,
-) -> str:
-    """Read an absolute server-local regular UTF-8 file with a strict byte limit."""
-    path = Path(path_value)
-    if not path.is_absolute():
-        _raise_review_preflight_error(f"{path_field} must be an absolute server-local path")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            _raise_review_preflight_error(f"{path_field} must point to a regular file")
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = -1
-            encoded = source.read(byte_limit + 1)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if len(encoded) > byte_limit:
-        _raise_review_preflight_error(f"{size_field} exceeds {byte_limit} UTF-8 bytes")
-    try:
-        return encoded.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        _raise_review_preflight_error(f"{path_field} is not valid UTF-8", cause=exc)
-
-
 def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
     """Read and validate every note body before the tool sends any GitLab request."""
     bodies: list[str] = []
@@ -2683,7 +2441,7 @@ def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
             body = note.body
             size = len(body.encode("utf-8"))
         else:
-            body = _read_server_local_utf8_file(
+            body = read_server_local_utf8_file(
                 note.body_path or "",
                 path_field=f"note {index} body_path",
                 size_field=f"note {index} body",
@@ -2691,29 +2449,29 @@ def _read_review_note_bodies(notes: list[ReviewNote]) -> list[str]:
             )
             size = len(body.encode("utf-8"))
         if not body.strip():
-            _raise_review_preflight_error(f"note {index} body must not be blank")
+            raise_review_preflight_error(f"note {index} body must not be blank")
         if size > REVIEW_NOTE_BODY_CAP:
-            _raise_review_preflight_error(f"note {index} body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
+            raise_review_preflight_error(f"note {index} body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
         bodies.append(body)
     return bodies
 
 
 async def _get_review_diff_refs(client: GitLabClient, project: str, iid: int) -> dict[str, str]:
     """Read the REST merge request SHA and the three diff reference SHAs."""
-    merge_request = await client.get(_mr_rest_path(project, iid))
+    merge_request = await client.get(mr_rest_path(project, iid))
     if not isinstance(merge_request, dict):
-        _raise_review_preflight_error("GitLab returned an invalid merge request response")
+        raise_review_preflight_error("GitLab returned an invalid merge request response")
     refs = merge_request.get("diff_refs")
     if not isinstance(refs, dict):
-        _raise_review_preflight_error("GitLab did not return merge request diff_refs")
+        raise_review_preflight_error("GitLab did not return merge request diff_refs")
     state = {
         "sha": merge_request.get("sha"),
         "base_sha": refs.get("base_sha"),
         "start_sha": refs.get("start_sha"),
         "head_sha": refs.get("head_sha"),
     }
-    if not all(_full_sha(value) for value in state.values()):
-        _raise_review_preflight_error("GitLab did not return full SHA values for the merge request and diff_refs")
+    if not all(full_sha(value) for value in state.values()):
+        raise_review_preflight_error("GitLab did not return full SHA values for the merge request and diff_refs")
     return {key: str(value).lower() for key, value in state.items()}
 
 
@@ -2727,10 +2485,10 @@ def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:
     for content in diff.removesuffix("\n").split("\n"):
         if content.startswith("@@"):
             if in_hunk and (old_remaining or new_remaining):
-                _raise_review_preflight_error("diff has an incomplete unified hunk")
+                raise_review_preflight_error("diff has an incomplete unified hunk")
             match = DIFF_HUNK_PATTERN.match(content)
             if match is None:
-                _raise_review_preflight_error("diff contains an invalid unified hunk header")
+                raise_review_preflight_error("diff contains an invalid unified hunk header")
             old_line = int(match.group(1))
             old_remaining = int(match.group(2) or 1)
             new_line = int(match.group(3))
@@ -2741,7 +2499,7 @@ def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:
             continue
         if content.startswith(" "):
             if old_remaining < 1 or new_remaining < 1:
-                _raise_review_preflight_error("diff contains more context lines than its hunk header")
+                raise_review_preflight_error("diff contains more context lines than its hunk header")
             positions.append(("context", old_line, new_line))
             old_line += 1
             new_line += 1
@@ -2749,33 +2507,33 @@ def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:
             new_remaining -= 1
         elif content.startswith("+"):
             if new_remaining < 1:
-                _raise_review_preflight_error("diff contains more added lines than its hunk header")
+                raise_review_preflight_error("diff contains more added lines than its hunk header")
             positions.append(("added", None, new_line))
             new_line += 1
             new_remaining -= 1
         elif content.startswith("-"):
             if old_remaining < 1:
-                _raise_review_preflight_error("diff contains more removed lines than its hunk header")
+                raise_review_preflight_error("diff contains more removed lines than its hunk header")
             positions.append(("removed", old_line, None))
             old_line += 1
             old_remaining -= 1
         else:
-            _raise_review_preflight_error("diff contains an invalid line inside a unified hunk")
+            raise_review_preflight_error("diff contains an invalid line inside a unified hunk")
 
     if in_hunk and (old_remaining or new_remaining):
-        _raise_review_preflight_error("diff has an incomplete unified hunk")
+        raise_review_preflight_error("diff has an incomplete unified hunk")
     if not saw_hunk or not positions:
-        _raise_review_preflight_error("diff has no usable unified patch")
+        raise_review_preflight_error("diff has no usable unified patch")
     return positions
 
 
 def _review_position(raw: dict[str, Any], note: ReviewNote) -> dict[str, str | int | None]:
     """Find the requested old- or new-side line in a file's unified patch."""
     if raw.get("collapsed") or raw.get("too_large"):
-        _raise_review_preflight_error(f"diff for {note.file!r} is collapsed or too large to position safely")
+        raise_review_preflight_error(f"diff for {note.file!r} is collapsed or too large to position safely")
     diff = raw.get("diff")
     if not isinstance(diff, str) or not diff:
-        _raise_review_preflight_error(f"diff for {note.file!r} has no usable patch")
+        raise_review_preflight_error(f"diff for {note.file!r} has no usable patch")
     locations = _diff_line_positions(diff)
     matches = []
     for kind, old_line, new_line in locations:
@@ -2787,11 +2545,11 @@ def _review_position(raw: dict[str, Any], note: ReviewNote) -> dict[str, str | i
         side = "new" if note.line is not None else "old"
         line = note.line if note.line is not None else note.old_line
         if matches:
-            _raise_review_preflight_error(f"line {line} on the {side} side is ambiguous in {note.file!r}")
-        _raise_review_preflight_error(f"line {line} on the {side} side is not a usable diff line in {note.file!r}")
+            raise_review_preflight_error(f"line {line} on the {side} side is ambiguous in {note.file!r}")
+        raise_review_preflight_error(f"line {line} on the {side} side is not a usable diff line in {note.file!r}")
     old_path, new_path = raw.get("old_path"), raw.get("new_path")
     if not isinstance(old_path, str) or not isinstance(new_path, str):
-        _raise_review_preflight_error(f"diff paths for {note.file!r} are invalid")
+        raise_review_preflight_error(f"diff paths for {note.file!r} are invalid")
     old_line, new_line = matches[0]
     return {
         "position_type": "text",
@@ -2812,7 +2570,7 @@ async def _scan_review_paths(
     path_matches: dict[str, list[dict[str, Any]]] = {path: [] for path in requested_paths}
     page = 1
     for _ in range(MAX_PAGES):
-        files, next_page = await _fetch_diff_page(client, project, iid, page)
+        files, next_page = await fetch_diff_page(client, project, iid, page)
         for raw in files:
             if not isinstance(raw, dict):
                 continue
@@ -2824,16 +2582,16 @@ async def _scan_review_paths(
         page = next_page
 
     if next_page is not None:
-        _raise_review_preflight_error(f"Diff path scan is incomplete after {MAX_PAGES} pages. No notes were posted.")
+        raise_review_preflight_error(f"Diff path scan is incomplete after {MAX_PAGES} pages. No notes were posted.")
 
     missing = sorted(path for path, matches in path_matches.items() if not matches)
     if missing:
-        _raise_review_preflight_error(
+        raise_review_preflight_error(
             f"Diff preflight could not find requested path(s) within {MAX_PAGES} pages: {', '.join(missing)}"
         )
     ambiguous = sorted(path for path, matches in path_matches.items() if len(matches) != 1)
     if ambiguous:
-        _raise_review_preflight_error(f"Diff preflight found ambiguous requested path(s): {', '.join(ambiguous)}")
+        raise_review_preflight_error(f"Diff preflight found ambiguous requested path(s): {', '.join(ambiguous)}")
     return path_matches
 
 
@@ -2930,7 +2688,7 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
     try:
         response = await client.request(
             "POST",
-            f"{_mr_rest_path(project, iid)}/discussions",
+            f"{mr_rest_path(project, iid)}/discussions",
             json={"body": body, "position": position},
         )
     except GitLabAPIError as exc:
@@ -3042,7 +2800,7 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
     and never retried. Check every result before deciding what to do next.
     """
-    if not _full_sha(head_sha):
+    if not full_sha(head_sha):
         return _unattempted_review_notes(
             len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
         )
@@ -3142,15 +2900,6 @@ class MergeRefusedError(ToolError):
         super().__init__(f"{error} Check blockers with get_merge_request.")
 
 
-def _mr_rest_path(project: str, iid: int) -> str:
-    """Return the REST path of one merge request.
-
-    The project path is URL-encoded, so `group/project` becomes `group%2Fproject`.
-    """
-    encoded = quote(project, safe="")
-    return f"/projects/{encoded}/merge_requests/{iid}"
-
-
 def _check_land_args(mode: LandMode, sha: str | None, squash: bool | None, remove_source_branch: bool | None) -> None:
     """Refuse a bad land request before anything is sent to GitLab.
 
@@ -3185,7 +2934,7 @@ def _land_result(mode: LandMode, node: dict[str, Any]) -> LandResult:
     A merged MR wins over any strategy still set on it. A cancel counts as
     cancelled only when no strategy is left.
     """
-    strategy = _lower(node["autoMergeStrategy"])
+    strategy = lower_or_empty(node["autoMergeStrategy"])
     if node["state"] == "merged":
         return "merged"
     if strategy in TRAIN_STRATEGIES:
@@ -3204,15 +2953,15 @@ def _to_landing(mode: LandMode, node: dict[str, Any]) -> MergeRequestLanding:
     fields: dict[str, Any] = {
         "result": _land_result(mode, node),
         "state": node["state"],
-        "merge_status": _lower(node["detailedMergeStatus"]),
-        "auto_merge_strategy": _lower(node["autoMergeStrategy"]),
+        "merge_status": lower_or_empty(node["detailedMergeStatus"]),
+        "auto_merge_strategy": lower_or_empty(node["autoMergeStrategy"]),
         "merge_commit_sha": node["mergeCommitSha"] or "",
     }
     if mode != "cancel":
         # A null headPipeline means the head has no pipeline, so the status stays empty and is left out.
         pipeline = node["headPipeline"] or {}
-        fields["head_sha"] = _head_sha(node["diffRefs"])
-        fields["pipeline_status"] = _lower(pipeline.get("status"))
+        fields["head_sha"] = diff_refs_head_sha(node["diffRefs"])
+        fields["pipeline_status"] = lower_or_empty(pipeline.get("status"))
     return MergeRequestLanding(**fields)
 
 
@@ -3244,7 +2993,7 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
     """
     _check_land_args(mode, sha, squash, remove_source_branch)
     client = get_client(ctx)
-    path = _mr_rest_path(project, iid)
+    path = mr_rest_path(project, iid)
     try:
         if mode == "cancel":
             await client.request("POST", f"{path}/cancel_merge_when_pipeline_succeeds")
@@ -3260,7 +3009,7 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
 
     # The write was accepted, so a failed read must not look like a failed merge. 🧾
     try:
-        node = await _fetch_merge_request(client, LAND_QUERY, project, iid)
+        node = await fetch_merge_request(client, LAND_QUERY, project, iid)
     except ToolError:
         return MergeRequestLanding(
             result="pending",
@@ -3613,7 +3362,7 @@ class _Update:
     @property
     def path(self) -> str:
         """Return the REST path of this merge request."""
-        return _mr_rest_path(self.project, self.iid)
+        return mr_rest_path(self.project, self.iid)
 
     async def run(self) -> None:
         """Run every requested step, in the order the docs describe."""
@@ -3648,14 +3397,14 @@ class _Update:
     async def read_back(self) -> dict[str, Any]:
         """Re-read the merge request and return its final fields, or a warning when the read fails."""
         try:
-            node = await _fetch_merge_request(self.client, MERGE_REQUEST_STATE_QUERY, self.project, self.iid)
+            node = await fetch_merge_request(self.client, MERGE_REQUEST_STATE_QUERY, self.project, self.iid)
         except ToolError as exc:
             return {"warning": f"Could not read the merge request back. Check it with get_merge_request. {exc}"}
         final: dict[str, Any] = {
             "state": node["state"],
             "draft": node["draft"],
-            "merge_status": _lower(node["detailedMergeStatus"]),
-            "head_sha": _head_sha(node["diffRefs"]),
+            "merge_status": lower_or_empty(node["detailedMergeStatus"]),
+            "head_sha": diff_refs_head_sha(node["diffRefs"]),
         }
         if self.changes.add_reviewers or self.changes.remove_reviewers:
             reviewers = _verified_usernames(node.get("reviewers"))
@@ -3945,7 +3694,7 @@ def _create_description(description: str | None, description_file: str | None) -
         return description
 
     try:
-        return _read_server_local_utf8_file(
+        return read_server_local_utf8_file(
             description_file or "",
             path_field="description_file",
             size_field="description_file",
