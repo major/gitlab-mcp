@@ -1198,6 +1198,198 @@ async def test_finding_view_compacts_bot_greeting_and_signoff_preserving_finding
     assert finding["threads"][0]["notes"][0]["body"] == expected
 
 
+@respx.mock
+async def test_finding_view_keeps_selected_bot_sections_and_their_code(gitlab_env):
+    """Section findings keep the bold title and approved sections, including code and diagrams."""
+    # Arrange
+    body = (
+        "👋 Hello team!\n\n"
+        "**[P1] Preserve the original parse error**\n\n"
+        "The parser currently loses `error.message`.\n\n"
+        "### 🧭 What needs to be improved\n\n"
+        "The error context is missing.\n\n"
+        "### 💥 FAILURE SCENARIO\n\n"
+        "1. Invalid input reaches the parser.\n"
+        "2. The original error details are lost.\n\n"
+        "```python\n"
+        "raise ParseError(error.message)\n"
+        "```\n\n"
+        "```text\n"
+        "Input -> Parser -> Error\n"
+        "1. Keep this numbered example\n"
+        "### Keep this heading example\n"
+        "Fix: This is an example line\n"
+        "```\n\n"
+        "    keep_context(error.message)\n\n"
+        "### 🌟 What was done well\n\n"
+        "The tests are clear.\n\n"
+        "**🛠️ HOW TO FIX**\n"
+        "- Keep the original error details.\n\n"
+        "Looks like we're ready to leave the station! 🛤️"
+    )
+    expected = (
+        "**[P1] Preserve the original parse error**\n\n"
+        "### 🧭 What needs to be improved\n\n"
+        "The error context is missing.\n\n"
+        "### 💥 FAILURE SCENARIO\n\n"
+        "1. Invalid input reaches the parser.\n"
+        "2. The original error details are lost.\n\n"
+        "```python\n"
+        "raise ParseError(error.message)\n"
+        "```\n\n"
+        "```text\n"
+        "Input -> Parser -> Error\n"
+        "1. Keep this numbered example\n"
+        "### Keep this heading example\n"
+        "Fix: This is an example line\n"
+        "```\n\n"
+        "    keep_context(error.message)\n\n"
+        "**🛠️ HOW TO FIX**\n"
+        "- Keep the original error details."
+    )
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    full = await call_tool()
+    finding = await call_tool(view="finding")
+
+    # Assert
+    assert full["threads"][0]["notes"][0]["body"] == body
+    assert finding["threads"][0]["notes"][0]["body"] == expected
+
+
+@respx.mock
+async def test_finding_view_preserves_signoff_text_when_meaningful_prose_follows(gitlab_env):
+    """A section signoff candidate stays when a meaningful paragraph follows it."""
+    # Arrange
+    body = (
+        "**[P1] Keep error context**\n\n"
+        "### Failure scenario\n\n"
+        "Invalid input loses its source details.\n\n"
+        "### How to fix\n"
+        "- Keep the original error.\n\n"
+        "Looks like we're ready to leave the station! 🛤️\n\n"
+        "The retry path still needs review."
+    )
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    finding = await call_tool(view="finding")
+
+    # Assert
+    assert finding["threads"][0]["notes"][0]["body"] == body
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            (
+                "**🟡 LOW: Pin the reason in the neutral baseline rejection test** 🔧\n\n"
+                "All aboard! 🎫 Nice move to the shared `registered_neutral_ecosystem` fixture instead of "
+                "patching the registry.\n\n"
+                "- **Location:** `tests/test_config.py:42`\n"
+                "- **Fix:** Pin the rejection reason."
+            ),
+            (
+                "**🟡 LOW: Pin the reason in the neutral baseline rejection test** 🔧\n\n"
+                "- **Location:** `tests/test_config.py:42`\n"
+                "- **Fix:** Pin the rejection reason."
+            ),
+        ),
+        (
+            (
+                "👋 Hi!\n\n**[P2] Keep the source path**\n\n"
+                "This breaks when `config.yaml` is invalid.\n\n"
+                "- **Fix:** Keep the original path.\n"
+                "- **Location:** `src/parser.py:42`\n\nThanks!"
+            ),
+            ("**[P2] Keep the source path**\n\n- **Fix:** Keep the original path.\n- **Location:** `src/parser.py:42`"),
+        ),
+        (
+            (
+                "**🟡 LOW: Pin the reason in the neutral baseline rejection test** 🔧 trailing prose\n\n"
+                "This paragraph has `inline code`, but no action marker.\n\n"
+                "- Fix: This must remain unchanged."
+            ),
+            (
+                "**🟡 LOW: Pin the reason in the neutral baseline rejection test** 🔧 trailing prose\n\n"
+                "This paragraph has `inline code`, but no action marker.\n\n"
+                "- Fix: This must remain unchanged."
+            ),
+        ),
+        (
+            (
+                "**[P2] Keep the source path**\n\n"
+                "This paragraph has `inline code`, but no action marker.\n\n"
+                "The prose remains ambiguous."
+            ),
+            (
+                "**[P2] Keep the source path**\n\n"
+                "This paragraph has `inline code`, but no action marker.\n\n"
+                "The prose remains ambiguous."
+            ),
+        ),
+        (
+            (
+                "**[P2] Keep the source path**\n\n"
+                "```text\n- Fix: This is fenced example text.\n```\n\n"
+                "The prose remains ambiguous."
+            ),
+            (
+                "**[P2] Keep the source path**\n\n"
+                "```text\n- Fix: This is fenced example text.\n```\n\n"
+                "The prose remains ambiguous."
+            ),
+        ),
+        (
+            (
+                "**[P2] Keep the source path**\n\n"
+                "### Root cause\n\n"
+                "The source path is lost.\n\n"
+                "### Suggested change\n\n"
+                "Preserve the original path."
+            ),
+            (
+                "**[P2] Keep the source path**\n\n"
+                "### Root cause\n\n"
+                "The source path is lost.\n\n"
+                "### Suggested change\n\n"
+                "Preserve the original path."
+            ),
+        ),
+    ],
+    ids=[
+        "trailing-emoji-heading-and-exact-intro",
+        "remove-intro-before-action-bullets",
+        "trailing-prose-is-not-heading-decoration",
+        "keep-unknown-prose",
+        "keep-fenced-example",
+        "keep-unknown-sections",
+    ],
+)
+@respx.mock
+async def test_finding_view_only_removes_intro_in_recognized_bullet_layout(gitlab_env, body, expected):
+    """Only a bold-heading layout with a real action marker loses its introductory paragraph."""
+    # Arrange
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    finding = await call_tool(view="finding")
+
+    # Assert
+    assert finding["threads"][0]["notes"][0]["body"] == expected
+
+
 @pytest.mark.parametrize(
     ("indent", "placement"),
     [
@@ -1301,8 +1493,21 @@ async def test_finding_view_keeps_prose_after_multiline_signoff(gitlab_env):
             {"username": "alice", "bot": False},
             "👋 Hi!\n\n1. [P1] Keep the human note unchanged.\n\nThanks!",
         ),
+        (
+            {"username": "alice", "bot": False},
+            (
+                "👋 Hi!\n\n**[P1] Keep this human finding unchanged**\n\n"
+                "### Needs to be improved\n\nThe section stays as written.\n\nThanks!"
+            ),
+        ),
     ],
-    ids=["signoff-without-finding", "known-signoff-without-finding", "no-numbered-items", "human-note"],
+    ids=[
+        "signoff-without-finding",
+        "known-signoff-without-finding",
+        "no-numbered-items",
+        "human-numbered-note",
+        "human-section-note",
+    ],
 )
 @respx.mock
 async def test_finding_view_keeps_signoff_only_unstructured_and_human_notes(gitlab_env, author, body):
