@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -128,6 +129,10 @@ DIFF_PAGE_SIZE = 100
 # "list states" tool.
 MergeRequestState = Literal["opened", "closed", "locked", "merged", "all"]
 
+# Column order of the TSV output. Every row has every column, so agents
+# never have to guess whether a missing key means "empty" or "not sent".
+TSV_COLUMNS = ("iid", "title", "author", "state", "draft", "approved", "approved_by", "open_threads", "updated")
+
 
 @lifespan
 async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
@@ -187,21 +192,19 @@ async def get_current_user(ctx: Context) -> CurrentUser:
 
 
 class MergeRequestSummary(BaseModel):
-    """One merge request with the fields an agent needs to pick the next step.
+    """One merge request row, with every field the TSV output needs.
 
-    Empty values are left out to save tokens. A missing `draft` means not a
-    draft, a missing `open_threads` means zero, and a missing `approved_by`
-    means nobody approved.
+    Values are kept as-is here. `_to_tsv` turns them into cells.
     """
 
     iid: int
     title: str
-    author: str | None = Field(default=None, exclude_if=lambda v: v is None)
-    state: str | None = Field(default=None, exclude_if=lambda v: v is None)  # Only set when listing state "all".
-    draft: bool = Field(default=False, exclude_if=lambda v: not v)
+    author: str | None  # Null when the author was deleted or banned.
+    state: str
+    draft: bool
     approved: bool
-    approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
-    open_threads: int = Field(default=0, exclude_if=lambda v: v == 0)
+    approved_by: list[str]
+    open_threads: int
     updated: str  # Date only, YYYY-MM-DD.
 
 
@@ -209,7 +212,13 @@ class MergeRequestList(BaseModel):
     """A page of merge requests."""
 
     web_url_prefix: str = Field(description="Append an iid to get the MR link.")
-    merge_requests: list[MergeRequestSummary]
+    merge_requests: str = Field(
+        description=(
+            "TSV with a header row. Columns: iid, title, author, state, draft, approved, "
+            "approved_by, open_threads, updated. approved_by is comma-separated usernames. "
+            "An empty cell means none. Booleans are true/false."
+        ),
+    )
     has_more: bool
 
 
@@ -367,19 +376,38 @@ class MergeRequestDetail(BaseModel):
     threads: ThreadIndex
 
 
-def _to_summary(node: dict[str, Any], include_state: bool) -> MergeRequestSummary:
-    """Convert one GraphQL merge request node into a summary.
+def _cell(value: object) -> str:
+    """Render one value as a TSV cell.
 
-    The state is only kept when `include_state` is True, because callers that
-    filter on one state already know it.
+    None becomes an empty cell, booleans become true/false, and lists become
+    comma-separated. Tabs and line breaks in text would split the row, so each
+    run of them becomes one space. Titles can contain them.
     """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return ",".join(value)
+    return re.sub(r"[\t\r\n]+", " ", str(value))
+
+
+def _to_tsv(mrs: list[MergeRequestSummary]) -> str:
+    """Render merge requests as TSV: a header row, then one line per MR, no trailing newline."""
+    lines = ["\t".join(TSV_COLUMNS)]
+    lines.extend("\t".join(_cell(getattr(mr, column)) for column in TSV_COLUMNS) for mr in mrs)
+    return "\n".join(lines)
+
+
+def _to_summary(node: dict[str, Any]) -> MergeRequestSummary:
+    """Convert one GraphQL merge request node into a summary."""
     # A deleted or banned author comes back as null.
     author = node["author"]
     return MergeRequestSummary(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
         author=author["username"] if author else None,
-        state=node["state"] if include_state else None,
+        state=node["state"],
         draft=node["draft"],
         approved=node["approved"],
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
@@ -414,9 +442,10 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
     """List merge requests in a project, newest-updated first.
 
     Equivalent to `glab mr list` with filters. The token needs the `read_api`
-    scope. For a link, append an MR's `iid` to `web_url_prefix`. Empty fields
-    are left out: no `draft` means not a draft, no `open_threads` means zero,
-    and no `approved_by` means nobody approved. `updated` is a date.
+    scope. Results are TSV with a header row, and every row has every column.
+    An empty cell means none, like no author or no approvers. Booleans are
+    true or false. `updated` is a date. For a link, append an MR's `iid` to
+    `web_url_prefix`.
 
     `approved` follows the instance rules: on Free it means at least one
     approval, on Premium and Ultimate it means all approval rules are met.
@@ -425,7 +454,6 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
     came back, the scan stopped early and more matches may exist.
     """
     client = get_client(ctx)
-    include_state = state == "all"
     # Client-side filters can drop nodes, so fetch big pages to find matches faster.
     filtered = approved is not None or has_open_threads is not None
     variables: dict[str, Any] = {
@@ -443,7 +471,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         if data["project"] is None:
             raise ProjectNotFoundError(project)
         connection = data["project"]["mergeRequests"]
-        summaries = [_to_summary(node, include_state) for node in connection["nodes"]]
+        summaries = [_to_summary(node) for node in connection["nodes"]]
         collected.extend(mr for mr in summaries if _matches(mr, approved, has_open_threads))
         page_info = connection["pageInfo"]
         has_next = page_info["hasNextPage"]
@@ -453,7 +481,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
 
     return MergeRequestList(
         web_url_prefix=f"{client.settings.url}/{project}/-/merge_requests/",
-        merge_requests=collected[:limit],
+        merge_requests=_to_tsv(collected[:limit]),
         has_more=len(collected) > limit or has_next,
     )
 

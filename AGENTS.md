@@ -28,7 +28,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 
 ## Tool design rules
 
-- Tool output is sent to an agent on every call, so keep it token-lean: small Pydantic models, `exclude_if` to drop empty fields, dates trimmed to `YYYY-MM-DD`.
+- Tool output is sent to an agent on every call, so keep it token-lean: small Pydantic models, TSV strings for lists of rows (fixed columns, so no row looks like it is missing data), dates trimmed to `YYYY-MM-DD`.
 - Tool docstrings and `Field(description=...)` are the agent-facing docs. Name the matching `glab` command in the docstring.
 - Use `Literal[...]` for enum-like args instead of a separate "list values" tool.
 - Mark read-only tools with `annotations={"readOnlyHint": True, "openWorldHint": True}`.

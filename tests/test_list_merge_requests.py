@@ -10,12 +10,13 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 lazy from mcp.types import CallToolResult, TextContent
 
-from gitlab_mcp.server import MAX_PAGES, mcp
+from gitlab_mcp.server import MAX_PAGES, TSV_COLUMNS, mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 WEB_URL_PREFIX = "https://gitlab.example.com/group/project/-/merge_requests/"
 FULL_PAGE = 100  # The largest page GitLab serves, used when filtering client-side.
+HEADER = "iid\ttitle\tauthor\tstate\tdraft\tapproved\tapproved_by\topen_threads\tupdated"
 
 
 def make_node(iid: int, **overrides: Any) -> dict[str, Any]:
@@ -67,9 +68,15 @@ async def call_tool(arguments: dict[str, Any] | None = None) -> dict:
     return result.structured_content
 
 
+def rows(data: dict) -> list[dict[str, str]]:
+    """Parse the TSV `merge_requests` string into one dict per row, keyed by header."""
+    header, *lines = data["merge_requests"].split("\n")
+    return [dict(zip(header.split("\t"), line.split("\t"), strict=True)) for line in lines]
+
+
 def iids(data: dict) -> list[int]:
     """Return the IIDs of the merge requests in a tool result."""
-    return [mr["iid"] for mr in data["merge_requests"]]
+    return [int(row["iid"]) for row in rows(data)]
 
 
 @respx.mock
@@ -102,17 +109,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
     }
     assert data == {
         "web_url_prefix": WEB_URL_PREFIX,
-        "merge_requests": [
-            {
-                "iid": 7,
-                "title": "Fix login",
-                "draft": True,
-                "approved": True,
-                "approved_by": ["reviewer"],
-                "open_threads": 3,
-                "updated": "2026-10-20",
-            },
-        ],
+        "merge_requests": (f"{HEADER}\n7\tFix login\t\topened\ttrue\ttrue\treviewer\t3\t2026-10-20"),
         "has_more": False,
     }
 
@@ -137,22 +134,41 @@ async def test_defaults_list_open_mrs_by_any_author(gitlab_env):
 
 
 @pytest.mark.parametrize(
-    ("overrides", "expected_keys"),
+    ("overrides", "expected_row"),
     [
         (
             {},
-            {"iid", "title", "author", "approved", "updated"},
-        ),  # Defaults: draft, threads, and approvers are left out.
-        ({"author": None}, {"iid", "title", "approved", "updated"}),  # A null author is left out too.
+            {
+                "iid": "1",
+                "title": "MR 1",
+                "author": "jdoe",
+                "state": "opened",
+                "draft": "false",
+                "approved": "false",
+                "approved_by": "",
+                "open_threads": "0",
+                "updated": "2026-10-20",
+            },
+        ),
         (
-            {"draft": True, "approvedBy": {"nodes": [{"username": "x"}]}, "resolvableDiscussionsCount": 1},
-            {"iid", "title", "author", "draft", "approved", "approved_by", "open_threads", "updated"},
+            {"author": None, "draft": True, "resolvableDiscussionsCount": 4, "resolvedDiscussionsCount": 1},
+            {
+                "iid": "1",
+                "title": "MR 1",
+                "author": "",
+                "state": "opened",
+                "draft": "true",
+                "approved": "false",
+                "approved_by": "",
+                "open_threads": "3",
+                "updated": "2026-10-20",
+            },
         ),
     ],
 )
 @respx.mock
-async def test_empty_values_are_omitted(gitlab_env, overrides, expected_keys):
-    """Empty values are left out of the structured output to save tokens."""
+async def test_every_row_has_every_column(gitlab_env, overrides, expected_row):
+    """Each row has all TSV columns, and empty values show as empty cell, false, or 0."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, **overrides)))
 
@@ -160,12 +176,14 @@ async def test_empty_values_are_omitted(gitlab_env, overrides, expected_keys):
     data = await call_tool()
 
     # Assert
-    assert set(data["merge_requests"][0]) == expected_keys
+    row = rows(data)[0]
+    assert list(row) == list(TSV_COLUMNS)
+    assert row == expected_row
 
 
 @respx.mock
-async def test_text_content_omits_empty_values(gitlab_env):
-    """The text the LLM reads uses the same trimmed shape as the structured output."""
+async def test_text_content_matches_structured_content(gitlab_env):
+    """The text the LLM reads is the same TSV as the structured output."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, author=None)))
 
@@ -175,28 +193,65 @@ async def test_text_content_omits_empty_values(gitlab_env):
     # Assert
     block = result.content[0]
     assert isinstance(block, TextContent)
-    text = json.loads(block.text)
-    assert text["merge_requests"] == [{"iid": 1, "title": "MR 1", "approved": False, "updated": "2026-10-20"}]
+    assert json.loads(block.text) == result.structured_content
 
 
 @pytest.mark.parametrize(
-    ("state", "expect_state_key"),
-    [("all", True), ("opened", False), ("merged", False)],
+    ("request_state", "node_state"),
+    [("opened", "opened"), ("closed", "closed"), ("locked", "locked"), ("merged", "merged"), ("all", "merged")],
 )
 @respx.mock
-async def test_state_is_only_returned_when_listing_all(gitlab_env, state, expect_state_key):
-    """The state field is only returned for state "all", because other callers already know it."""
+async def test_state_column_is_filled_for_every_state(gitlab_env, request_state, node_state):
+    """The state column is always filled, so callers never have to guess it."""
     # Arrange
-    respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, state="opened")))
+    respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, state=node_state)))
 
     # Act
-    data = await call_tool({"state": state})
+    data = await call_tool({"state": request_state})
 
     # Assert
-    mr = data["merge_requests"][0]
-    assert ("state" in mr) is expect_state_key
-    if expect_state_key:
-        assert mr["state"] == "opened"
+    assert rows(data)[0]["state"] == node_state
+
+
+@respx.mock
+async def test_title_tabs_and_line_breaks_become_single_spaces(gitlab_env):
+    """A tab or line break in a title would break the TSV row, so each run becomes one space."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, title="Fix\tthe\n\r\tlogin")))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert len(rows(data)) == 1
+    assert rows(data)[0]["title"] == "Fix the login"
+
+
+@respx.mock
+async def test_multiple_approvers_are_comma_separated(gitlab_env):
+    """Every approver appears in approved_by, separated by commas."""
+    # Arrange
+    approvers = {"nodes": [{"username": "alice"}, {"username": "bob"}]}
+    respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, approved=True, approvedBy=approvers)))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert rows(data)[0]["approved_by"] == "alice,bob"
+
+
+@respx.mock
+async def test_no_merge_requests_returns_header_only(gitlab_env):
+    """With no matches, the TSV is just the header line."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=make_page())
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert data["merge_requests"] == HEADER
 
 
 @pytest.mark.parametrize("state", ["opened", "closed", "locked", "merged", "all"])
@@ -322,7 +377,7 @@ async def test_has_more_reflects_remaining_results(gitlab_env, nodes, has_next, 
     data = await call_tool({"limit": limit})
 
     # Assert
-    assert len(data["merge_requests"]) == min(len(nodes), limit)
+    assert len(rows(data)) == min(len(nodes), limit)
     assert data["has_more"] is expected_has_more
 
 
@@ -339,7 +394,7 @@ async def test_scan_stops_after_max_pages(gitlab_env):
 
     # Assert
     assert route.call_count == MAX_PAGES
-    assert data == {"web_url_prefix": WEB_URL_PREFIX, "merge_requests": [], "has_more": True}
+    assert data == {"web_url_prefix": WEB_URL_PREFIX, "merge_requests": HEADER, "has_more": True}
 
 
 @respx.mock
