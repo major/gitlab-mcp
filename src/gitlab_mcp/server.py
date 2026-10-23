@@ -29,6 +29,7 @@ MAX_PAGES = 5
 MAX_BATCH_MERGE_REQUESTS = 20
 MAX_CREATE_BLOCKERS = 20
 MAX_CREATE_LABELS = 100
+MAX_CREATE_ASSIGNEES = 100
 HTTP_NOT_FOUND = 404
 HTTP_REQUEST_TIMEOUT = 408
 HTTP_CONFLICT = 409
@@ -3109,6 +3110,14 @@ query($usernames: [String!]) {
 }
 """
 
+CREATE_ASSIGNEES_QUERY = """
+query($usernames: [String!]) {
+  users(usernames: $usernames) {
+    nodes { id username }
+  }
+}
+"""
+
 SET_DRAFT_MUTATION = """
 mutation($projectPath: ID!, $iid: String!, $draft: Boolean!) {
   mergeRequestSetDraft(input: {projectPath: $projectPath, iid: $iid, draft: $draft}) {
@@ -3695,6 +3704,68 @@ def _create_description(description: str | None, description_file: str | None) -
         raise ToolError(f"Could not read description_file: {exc}") from exc  # noqa: TRY003
 
 
+def _numeric_user_id(global_id: Any) -> int | None:
+    """Return the positive numeric ID from a GitLab User global ID, or None when it is invalid."""
+    if not isinstance(global_id, str):
+        return None
+    match = re.fullmatch(r"gid://gitlab/User/([0-9]+)", global_id)
+    if match is None:
+        return None
+    try:
+        user_id = int(match.group(1))
+    except ValueError:
+        return None
+    return user_id if user_id > 0 else None
+
+
+async def _resolve_create_assignees(
+    client: GitLabClient,
+    names: Sequence[str],
+) -> tuple[list[int], list[str], dict[str, str]]:
+    """Resolve assignee usernames to numeric IDs, retaining failures per requested spelling."""
+    requested: dict[str, str] = {}
+    for name in names:
+        requested.setdefault(name.lower(), name)
+    if not requested:
+        return [], [], {}
+
+    try:
+        data = await client.graphql(CREATE_ASSIGNEES_QUERY, {"usernames": sorted(requested)})
+    except ToolError as exc:
+        return [], [], {f"assignees:{name}": f"could not verify user: {exc}" for name in requested.values()}
+
+    users = data.get("users") if isinstance(data, dict) else None
+    nodes = users.get("nodes") if isinstance(users, dict) else None
+    if not isinstance(nodes, list):
+        return [], [], {f"assignees:{name}": "could not verify user: invalid response" for name in requested.values()}
+
+    known = {
+        node["username"].lower(): node.get("id")
+        for node in nodes
+        if isinstance(node, dict) and isinstance(node.get("username"), str)
+    }
+    assignee_ids: list[int] = []
+    applied_names: list[str] = []
+    failures: dict[str, str] = {}
+    for normalized, name in requested.items():
+        if normalized not in known:
+            failures[f"assignees:{name}"] = "unknown user"
+            continue
+        user_id = _numeric_user_id(known[normalized])
+        if user_id is None:
+            failures[f"assignees:{name}"] = "could not verify user: invalid GitLab user ID"
+            continue
+        assignee_ids.append(user_id)
+        applied_names.append(name)
+    return assignee_ids, applied_names, failures
+
+
+def _include_create_assignees(body: dict[str, Any], assignee_ids: Sequence[int]) -> None:
+    """Add assignee IDs only when at least one username was verified."""
+    if assignee_ids:
+        body["assignee_ids"] = list(assignee_ids)
+
+
 def _uncertain_write_error(error: GitLabAPIError) -> bool:
     """Return true for HTTP statuses that can hide a committed write."""
     return error.status == HTTP_REQUEST_TIMEOUT or error.status >= HTTP_SERVER_ERROR
@@ -3803,6 +3874,10 @@ async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a u
             description="Existing project or ancestor-group labels to set, up to 100 labels.",
         ),
     ] = None,
+    assignees: Annotated[
+        list[str] | None,
+        Field(max_length=MAX_CREATE_ASSIGNEES, description="Usernames to assign, up to 100 users."),
+    ] = None,
     remove_source_branch: Annotated[
         bool | None,
         Field(description="Delete the source branch after the merge. Omit for the project default."),
@@ -3820,6 +3895,7 @@ async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a u
     Exactly one description source is required. A description file is read on this server and must be an absolute,
     regular UTF-8 file no larger than 100000 bytes. Labels are checked against project and ancestor-group labels;
     unknown or unchecked labels are omitted and reported while creation continues.
+    Assignee usernames are checked in one GraphQL lookup; unknown, invalid, or unchecked users are omitted and reported.
     Blockers are resolved in this project before creation. After creation, dependency requests run sequentially.
     `applied`, `unknown`, and `failed` report each outcome. A network error or server error can leave a write's
     outcome unknown. Check GitLab before retrying. Do not retry blindly, especially when creation is unknown. Requires
@@ -3844,6 +3920,9 @@ async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a u
         failures.update(blocker_failures)
         return MergeRequestCreateResult(failed=failures)
 
+    assignee_ids, applied_assignees, assignee_failures = await _resolve_create_assignees(client, assignees or [])
+    failures.update(assignee_failures)
+
     body: dict[str, Any] = {
         "source_branch": source_branch,
         "target_branch": target_branch,
@@ -3852,6 +3931,7 @@ async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a u
     }
     if valid_labels:
         body["labels"] = ",".join(valid_labels)
+    _include_create_assignees(body, assignee_ids)
     if remove_source_branch is not None:
         body["remove_source_branch"] = remove_source_branch
     project_path = f"/projects/{quote(project, safe='')}"
@@ -3879,6 +3959,7 @@ async def create_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a u
         resolved_blockers,
         failures,
     )
+    applied[1:1] = [f"assignees:{name}" for name in applied_assignees]
 
     return MergeRequestCreateResult(
         iid=created_iid,
