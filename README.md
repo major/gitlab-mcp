@@ -50,6 +50,14 @@ even when the returned content is focused or truncated.
 | --- | --- |
 | `get_work_item` | Read work-item details, all headings, or selected sections with a full-description hash. |
 | `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. |
+| `edit_work_item_description` | Edit a work-item description using exact text, ordered replacements, or a unique table cell. |
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
 | `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
+
+Work-item table-cell edits support standalone pipe-delimited Markdown tables with a unique, non-empty header and a
+valid separator row. The first column is the row key. A section can limit selection to an exact ATX heading and its
+nested content. Fenced code is ignored. Table-cell mode rejects any `<` outside fenced code, including HTML comments
+and markup. Use legacy exact-text replacement or the `edits` batch mode for descriptions containing HTML. The edit
+fails without writing when a selected table is malformed or the row-and-column match is missing or ambiguous. Cell
+replacements cannot contain pipes, line breaks, backslashes, or backticks.
