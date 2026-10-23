@@ -27,7 +27,7 @@ coverage:
 	$(MAKE) branch-coverage
 
 branch-coverage:
-	uv run --locked python -c 'import xml.etree.ElementTree as ET; root=ET.parse("coverage.xml").getroot(); covered=int(root.attrib["branches-covered"]); valid=int(root.attrib["branches-valid"]); rate=covered / valid if valid else 0.0; print(f"Branch coverage: {covered}/{valid} ({rate:.2%})"); raise SystemExit(0 if valid and rate >= 0.95 else 1)'
+	uv run --locked python -c 'import xml.etree.ElementTree as ET; root=ET.parse("coverage.xml").getroot(); covered=int(root.attrib["branches-covered"]); valid=int(root.attrib["branches-valid"]); rate=covered / valid if valid else 0.0; print(f"Branch coverage: {covered}/{valid} ({rate:.2%})"); raise SystemExit(0 if not valid or rate >= 0.95 else 1)'
 
 audit:
 	uv run --locked pip-audit
