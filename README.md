@@ -36,10 +36,13 @@ Example MCP client config:
 
 ## Tools
 
-| Tool                  | Same as                        | Returns                                                   |
-| --------------------- | ------------------------------ | --------------------------------------------------------- |
-| `get_current_user`    | `glab api user --jq .username` | `{"username", "id"}`                                      |
-| `list_merge_requests` | `glab mr list` + filters       | `{"web_url_prefix", "merge_requests": [...], "has_more"}` |
+| Tool                        | Same as                                         | Returns                                                              |
+| --------------------------- | ----------------------------------------------- | -------------------------------------------------------------------- |
+| `get_current_user`          | `glab api user --jq .username`                  | `{"username", "id"}`                                                 |
+| `list_merge_requests`       | `glab mr list` + filters                        | `{"web_url_prefix", "merge_requests": [...], "has_more"}`            |
+| `get_merge_request`         | `glab mr view`                                  | `{"iid", "title", "merge_status", "threads", ...}`                   |
+| `get_merge_request_threads` | `glab mr note list` / `glab mr view --comments` | `{"threads", "next_cursor", "not_found_ids"}`                        |
+| `get_merge_request_diff`    | `glab mr diff`                                  | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}` |
 
 `list_merge_requests` needs a token with the `read_api` scope. Pass `project`
 as the full path, like `group/subgroup/project`, not the numeric ID or the

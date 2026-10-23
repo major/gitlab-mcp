@@ -57,8 +57,8 @@ class GitLabClient:
         """Close the underlying HTTP connection pool."""
         await self._http.aclose()
 
-    async def get(self, path: str, **params: Any) -> Any:
-        """GET `path` and return the parsed JSON body.
+    async def _send_get(self, path: str, params: dict[str, Any]) -> httpx.Response:
+        """Send a GET and return the response. Error statuses raise, so callers only see good responses.
 
         Raises:
             GitLabConnectionError: When the instance cannot be reached.
@@ -71,7 +71,31 @@ class GitLabClient:
 
         if response.is_error:
             raise GitLabAPIError(response.status_code, path)
-        return response.json()
+        return response
+
+    async def get(self, path: str, **params: Any) -> Any:
+        """GET `path` and return the parsed JSON body.
+
+        Raises:
+            GitLabConnectionError: When the instance cannot be reached.
+            GitLabAPIError: When GitLab returns an error status.
+        """
+        return (await self._send_get(path, params)).json()
+
+    async def get_page(self, path: str, **params: Any) -> tuple[Any, int | None]:
+        """GET one page of a list and return its parsed JSON body and the next page number.
+
+        The next page comes from the `X-Next-Page` header. GitLab sends it as an
+        empty string on the last page, and some endpoints leave it out, so both
+        mean None.
+
+        Raises:
+            GitLabConnectionError: When the instance cannot be reached.
+            GitLabAPIError: When GitLab returns an error status.
+        """
+        response = await self._send_get(path, params)
+        next_page = response.headers.get("X-Next-Page")  # Empty string on the last page.
+        return response.json(), int(next_page) if next_page else None
 
     async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         """Run one GraphQL `query` and return its `data` object.

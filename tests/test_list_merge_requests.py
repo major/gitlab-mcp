@@ -18,13 +18,6 @@ WEB_URL_PREFIX = "https://gitlab.example.com/group/project/-/merge_requests/"
 FULL_PAGE = 100  # The largest page GitLab serves, used when filtering client-side.
 
 
-@pytest.fixture
-def gitlab_env(monkeypatch):
-    """Point the server at a fake self-managed GitLab instance."""
-    monkeypatch.setenv("GITLAB_URL", "https://gitlab.example.com/api/v4/")
-    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
-
-
 def make_node(iid: int, **overrides: Any) -> dict[str, Any]:
     """Build one merge request node shaped like the GitLab GraphQL response."""
     node = {

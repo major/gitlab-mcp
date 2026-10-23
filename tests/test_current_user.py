@@ -19,13 +19,6 @@ USER = {
 }
 
 
-@pytest.fixture
-def gitlab_env(monkeypatch):
-    """Point the server at a fake self-managed GitLab instance."""
-    monkeypatch.setenv("GITLAB_URL", "https://gitlab.example.com/api/v4/")
-    monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
-
-
 async def call_tool() -> dict:
     """Call get_current_user through the MCP protocol and return its data."""
     async with Client(mcp) as client:
