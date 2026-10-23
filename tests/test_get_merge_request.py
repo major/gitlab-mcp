@@ -118,7 +118,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
 
     # Act
-    data = await call_tool()
+    data = await call_tool(include_description=True)
 
     # Assert
     assert route.calls.last.request.headers["PRIVATE-TOKEN"] == "glpat-test"
@@ -410,7 +410,7 @@ async def test_empty_fields_are_omitted(gitlab_env, overrides, absent_keys):
     respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(**overrides)))
 
     # Act
-    data = await call_tool()
+    data = await call_tool(include_description=True)
 
     # Assert
     assert absent_keys.isdisjoint(data)
@@ -488,7 +488,7 @@ async def test_description_obeys_requested_limit(
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description="d" * length)))
 
     # Act
-    data = await call_tool(description_limit=description_limit)
+    data = await call_tool(include_description=True, description_limit=description_limit)
 
     # Assert
     assert sent_variables(route) == {
@@ -503,7 +503,36 @@ async def test_description_obeys_requested_limit(
     assert "description @include(if: $includeDescription)" in request["query"]
 
 
-@pytest.mark.parametrize("skip_args", [{"include_description": False}, {"description_limit": 0}])
+@pytest.mark.parametrize(
+    ("args", "expects_description"),
+    [
+        ({}, False),  # Default: the description is left out to save tokens.
+        ({"include_description": False}, False),
+        ({"include_description": True}, True),  # Opt-in: the description comes back.
+    ],
+    ids=["default", "explicit-false", "opt-in"],
+)
+@respx.mock
+async def test_description_is_omitted_by_default_and_included_on_opt_in(gitlab_env, args, expects_description):
+    """The description is only requested and returned when the caller opts in."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act
+    data = await call_tool(**args)
+
+    # Assert
+    assert sent_variables(route)["includeDescription"] is expects_description
+    assert ("description" in data) is expects_description
+    assert ("description_truncated" in data) is False
+    assert data["title"] == "Rebuild support"
+
+
+@pytest.mark.parametrize(
+    "skip_args",
+    [{"include_description": False}, {"include_description": True, "description_limit": 0}],
+    ids=["explicit-false", "zero-limit"],
+)
 @respx.mock
 async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
     """Skipping the description also skips the GraphQL field and cut flag."""

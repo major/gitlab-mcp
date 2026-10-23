@@ -49,10 +49,11 @@ even when the returned content is focused or truncated.
 | Tool | Description |
 | --- | --- |
 | `get_work_item` | Read work-item details, all headings, or selected sections with a full-description hash. |
-| `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. |
+| `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. `get_merge_request` skips the description unless `include_description=true`. |
 | `edit_work_item_description` | Edit a work-item description using exact text, ordered replacements, or a unique table cell. |
 | `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. Pass `names` to check which exact label names exist (`existing`/`missing`) before `create_merge_request(labels=...)`. |
-| `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
+| `reply_to_thread` | Reply to or resolve one review thread; a successful resolve also returns the MR's open thread count. |
+| `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome and each MR's open thread count after resolving. |
 | `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
 | `update_merge_request` | Change MR fields, reviewers, assignees, blockers, or approval; rebase reports `applied`, `pending` (still running after about 10 seconds), or `failed` (for example, when the MR has conflicts). |
 | `land_merge_request` | Queue, merge now, or cancel an MR; `auto` and `now` also return the queued `head_sha` and `pipeline_status`. |

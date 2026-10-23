@@ -100,7 +100,11 @@ async def test_server_instruction_tool_references_are_registered(gitlab_env):
 
     assert instructions is not None
     registered_names = {tool.name for tool in listed}
-    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - {"validate_only"}
+    # Argument names such as validate_only and include_description are not tool names.
+    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - {
+        "validate_only",
+        "include_description",
+    }
 
     # Assert
     assert referenced_names <= registered_names, (

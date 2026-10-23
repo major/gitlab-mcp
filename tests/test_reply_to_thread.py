@@ -1,5 +1,6 @@
 """Tests for replying to and resolving GitLab discussion threads 🧵."""
 
+import json
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ from fastmcp.exceptions import ToolError
 from gitlab_mcp.server import mcp
 
 API = "https://gitlab.example.com/api/v4"
+GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
 NOTE_ID = 789
@@ -18,6 +20,17 @@ MR_PATH = f"/projects/group%2Fproject/merge_requests/{IID}"
 DISCUSSION_PATH = f"{MR_PATH}/discussions/thread-1"
 NOTES_URL = API + DISCUSSION_PATH + "/notes"
 DISCUSSION_URL = API + DISCUSSION_PATH
+
+
+def count_response(resolvable: int, resolved: int) -> httpx.Response:
+    """Return the GraphQL thread-count envelope GitLab sends for one merge request."""
+    node = {"resolvableDiscussionsCount": resolvable, "resolvedDiscussionsCount": resolved}
+    return httpx.Response(200, json={"data": {"project": {"mergeRequest": node}}})
+
+
+def sent_variables(route: respx.Route) -> dict[str, Any]:
+    """Return the GraphQL variables from the last request the route received."""
+    return json.loads(route.calls.last.request.content)["variables"]
 
 
 async def call_reply(**arguments: Any) -> dict[str, Any]:
@@ -62,15 +75,16 @@ async def test_reply_then_resolve_uses_two_ordered_writes(gitlab_env):
     resolve = respx.put(DISCUSSION_URL).mock(
         side_effect=lambda request: (calls.append("resolve"), httpx.Response(200, json={"resolved": True}))[1]
     )
+    respx.post(GRAPHQL).mock(side_effect=lambda request: (calls.append("count"), count_response(1, 1))[1])
 
     # Act
     result = await call_reply(body="Done", resolve=True)
 
     # Assert
-    assert calls == ["reply", "resolve"]
+    assert calls == ["reply", "resolve", "count"]
     assert note.calls.last.request.read() == b'{"body":"Done"}'
     assert resolve.calls.last.request.read() == b'{"resolved":true}'
-    assert result == {"thread_id": "thread-1", "note_id": 321, "resolved": True}
+    assert result == {"thread_id": "thread-1", "note_id": 321, "resolved": True, "open_threads": 0}
 
 
 @respx.mock
@@ -79,6 +93,7 @@ async def test_resolve_only_sends_no_note(gitlab_env):
     # Arrange
     resolve = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"resolved": True}))
     note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": 321}))
+    respx.post(GRAPHQL).mock(return_value=count_response(1, 1))
 
     # Act
     result = await call_reply(body=None, resolve=True)
@@ -86,6 +101,77 @@ async def test_resolve_only_sends_no_note(gitlab_env):
     # Assert
     assert resolve.calls.call_count == 1
     assert note.calls.call_count == 0
+    assert result == {"thread_id": "thread-1", "resolved": True, "open_threads": 0}
+
+
+@pytest.mark.parametrize(
+    ("resolvable", "resolved", "expected_open"),
+    [(1, 1, 0), (3, 1, 2)],
+    ids=["last-open-thread", "one-of-several"],
+)
+@respx.mock
+async def test_resolve_reports_open_threads_after_the_write(gitlab_env, resolvable, resolved, expected_open):
+    """The open count is read after the resolve write and reflects the MR's remaining open threads."""
+    # Arrange
+    calls: list[str] = []
+
+    def serve_resolve(request: httpx.Request) -> httpx.Response:
+        """Record the resolve write and accept it."""
+        calls.append("resolve")
+        return httpx.Response(200, json={"resolved": True})
+
+    def serve_counts(request: httpx.Request) -> httpx.Response:
+        """Record the count read and return the MR's discussion totals."""
+        calls.append("count")
+        return count_response(resolvable, resolved)
+
+    respx.put(DISCUSSION_URL).mock(side_effect=serve_resolve)
+    counts = respx.post(GRAPHQL).mock(side_effect=serve_counts)
+
+    # Act
+    result = await call_reply(resolve=True)
+
+    # Assert
+    assert calls == ["resolve", "count"]
+    assert sent_variables(counts) == {"fullPath": PROJECT, "iid": str(IID)}
+    assert result == {"thread_id": "thread-1", "resolved": True, "open_threads": expected_open}
+
+
+@respx.mock
+async def test_reply_without_resolve_keeps_shape_and_skips_the_count(gitlab_env):
+    """A reply that does not resolve has no open_threads field and makes no count read."""
+    # Arrange
+    respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    counts = respx.post(GRAPHQL).mock(return_value=count_response(1, 0))
+
+    # Act
+    result = await call_reply(body="Reply only")
+
+    # Assert
+    assert result == {"thread_id": "thread-1", "note_id": NOTE_ID}
+    assert counts.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"return_value": httpx.Response(403, json={"message": "Forbidden"})},
+        {"side_effect": httpx.ConnectError("connection reset")},
+    ],
+    ids=["api-error", "connection-error"],
+)
+@respx.mock
+async def test_failed_count_read_omits_open_threads_without_failing_the_write(gitlab_env, failure):
+    """A resolved thread still returns success when the follow-up count cannot be read."""
+    # Arrange
+    resolve = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"resolved": True}))
+    respx.post(GRAPHQL).mock(**failure)
+
+    # Act
+    result = await call_reply(resolve=True)
+
+    # Assert
+    assert resolve.calls.call_count == 1
     assert result == {"thread_id": "thread-1", "resolved": True}
 
 
@@ -308,6 +394,8 @@ async def test_batch_keeps_cross_merge_request_writes_in_input_order(gitlab_env)
             )[1]
         )
 
+    respx.post(GRAPHQL).mock(return_value=count_response(1, 1))
+
     # Act
     result = await call_reply_batch(replies)
 
@@ -315,6 +403,7 @@ async def test_batch_keeps_cross_merge_request_writes_in_input_order(gitlab_env)
     assert calls == [("reply", 2187), ("resolve", 2187), ("reply", 2188), ("resolve", 2188)]
     assert [row["status"] for row in result["results"]] == ["applied", "applied"]
     assert [row["resolved"] for row in result["results"]] == [True, True]
+    assert [row["open_threads"] for row in result["results"]] == [0, 0]
 
 
 @pytest.mark.parametrize("count", [0, 21])
@@ -389,3 +478,60 @@ async def test_batch_resolution_5xx_is_unknown_not_failed(gitlab_env):
     assert note.calls.call_count == resolve.calls.call_count == 1
     assert result["results"][0]["status"] == "unknown"
     assert "resolution outcome is unknown" in result["results"][0]["warning"].lower()
+
+
+@respx.mock
+async def test_batch_reads_open_threads_once_per_merge_request_after_its_last_resolve(gitlab_env):
+    """Each MR gets one count, read after its last resolve item, and each count stays with its own MR."""
+    # Arrange
+    open_counts = {"2187": (2, 2), "2188": (3, 1)}  # (resolvable, resolved): 0 open for 2187, 2 open for 2188.
+    for iid, thread_id in ((2187, "a"), (2188, "b"), (2187, "c")):
+        path = API + f"/projects/group%2Fproject/merge_requests/{iid}/discussions/{thread_id}"
+        respx.post(path + "/notes").mock(return_value=httpx.Response(201, json={"id": 1}))
+        respx.put(path).mock(return_value=httpx.Response(200, json={"resolved": True}))
+
+    def serve_counts(request: httpx.Request) -> httpx.Response:
+        """Return the totals for the merge request named in the GraphQL variables."""
+        iid = json.loads(request.content)["variables"]["iid"]
+        return count_response(*open_counts[iid])
+
+    counts = respx.post(GRAPHQL).mock(side_effect=serve_counts)
+
+    # Act
+    result = await call_reply_batch(
+        [
+            {"iid": 2187, "thread_id": "a", "body": "Done", "resolve": True},
+            {"iid": 2188, "thread_id": "b", "body": "Done", "resolve": True},
+            {"iid": 2187, "thread_id": "c", "body": "Done", "resolve": True},
+        ]
+    )
+
+    # Assert
+    assert [json.loads(call.request.content)["variables"]["iid"] for call in counts.calls] == ["2188", "2187"]
+    assert "open_threads" not in result["results"][0]
+    assert [row["open_threads"] for row in result["results"][1:]] == [2, 0]
+
+
+@respx.mock
+async def test_batch_omits_open_threads_when_the_last_resolution_fails(gitlab_env):
+    """An earlier successful resolve gets no count when the MR's last resolve item failed."""
+    # Arrange
+    path = API + "/projects/group%2Fproject/merge_requests/2187/discussions/"
+    respx.post(path + "a/notes").mock(return_value=httpx.Response(201, json={"id": 1}))
+    respx.put(path + "a").mock(return_value=httpx.Response(200, json={"resolved": True}))
+    respx.post(path + "b/notes").mock(return_value=httpx.Response(201, json={"id": 2}))
+    respx.put(path + "b").mock(return_value=httpx.Response(403, json={"message": "Cannot resolve"}))
+    counts = respx.post(GRAPHQL).mock(return_value=count_response(1, 1))
+
+    # Act
+    result = await call_reply_batch(
+        [
+            {"iid": IID, "thread_id": "a", "body": "Done", "resolve": True},
+            {"iid": IID, "thread_id": "b", "body": "Done", "resolve": True},
+        ]
+    )
+
+    # Assert
+    assert [row["status"] for row in result["results"]] == ["applied", "partial"]
+    assert all("open_threads" not in row for row in result["results"])
+    assert counts.call_count == 0
