@@ -177,8 +177,17 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
         (
             "edit_work_item_description",
-            {"project", "iid", "old_text", "new_text"},
-            {"scope"},
+            {"project", "iid"},
+            {
+                "old_text",
+                "new_text",
+                "scope",
+                "return_diff",
+                "edits",
+                "table_cell",
+                "expected_hash",
+                "diff_limit",
+            },
         ),
         ("edit_merge_request_description", {"project", "iid", "old_text", "new_text"}, set()),
         (

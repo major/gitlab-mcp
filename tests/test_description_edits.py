@@ -1,5 +1,6 @@
 """Behavioral tests for exact-text description edits through an in-memory MCP client ✏️."""
 
+import hashlib
 import json
 from typing import Any
 from unittest.mock import Mock
@@ -21,6 +22,7 @@ MR = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/
 WORK_ITEM_ID = "gid://gitlab/WorkItem/123"
 UPDATED = {"data": {"workItemUpdate": {"errors": [], "workItem": {"id": WORK_ITEM_ID}}}}
 RESULT_BUDGET = 1000  # Characters. A big description must not inflate the result.
+WORK_ITEM_DIFF_LIMIT = 1000
 
 
 @pytest.fixture
@@ -244,7 +246,7 @@ async def test_long_changed_lines_are_capped_and_flagged(router):
 
 
 async def test_mr_edit_can_skip_changed_lines(router, monkeypatch):
-    """An applied merge request edit can omit its diff without changing the write or warning."""
+    """An applied merge request edit can omit its diff without changing the write."""
     # Arrange
     put = serve_merge_request(router, "Plan: ship")
     changed_lines = Mock(side_effect=AssertionError("return_diff=false must not compute changed lines"))
@@ -264,7 +266,7 @@ async def test_mr_edit_can_skip_changed_lines(router, monkeypatch):
     assert result["status"] == "applied"
     assert "changed_lines" not in result
     assert result["truncated"] is False
-    assert "compare-and-swap" in result["warning"]
+    assert "warning" not in result
     assert json.loads(put.calls.last.request.content) == {"description": "Plan: launch"}
     changed_lines.assert_not_called()
 
@@ -339,6 +341,7 @@ async def test_mr_write_outcome_is_applied_failed_or_unknown_and_never_retried(r
     assert warning in result["warning"]
     assert "changed_lines" not in result
     assert result["truncated"] is False
+    assert "description_hash" not in result
     assert put.call_count == 1
 
 
@@ -377,7 +380,7 @@ async def test_work_item_edit_writes_exact_global_id_and_full_description(router
 
 
 async def test_work_item_edit_can_skip_changed_lines(router, monkeypatch):
-    """An applied work-item edit can omit its diff while preserving the mutation and warning."""
+    """An applied work-item edit can omit its diff while preserving the mutation."""
     # Arrange
     route = serve_work_item(router, "old line")
     changed_lines = Mock(side_effect=AssertionError("return_diff=false must not compute changed lines"))
@@ -397,7 +400,7 @@ async def test_work_item_edit_can_skip_changed_lines(router, monkeypatch):
     assert result["status"] == "applied"
     assert "changed_lines" not in result
     assert result["truncated"] is False
-    assert "compare-and-swap" in result["warning"]
+    assert "warning" not in result
     assert mutation_variables(route) == [
         {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": "new line"}}}
     ]
@@ -457,6 +460,7 @@ async def test_work_item_write_outcome_is_failed_or_unknown_and_never_retried(ro
     # Assert
     assert result["status"] == status
     assert warning in result["warning"]
+    assert "description_hash" not in result
     assert len(mutation_variables(route)) == 1
 
 
@@ -496,3 +500,181 @@ async def test_work_item_not_found_raises_and_writes_nothing(router):
     # Act / Assert
     with pytest.raises(ToolError, match="Work item #7 not found"):
         await call_tool("edit_work_item_description", project=PROJECT, iid=IID, old_text="a", new_text="b")
+
+
+async def test_work_item_batch_applies_dependent_replacements_in_order(router):
+    """A later batch replacement sees the result of each earlier replacement, with one final write."""
+    # Arrange
+    route = serve_work_item(router, "alpha beta")
+
+    # Act
+    result = await call_tool(
+        "edit_work_item_description",
+        project=PROJECT,
+        iid=IID,
+        edits=[
+            {"old_text": "alpha", "new_text": "gamma"},
+            {"old_text": "gamma", "new_text": "delta"},
+        ],
+    )
+
+    # Assert
+    assert result["status"] == "applied"
+    assert result["description_hash"] == hashlib.sha256(b"delta beta").hexdigest()
+    assert mutation_variables(route) == [
+        {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": "delta beta"}}}
+    ]
+
+
+async def test_work_item_batch_deletion_and_unicode_crlf_hashes(router, monkeypatch):
+    """Batch deletion keeps CRLF bytes intact, and hashes cover exact UTF-8 input and output."""
+    # Arrange
+    before = "Plan 🦊\r\ncafé stays"
+    route = serve_work_item(router, before)
+    changed_lines = Mock(side_effect=AssertionError("diff_limit=0 must not compute changed lines"))
+    monkeypatch.setattr(description_edits_module, "_changed_lines", changed_lines)
+
+    # Act
+    result = await call_tool(
+        "edit_work_item_description",
+        project=PROJECT,
+        iid=IID,
+        edits=[{"old_text": "🦊\r\n", "new_text": ""}, {"old_text": "café", "new_text": "naïve"}],
+        expected_hash=hashlib.sha256(before.encode("utf-8")).hexdigest(),
+        diff_limit=0,
+    )
+
+    # Assert
+    final_description = "Plan naïve stays"
+    assert result["status"] == "applied"
+    assert result["description_hash"] == hashlib.sha256(final_description.encode("utf-8")).hexdigest()
+    assert "changed_lines" not in result
+    assert result["truncated"] is False
+    assert mutation_variables(route) == [
+        {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": final_description}}}
+    ]
+    changed_lines.assert_not_called()
+
+
+async def test_work_item_later_batch_failure_reports_index_and_writes_nothing(router):
+    """A failed later replacement identifies its one-based index and prevents the only mutation."""
+    # Arrange
+    route = serve_work_item(router, "first item")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Edit 2 failed: old_text was not found"):
+        await call_tool(
+            "edit_work_item_description",
+            project=PROJECT,
+            iid=IID,
+            edits=[{"old_text": "first", "new_text": "second"}, {"old_text": "missing", "new_text": "third"}],
+        )
+    assert mutation_variables(route) == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({}, id="no-mode"),
+        pytest.param({"old_text": "one"}, id="legacy-missing-new"),
+        pytest.param({"new_text": "two"}, id="legacy-missing-old"),
+        pytest.param(
+            {"old_text": "one", "new_text": "two", "edits": [{"old_text": "one", "new_text": "two"}]},
+            id="both-modes",
+        ),
+        pytest.param({"edits": []}, id="empty-batch"),
+        pytest.param({"edits": [{"old_text": "", "new_text": "two"}]}, id="empty-old-text"),
+        pytest.param({"edits": [{"old_text": "same", "new_text": "same"}]}, id="replacement-no-op"),
+        pytest.param({"old_text": "one", "new_text": "two", "expected_hash": "A" * 64}, id="bad-hash-format"),
+        pytest.param({"old_text": "one", "new_text": "two", "diff_limit": 4001}, id="diff-limit-too-large"),
+        pytest.param(
+            {"edits": [{"old_text": f"old-{index}", "new_text": f"new-{index}"} for index in range(101)]},
+            id="batch-too-large",
+        ),
+    ],
+)
+async def test_request_independent_invalid_inputs_fail_before_fetch(router, arguments):
+    """Invalid modes and replacement arguments are rejected without reading or writing GitLab data."""
+    # Arrange
+    serve_work_item(router, "some description")
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool("edit_work_item_description", project=PROJECT, iid=IID, **arguments)
+    assert len(router.calls) == 0
+
+
+async def test_replacement_model_forbids_extra_fields_before_fetch(router):
+    """A replacement object cannot silently accept fields outside its old/new text contract."""
+    # Arrange
+    serve_work_item(router, "some description")
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(
+            "edit_work_item_description",
+            project=PROJECT,
+            iid=IID,
+            edits=[{"old_text": "some", "new_text": "other", "ignored": True}],
+        )
+    assert len(router.calls) == 0
+
+
+async def test_batch_net_no_op_and_hash_mismatch_do_not_write(router):
+    """Net-zero batches and a stale original-description hash fail without a mutation."""
+    # Arrange
+    route = serve_work_item(router, "one")
+
+    # Act / Assert: all replacements can succeed and still return the description to its original value.
+    with pytest.raises(ToolError, match="do not change the description"):
+        await call_tool(
+            "edit_work_item_description",
+            project=PROJECT,
+            iid=IID,
+            edits=[{"old_text": "one", "new_text": "two"}, {"old_text": "two", "new_text": "one"}],
+        )
+    assert mutation_variables(route) == []
+
+    # Act / Assert: an otherwise valid but stale guard fails after one fetch and before the write.
+    with pytest.raises(ToolError, match="does not match the current description"):
+        await call_tool(
+            "edit_work_item_description",
+            project=PROJECT,
+            iid=IID,
+            old_text="one",
+            new_text="two",
+            expected_hash=hashlib.sha256(b"stale").hexdigest(),
+        )
+    assert mutation_variables(route) == []
+
+
+async def test_work_item_batch_limit_accepts_100_replacements(router):
+    """The documented batch maximum of 100 replacements can be applied in one mutation."""
+    # Arrange
+    before = "".join(f"|key-{index}|" for index in range(100))
+    edits = [{"old_text": f"|key-{index}|", "new_text": f"|value-{index}|"} for index in range(100)]
+    route = serve_work_item(router, before)
+
+    # Act
+    result = await call_tool("edit_work_item_description", project=PROJECT, iid=IID, edits=edits)
+
+    # Assert
+    expected = "".join(f"|value-{index}|" for index in range(100))
+    assert result["status"] == "applied"
+    assert len(mutation_variables(route)) == 1
+    assert mutation_variables(route)[0]["input"]["descriptionWidget"]["description"] == expected
+
+
+async def test_work_item_diff_uses_default_1000_character_limit(router):
+    """The work-item default bounds the returned diff at 1000 characters while preserving the full write."""
+    # Arrange
+    before = "old" + "x" * 2500
+    route = serve_work_item(router, before)
+
+    # Act
+    result = await call_tool("edit_work_item_description", project=PROJECT, iid=IID, old_text="old", new_text="new")
+
+    # Assert
+    assert len(result["changed_lines"]) == WORK_ITEM_DIFF_LIMIT
+    assert result["truncated"] is True
+    assert mutation_variables(route)[0]["input"]["descriptionWidget"]["description"] == "new" + "x" * 2500
