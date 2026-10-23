@@ -351,6 +351,45 @@ async def test_unapprove_posts_to_the_unapprove_endpoint(gitlab_env, router):
     assert data["applied"] == ["unapprove"]
 
 
+@pytest.mark.parametrize(
+    ("arguments", "route", "status", "reason"),
+    [
+        ({"approve": True, "sha": SHA}, "approve", 401, "you are its author"),
+        ({"approve": False}, "unapprove", 404, "You have not approved this MR."),
+    ],
+)
+async def test_approval_refusals_get_a_clear_reason(router, arguments, route, status, reason):
+    """GitLab's 401 on approve and 404 on unapprove are normal refusals, not a bad token or a missing MR."""
+    # Arrange
+    routes = serve_writes(router)
+    routes[route].mock(return_value=httpx.Response(status, json={"message": f"{status} error"}))
+
+    # Act
+    data = await call_tool(title="New", **arguments)
+
+    # Assert
+    message = data["failed"][route]
+    assert message.startswith(f"GitLab returned HTTP {status}. ")
+    assert reason in message
+    assert "token" not in message
+
+
+@pytest.mark.parametrize("marker", ["mergeRequestSetReviewers", "mergeRequestSetAssignees"])
+async def test_people_mutations_declare_a_non_null_username_list(gitlab_env, router, marker):
+    """GitLab rejects a nullable `[String!]` variable for the username argument, so it must be `[String!]!`."""
+    # Arrange
+    routes = serve_writes(router)
+    kind = "reviewers" if "Reviewers" in marker else "assignees"
+
+    # Act
+    await call_tool(**{f"add_{kind}": ["alice"]})
+
+    # Assert
+    queries = [operation(call.request) for call in routes["graphql"].calls if marker in operation(call.request)]
+    assert len(queries) == 1
+    assert "$usernames: [String!]!" in queries[0]
+
+
 async def test_rebase_is_pending_not_applied(gitlab_env, router):
     """A rebase is accepted, so it is pending, and never applied."""
     # Arrange

@@ -1186,7 +1186,7 @@ mutation($projectPath: ID!, $iid: String!, $draft: Boolean!) {
 """
 
 REVIEWERS_MUTATION = """
-mutation($projectPath: ID!, $iid: String!, $usernames: [String!], $mode: MutationOperationMode) {
+mutation($projectPath: ID!, $iid: String!, $usernames: [String!]!, $mode: MutationOperationMode) {
   mergeRequestSetReviewers(
     input: {projectPath: $projectPath, iid: $iid, reviewerUsernames: $usernames, operationMode: $mode}
   ) {
@@ -1196,7 +1196,7 @@ mutation($projectPath: ID!, $iid: String!, $usernames: [String!], $mode: Mutatio
 """
 
 ASSIGNEES_MUTATION = """
-mutation($projectPath: ID!, $iid: String!, $usernames: [String!], $mode: MutationOperationMode) {
+mutation($projectPath: ID!, $iid: String!, $usernames: [String!]!, $mode: MutationOperationMode) {
   mergeRequestSetAssignees(
     input: {projectPath: $projectPath, iid: $iid, assigneeUsernames: $usernames, operationMode: $mode}
   ) {
@@ -1222,6 +1222,13 @@ query($fullPath: ID!, $iid: String!) {
   }
 }
 """
+
+# Reasons that replace the generic HTTP hint for one step. Seen live on GitLab 19.2:
+# approving your own MR gives 401 (not a bad token), and unapproving when you never approved gives 404.
+STEP_STATUS_REASONS = {
+    ("approve", 401): "You may not approve this MR, for example because you are its author.",
+    ("unapprove", 404): "You have not approved this MR.",
+}
 
 # Blocks per page on the REST blocks endpoint. The largest page GitLab serves.
 BLOCKS_PAGE_SIZE = 100
@@ -1435,6 +1442,10 @@ class _Update:
             await action
         except GitLabConnectionError:
             self.unknown.append(name)
+        except GitLabAPIError as exc:
+            # Some steps reuse a status for a common, harmless case. The generic hint would mislead there. 🧭
+            reason = STEP_STATUS_REASONS.get((name, exc.status))
+            self.failed[name] = f"GitLab returned HTTP {exc.status}. {reason}" if reason else str(exc)
         except ToolError as exc:
             self.failed[name] = str(exc)
         else:
