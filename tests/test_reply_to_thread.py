@@ -30,6 +30,13 @@ async def call_reply(**arguments: Any) -> dict[str, Any]:
     return result.structured_content
 
 
+async def call_reply_batch(replies: list[dict[str, Any]]) -> dict[str, Any]:
+    """Call reply_to_threads through the in-memory MCP client."""
+    async with Client(mcp) as client:
+        result = await client.call_tool("reply_to_threads", {"project": PROJECT, "replies": replies})
+    return result.structured_content
+
+
 @respx.mock
 async def test_posts_reply_and_returns_only_the_note_id(gitlab_env):
     """A reply uses the notes endpoint and does not include the note body in its result."""
@@ -238,3 +245,147 @@ async def test_tool_is_a_non_idempotent_write_and_has_user_approval_guidance(git
     assert "glab mr note create --reply" in tool.description
     assert "glab mr note resolve" in tool.description
     assert "approval" in tool.description.lower()
+
+
+@respx.mock
+async def test_batch_continues_after_success_failure_and_unknown_write(gitlab_env):
+    """Every item is reported and later items run after definite or uncertain errors."""
+    # Arrange
+    calls: list[int] = []
+    routes = [
+        respx.post(API + f"/projects/group%2Fproject/merge_requests/{iid}/discussions/thread/notes").mock(
+            side_effect=lambda request, requested_iid=iid, response_status=status, response_body=response: (
+                calls.append(requested_iid),
+                httpx.Response(response_status, json=response_body),
+            )[1]
+        )
+        for iid, status, response in [
+            (2187, 201, {"id": 11}),
+            (2188, 403, {"message": "Not allowed"}),
+            (2189, 503, {"message": "Server error"}),
+            (2190, 201, {"id": 44}),
+        ]
+    ]
+    replies = [{"iid": iid, "thread_id": "thread", "body": f"reply {iid}"} for iid in (2187, 2188, 2189, 2190)]
+
+    # Act
+    result = await call_reply_batch(replies)
+
+    # Assert
+    assert [route.calls.call_count for route in routes] == [1, 1, 1, 1]
+    assert calls == [2187, 2188, 2189, 2190]
+    assert [(row["iid"], row["thread_id"], row["status"], row["resolved"]) for row in result["results"]] == [
+        (2187, "thread", "applied", None),
+        (2188, "thread", "failed", None),
+        (2189, "thread", "unknown", None),
+        (2190, "thread", "applied", None),
+    ]
+    assert "unknown" not in result["results"][1]["warning"].lower()
+    assert "outcome is unknown" in result["results"][2]["warning"].lower()
+
+
+@respx.mock
+async def test_batch_keeps_cross_merge_request_writes_in_input_order(gitlab_env):
+    """Each MR reply and resolve pair runs before the next input item."""
+    # Arrange
+    calls: list[tuple[str, int]] = []
+    replies = [
+        {"iid": 2187, "thread_id": "first", "body": "first", "resolve": True},
+        {"iid": 2188, "thread_id": "second", "body": "second", "resolve": True},
+    ]
+    for iid, thread_id in ((2187, "first"), (2188, "second")):
+        path = API + f"/projects/group%2Fproject/merge_requests/{iid}/discussions/{thread_id}"
+        respx.post(path + "/notes").mock(
+            side_effect=lambda request, requested_iid=iid: (
+                calls.append(("reply", requested_iid)),
+                httpx.Response(201, json={"id": requested_iid}),
+            )[1]
+        )
+        respx.put(path).mock(
+            side_effect=lambda request, requested_iid=iid: (
+                calls.append(("resolve", requested_iid)),
+                httpx.Response(200, json={"resolved": True}),
+            )[1]
+        )
+
+    # Act
+    result = await call_reply_batch(replies)
+
+    # Assert
+    assert calls == [("reply", 2187), ("resolve", 2187), ("reply", 2188), ("resolve", 2188)]
+    assert [row["status"] for row in result["results"]] == ["applied", "applied"]
+    assert [row["resolved"] for row in result["results"]] == [True, True]
+
+
+@pytest.mark.parametrize("count", [0, 21])
+@respx.mock
+async def test_batch_size_bounds_reject_before_writes(gitlab_env, count):
+    """The batch requires 1 to 20 entries and validates bounds before network access."""
+    # Act / Assert
+    replies = [{"iid": IID, "thread_id": "thread", "body": "reply"}] * count
+    with pytest.raises(ToolError):
+        await call_reply_batch(replies)
+    assert not respx.calls
+
+
+@pytest.mark.parametrize(
+    "invalid_reply",
+    [
+        {"iid": 2188, "thread_id": " ", "body": "reply"},
+        {"iid": 2188, "thread_id": "thread", "body": "  "},
+        {"iid": 2188, "thread_id": "thread"},
+    ],
+)
+@respx.mock
+async def test_batch_validates_every_item_before_any_write(gitlab_env, invalid_reply):
+    """An invalid later input prevents earlier batch entries from being written."""
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_reply_batch(
+            [
+                {"iid": 2187, "thread_id": "thread", "body": "valid"},
+                invalid_reply,
+            ]
+        )
+    assert not respx.calls
+
+
+@respx.mock
+async def test_batch_connection_error_is_unknown_and_later_items_continue(gitlab_env):
+    """A lost connection marks only that item unknown and does not stop later writes."""
+    # Arrange
+    unknown = respx.post(API + "/projects/group%2Fproject/merge_requests/2187/discussions/thread/notes").mock(
+        side_effect=httpx.ConnectError("connection reset")
+    )
+    success = respx.post(API + "/projects/group%2Fproject/merge_requests/2188/discussions/thread/notes").mock(
+        return_value=httpx.Response(201, json={"id": 12})
+    )
+
+    # Act
+    result = await call_reply_batch(
+        [
+            {"iid": 2187, "thread_id": "thread", "body": "possibly posted"},
+            {"iid": 2188, "thread_id": "thread", "body": "continue"},
+        ]
+    )
+
+    # Assert
+    assert unknown.calls.call_count == success.calls.call_count == 1
+    assert [row["status"] for row in result["results"]] == ["unknown", "applied"]
+    assert "outcome is unknown" in result["results"][0]["warning"].lower()
+
+
+@respx.mock
+async def test_batch_resolution_5xx_is_unknown_not_failed(gitlab_env):
+    """A swallowed single-tool resolution warning is corrected to an uncertain batch outcome."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    resolve = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(503, json={"message": "Server error"}))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply", "resolve": True}])
+
+    # Assert
+    assert note.calls.call_count == resolve.calls.call_count == 1
+    assert result["results"][0]["status"] == "unknown"
+    assert "resolution outcome is unknown" in result["results"][0]["warning"].lower()

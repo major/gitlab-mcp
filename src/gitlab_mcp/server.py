@@ -488,6 +488,45 @@ class ThreadReplyResult(BaseModel):
     warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
+class ThreadReplyRequest(BaseModel):
+    """One validated reply or resolution in a batch."""
+
+    iid: Iid = Field(description="Merge request IID containing this thread.")
+    thread_id: str = Field(description="Discussion ID, or a full GitLab discussion GID.")
+    body: str | None = Field(default=None, description="Reply text. Omit only when resolving the thread.")
+    resolve: bool = Field(default=False, description="Resolve after replying, or resolve without a reply.")
+
+    @model_validator(mode="after")
+    def validate_reply(self) -> ThreadReplyRequest:
+        """Reject malformed entries before any batch item can be written."""
+        if not _bare_id(self.thread_id).strip():
+            raise ValueError("thread_id must not be empty")  # noqa: TRY003
+        if self.body is not None and not self.body.strip():
+            raise ValueError("body must not be empty or whitespace")  # noqa: TRY003
+        if self.body is None and not self.resolve:
+            raise ValueError("Provide a reply body or set resolve=True")  # noqa: TRY003
+        return self
+
+
+ThreadReplyBatchStatus = Literal["applied", "partial", "failed", "unknown"]
+
+
+class ThreadReplyBatchItem(BaseModel):
+    """The compact outcome for one requested thread reply."""
+
+    iid: int
+    thread_id: str
+    status: ThreadReplyBatchStatus
+    resolved: bool | None
+    warning: str = Field(default="", exclude_if=lambda value: not value)
+
+
+class ThreadReplyBatchResult(BaseModel):
+    """Ordered outcomes for a batch of thread replies."""
+
+    results: list[ThreadReplyBatchItem]
+
+
 class DiffSummary(BaseModel):
     """Diff size totals."""
 
@@ -1790,6 +1829,87 @@ async def reply_to_thread(  # noqa: C901, PLR0913, PLR0917 - user-facing inputs 
             )
 
     return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=True if resolve else None)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def reply_to_threads(
+    ctx: Context,
+    project: Project,
+    replies: Annotated[
+        list[ThreadReplyRequest],
+        Field(min_length=1, max_length=20, description="One to 20 thread replies or resolutions, in write order."),
+    ],
+) -> ThreadReplyBatchResult:
+    """Reply to or resolve up to 20 review threads in order.
+
+    Like `glab mr note create --reply` and `glab mr note resolve`. Get user approval before posting. Each item uses
+    the same reply and resolution behavior as `reply_to_thread`; items run sequentially, and a failed item does not
+    stop later items or roll back successful writes. Writes are never retried. Check each status and warning before
+    deciding what to do next, especially when an outcome is unknown.
+    """
+    results: list[ThreadReplyBatchItem] = []
+    for reply in replies:
+        thread_id = _bare_id(reply.thread_id)
+        try:
+            outcome = await reply_to_thread(
+                ctx,
+                project,
+                reply.iid,
+                reply.thread_id,
+                reply.body,
+                reply.resolve,
+            )
+        except ToolError as exc:
+            uncertain = (
+                isinstance(exc, GitLabConnectionError)
+                or (
+                    isinstance(exc, GitLabAPIError)
+                    and (exc.status == HTTP_REQUEST_TIMEOUT or exc.status >= HTTP_SERVER_ERROR)
+                )
+                or "outcome is unknown" in str(exc).lower()
+            )
+            warning = str(exc)
+            if uncertain and "outcome is unknown" not in warning.lower():
+                warning = f"Write outcome is unknown: {warning} Check get_merge_request_threads before retrying."
+            results.append(
+                ThreadReplyBatchItem(
+                    iid=reply.iid,
+                    thread_id=thread_id,
+                    status="unknown" if uncertain else "failed",
+                    resolved=None,
+                    warning=warning,
+                )
+            )
+            continue
+
+        warning = outcome.warning
+        uncertain_resolution = bool(re.search(r"GitLab returned HTTP (?:408|5\d\d)\b", warning))
+        if uncertain_resolution:
+            # The single tool reports all resolution ToolErrors as failures, but a timeout or 5xx can hide a write.
+            warning = warning.replace("resolution failed:", "resolution outcome is unknown:")
+        if uncertain_resolution or "outcome is unknown" in warning.lower():
+            status: ThreadReplyBatchStatus = "unknown"
+        elif warning:
+            status = "partial"
+        else:
+            status = "applied"
+        results.append(
+            ThreadReplyBatchItem(
+                iid=reply.iid,
+                thread_id=outcome.thread_id,
+                status=status,
+                resolved=outcome.resolved,
+                warning=warning,
+            )
+        )
+    return ThreadReplyBatchResult(results=results)
 
 
 def _new_line_ranges(diff: str) -> list[tuple[int, int]]:

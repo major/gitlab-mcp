@@ -26,3 +26,9 @@ or note bodies. It counts both states regardless of `state`, and cannot be combi
 
 The `ids` thread filter is available only with a single `iid`. It is rejected with batch `iids` because one thread ID
 can be ambiguous across merge requests.
+
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
