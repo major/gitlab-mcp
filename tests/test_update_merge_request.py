@@ -22,7 +22,14 @@ SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA, because approval n
 KNOWN_USERS = ("alice", "bob")
 MUTATION_PAYLOADS = ("mergeRequestSetDraft", "mergeRequestSetReviewers", "mergeRequestSetAssignees")
 GRAPHQL_MARKERS = ("users(", *MUTATION_PAYLOADS, "mergeRequest(")
-READ_BACK = {"state": "opened", "draft": False, "detailedMergeStatus": "MERGEABLE", "diffRefs": {"headSha": SHA}}
+READ_BACK = {
+    "state": "opened",
+    "draft": False,
+    "detailedMergeStatus": "MERGEABLE",
+    "diffRefs": {"headSha": SHA},
+    "reviewers": {"nodes": []},
+    "assignees": {"nodes": []},
+}
 
 
 @pytest.fixture
@@ -663,16 +670,98 @@ async def test_final_state_comes_from_a_reread(gitlab_env, router):
     }
 
 
+async def test_final_readback_returns_requested_people_and_empty_cleared_list(gitlab_env, router):
+    """Requested people lists come from the final read-back, including an empty cleared list."""
+    # Arrange
+    routes = serve_writes(
+        router,
+        replies={
+            "mergeRequest(": mr_body(
+                reviewers={"nodes": [{"username": "alice"}]},
+                assignees={"nodes": []},
+            )
+        },
+    )
+
+    # Act
+    data = await call_tool(add_reviewers=["alice"], remove_assignees=["bob"])
+
+    # Assert
+    assert len(graphql_calls(routes["graphql"], "mergeRequest(")) == 1
+    assert data["reviewers"] == ["alice"]
+    assert data["assignees"] == []
+
+
+async def test_final_readback_omits_unrequested_people_lists(gitlab_env, router):
+    """The result does not include a people list unless that list was requested to change."""
+    # Arrange
+    serve_writes(
+        router,
+        replies={"mergeRequest(": mr_body(assignees={"nodes": [{"username": "bob"}]})},
+    )
+
+    # Act
+    data = await call_tool(add_reviewers=["alice"])
+
+    # Assert
+    assert data["reviewers"] == []
+    assert "assignees" not in data
+
+
+@pytest.mark.parametrize("kind", ["reviewers", "assignees"])
+@pytest.mark.parametrize(
+    "connection",
+    [
+        None,
+        {"nodes": None},
+        {"nodes": {}},
+        {"nodes": [None]},
+        {"nodes": [{}]},
+        {"nodes": [{"username": None}]},
+        {"nodes": [{"username": 5}]},
+        {"nodes": [{"username": ""}]},
+        {"nodes": [{"username": "  "}]},
+    ],
+    ids=[
+        "missing-connection",
+        "missing-nodes",
+        "nodes-dict",
+        "node-none",
+        "missing-username",
+        "null-username",
+        "nonstring-username",
+        "blank-username",
+        "whitespace-username",
+    ],
+)
+async def test_final_readback_omits_unverified_people_lists(gitlab_env, router, kind, connection):
+    """Malformed or missing final people connections are not returned as verified lists."""
+    # Arrange
+    serve_writes(
+        router,
+        replies={"mergeRequest(": mr_body(**{kind: connection})},
+    )
+
+    # Act
+    argument = f"add_{kind}"
+    data = await call_tool(**{argument: ["alice"]})
+
+    # Assert
+    assert kind not in data
+
+
 async def test_failed_reread_keeps_the_outcomes_and_adds_a_warning(gitlab_env, router):
     """A failed re-read keeps the outcomes and adds a warning."""
     # Arrange
     serve_writes(router, replies={"mergeRequest(": httpx.Response(500, json={"message": "Boom"})})
 
     # Act
-    data = await call_tool(title="New")
+    data = await call_tool(title="New", add_reviewers=["alice"], remove_assignees=["bob"])
 
     # Assert
-    assert data["applied"] == ["fields"]
+    assert data["applied"] == ["fields", "add_reviewers", "remove_assignees"]
     assert "state" not in data
     assert "head_sha" not in data
+    assert "reviewers" not in data
+    assert "assignees" not in data
     assert data["warning"].startswith("Could not read the merge request back")
