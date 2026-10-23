@@ -1,5 +1,6 @@
 """FastMCP server with GitLab tools for fast developer workflows 🚀."""
 
+import asyncio
 import base64
 import json
 import os
@@ -3027,6 +3028,8 @@ query($fullPath: ID!, $iid: String!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
       state detailedMergeStatus autoMergeStrategy mergeCommitSha
+      diffRefs { headSha }
+      headPipeline { status }
     }
   }
 }
@@ -3041,6 +3044,9 @@ class MergeRequestLanding(BaseModel):
     merge_status: str = Field(default="", exclude_if=lambda v: not v)  # GitLab's detailed status, lowercased.
     auto_merge_strategy: str = Field(default="", exclude_if=lambda v: not v)  # Lowercased.
     merge_commit_sha: str = Field(default="", exclude_if=lambda v: not v)
+    # The head SHA GitLab queued or merged. Only auto and now fill it, so cancel keeps its shorter shape.
+    head_sha: str = Field(default="", exclude_if=lambda v: not v)
+    pipeline_status: str = Field(default="", exclude_if=lambda v: not v)  # Head pipeline status, lowercased.
     warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the write worked but the read did not.
 
 
@@ -3131,14 +3137,23 @@ def _land_result(mode: LandMode, node: dict[str, Any]) -> LandResult:
 
 
 def _to_landing(mode: LandMode, node: dict[str, Any]) -> MergeRequestLanding:
-    """Convert the read-back state into the landing result."""
-    return MergeRequestLanding(
-        result=_land_result(mode, node),
-        state=node["state"],
-        merge_status=_lower(node["detailedMergeStatus"]),
-        auto_merge_strategy=_lower(node["autoMergeStrategy"]),
-        merge_commit_sha=node["mergeCommitSha"] or "",
-    )
+    """Convert the read-back state into the landing result.
+
+    Cancel leaves out the head SHA and pipeline status. Its result only says what the queue looks like now.
+    """
+    fields: dict[str, Any] = {
+        "result": _land_result(mode, node),
+        "state": node["state"],
+        "merge_status": _lower(node["detailedMergeStatus"]),
+        "auto_merge_strategy": _lower(node["autoMergeStrategy"]),
+        "merge_commit_sha": node["mergeCommitSha"] or "",
+    }
+    if mode != "cancel":
+        # A null headPipeline means the head has no pipeline, so the status stays empty and is left out.
+        pipeline = node["headPipeline"] or {}
+        fields["head_sha"] = _head_sha(node["diffRefs"])
+        fields["pipeline_status"] = _lower(pipeline.get("status"))
+    return MergeRequestLanding(**fields)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
@@ -3164,6 +3179,7 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
     - `cancel`: leave the merge train or cancel auto-merge. Takes no `sha`, `squash`, or `remove_source_branch`.
     - Get `sha` from get_merge_request. GitLab refuses the merge with 409 when the head has moved.
     - `result`: `merge_train`, `auto_merge`, `merged`, `cancelled`, or `pending`. Use get_merge_request to see blockers.
+    - `auto` and `now` also return `head_sha` and `pipeline_status`, so you can confirm which commit was queued.
     - A refused merge (405, 406, 409, 422) says to check blockers. Never retry a failed write without checking first.
     """
     _check_land_args(mode, sha, squash, remove_source_branch)
@@ -3269,6 +3285,9 @@ STEP_STATUS_REASONS = {
 BLOCKS_PAGE_SIZE = 100
 # Labels per page on the project labels endpoint. The largest page GitLab serves.
 PROJECT_LABELS_PAGE_SIZE = 100
+# A rebase is watched for about 10 seconds: poll this many times, waiting this long before each poll. ⏱️
+REBASE_POLL_ATTEMPTS = 5
+REBASE_POLL_DELAY = 2.0
 
 
 class MergeRequestUpdate(BaseModel):
@@ -3276,7 +3295,7 @@ class MergeRequestUpdate(BaseModel):
 
     # GitLab confirmed these changes.
     applied: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
-    # GitLab accepted these, but the work is not done yet. Rebase runs in the background.
+    # GitLab accepted these, but they were still running when the wait ended. Check get_merge_request later.
     pending: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     # The write may have reached GitLab. Check with get_merge_request. Do not retry blindly.
     unknown: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
@@ -3309,6 +3328,11 @@ class SearchAndNamesError(ToolError):
     def __init__(self) -> None:
         """Tell the agent to pass only one of the two filters."""
         super().__init__("Pass either search or names to list_labels, not both.")
+
+
+async def _wait(seconds: float) -> None:
+    """Pause for `seconds`. It is a module-level function, so tests can replace it with a no-op."""
+    await asyncio.sleep(seconds)
 
 
 class NothingToUpdateError(ToolError):
@@ -3674,9 +3698,46 @@ class _Update:
             await self.attempt("unapprove", self.client.request("POST", f"{self.path}/unapprove"))
 
     async def _rebase(self) -> None:
-        """Ask GitLab to rebase. GitLab accepts the job and works on it later, so the result is pending."""
-        if self.changes.rebase:
-            await self.attempt("rebase", self.client.request("PUT", f"{self.path}/rebase"), accepted=self.pending)
+        """Ask GitLab to rebase, then watch the job for about 10 seconds.
+
+        GitLab accepts a rebase even when it will fail later, so the conflicts flag is
+        checked first. An MR with conflicts is never sent to the rebase endpoint. 🧯
+        """
+        if not self.changes.rebase:
+            return
+        try:
+            mr = await self.client.get(self.path)
+        except ToolError as exc:
+            self.failed["rebase"] = str(exc)
+            return
+        if mr.get("has_conflicts"):
+            self.failed["rebase"] = "GitLab cannot rebase this MR because it has conflicts. Rebase locally and push."
+            return
+        await self.attempt("rebase", self.client.request("PUT", f"{self.path}/rebase"), accepted=self.pending)
+        if "rebase" in self.pending:
+            await self._watch_rebase()
+
+    async def _watch_rebase(self) -> None:
+        """Poll until GitLab finishes the rebase, or until the wait runs out.
+
+        A finished rebase moves from `pending` to `applied`, or to `failed` with GitLab's
+        `merge_error`. A failed poll leaves it pending, because GitLab already accepted the write.
+        """
+        for _ in range(REBASE_POLL_ATTEMPTS):
+            await _wait(REBASE_POLL_DELAY)
+            try:
+                mr = await self.client.get(self.path, include_rebase_in_progress=True)
+            except ToolError:
+                return
+            # A missing flag counts as still running, so an unclear answer never reads as success.
+            if mr.get("rebase_in_progress", True):
+                continue
+            self.pending.remove("rebase")
+            if mr.get("merge_error"):
+                self.failed["rebase"] = mr["merge_error"]
+            else:
+                self.applied.append("rebase")
+            return
 
 
 @mcp.tool(
@@ -3720,7 +3781,11 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     source branch. An approval can let an auto-merge that is already enabled go through.
 
     - Several changes go in one call. Each step runs even when an earlier step failed.
-    - `applied`: GitLab confirmed the change. `pending`: GitLab accepted a rebase, but it is not done yet.
+    - `applied`: GitLab confirmed the change. `pending`: the rebase was still running after about 10 seconds.
+      Check get_merge_request later. A rebase reports `applied` with the new `head_sha`,
+      or `failed` with GitLab's reason.
+    - A rebase on an MR with conflicts fails right away and is never sent, because GitLab cannot rebase it.
+      Rebase locally and push instead.
     - `unknown`: the request may have reached GitLab. Check with get_merge_request. Do not retry blindly.
     - `failed` maps each step or item to a reason. Items look like `reviewers:bob` (unknown user) or `blocked_by:12`.
     - `approve` needs `sha`, the full `head_sha` from get_merge_request. Approve in its own call, because
