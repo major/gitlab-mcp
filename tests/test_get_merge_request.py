@@ -498,6 +498,48 @@ async def test_open_thread_ref_drops_empty_and_repeated_fields(gitlab_env, note_
     assert data["threads"]["open"] == [{"id": "open"} | expected]
 
 
+@pytest.mark.parametrize(
+    ("author", "expected"),
+    [
+        (
+            {"username": "review-bot", "bot": True, "name": "****", "id": "gid://gitlab/User/123456"},
+            "bot:123456",
+        ),
+        (
+            {"username": "review-bot", "bot": True, "name": "Review Assistant", "id": "gid://gitlab/User/123456"},
+            "Review Assistant",
+        ),
+        ({"username": "alice", "bot": False, "name": "Alice Example", "id": "gid://gitlab/User/42"}, "alice"),
+        (None, None),
+    ],
+    ids=["short-bot", "named-bot", "human", "deleted-author"],
+)
+@respx.mock
+async def test_thread_index_displays_bot_authors_without_exposing_long_username(gitlab_env, author, expected):
+    """Thread index display uses compact bot labels and leaves human usernames unchanged."""
+    # Arrange
+    note = make_note(position=POSITION) | {"author": author}
+    route = respx.post(GRAPHQL).mock(
+        return_value=graphql_response(
+            make_mr(
+                resolvableDiscussionsCount=1,
+                discussions=make_discussions(make_discussion("open", note=note)),
+            ),
+        ),
+    )
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    expected_fields = {"by": expected} if expected is not None else {}
+    assert data["threads"]["open"] == [
+        {"id": "open", "notes": 1, "path": "docs/sop.md", "line": 212} | expected_fields,
+    ]
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "author { username bot name id }" in query
+
+
 @respx.mock
 async def test_thread_index_lists_only_open_human_threads(gitlab_env):
     """Only resolvable, unresolved threads that start with a human note are listed."""

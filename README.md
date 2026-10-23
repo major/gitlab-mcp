@@ -16,6 +16,17 @@ instead of claiming the diff is unchanged. Files removed from the current merge 
 patch and a warning because they have no current comment anchors. When a patch result includes `next_cursor`, pass it
 back with the same `since_sha` and requested paths. Cursors are rejected if those inputs or the latest head change.
 
+## Merge request thread triage
+
+Use `get_merge_request_threads` for a compact review view: `view="full"` returns capped note bodies, `view="headings"`
+returns root-note headings without bodies, and `view="finding"` trims separate greetings and signoffs from bot notes
+that contain numbered findings. `count_only=true` returns exact `open` and `resolved` totals without fetching threads
+or note bodies. It counts both states regardless of `state`, and cannot be combined with `cursor`, `ids`, `file`, or
+`author`. For batch calls, count results include each `iid` and missing merge requests remain in `missing_iids`.
+
+The `ids` thread filter is available only with a single `iid`. It is rejected with batch `iids` because one thread ID
+can be ambiguous across merge requests.
+
 ## Tools
 
 | Tool | Description |

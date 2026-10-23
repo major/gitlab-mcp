@@ -15,6 +15,7 @@ from gitlab_mcp.server import (
     MAX_BATCH_MERGE_REQUESTS,
     MAX_PAGES,
     NOTE_CAP,
+    THREAD_CUT_MARKER,
     THREAD_HEADING_BUDGET,
     THREAD_HEADING_CAP,
     mcp,
@@ -72,10 +73,41 @@ def make_discussion(
     }
 
 
-def page(*discussions: dict[str, Any], has_next: bool = False, end_cursor: str | None = None) -> dict[str, Any]:
-    """Build one GraphQL response body with a page of discussions."""
+def page(  # noqa: PLR0913 - optional MR fields keep GraphQL response fixtures readable.
+    *discussions: dict[str, Any],
+    has_next: bool = False,
+    end_cursor: str | None = None,
+    source_branch: str | None = None,
+    head_sha: str | None = None,
+    merge_status: str | None = None,
+    pipeline_status: str | None = None,
+) -> dict[str, Any]:
+    """Build one GraphQL response body with discussions and optional MR status fields."""
     connection = {"pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}, "nodes": list(discussions)}
-    return {"data": {"project": {"mergeRequest": {"discussions": connection}}}}
+    merge_request = {"discussions": connection}
+    if source_branch is not None:
+        merge_request["sourceBranch"] = source_branch
+    if head_sha is not None:
+        merge_request["diffRefs"] = {"headSha": head_sha}
+    if merge_status is not None:
+        merge_request["detailedMergeStatus"] = merge_status
+    if any(value is not None for value in (source_branch, head_sha, merge_status, pipeline_status)):
+        merge_request["headPipeline"] = {"status": pipeline_status} if pipeline_status is not None else None
+    return {"data": {"project": {"mergeRequest": merge_request}}}
+
+
+def counts_page(total: int, resolved: int) -> dict[str, Any]:
+    """Build a GraphQL response with exact merge request discussion totals."""
+    return {
+        "data": {
+            "project": {
+                "mergeRequest": {
+                    "resolvableDiscussionsCount": total,
+                    "resolvedDiscussionsCount": resolved,
+                },
+            },
+        },
+    }
 
 
 def respond(body: dict[str, Any]) -> httpx.Response:
@@ -305,27 +337,15 @@ async def test_filters_and_headings_apply_to_every_batch_result(gitlab_env):
 
 
 @respx.mock
-async def test_thread_ids_and_missing_ids_are_evaluated_per_merge_request(gitlab_env):
-    """The shared thread ID filter selects independently, and each MR reports its own absent IDs."""
-
+async def test_batch_rejects_thread_ids_before_network(gitlab_env):
+    """Thread IDs are ambiguous across MRs, so the filter is limited to single-IID calls."""
     # Arrange
-    def handler(request: httpx.Request) -> httpx.Response:
-        iid = json.loads(request.content)["variables"]["iid"]
-        discussion_id = "wanted" if iid == "5" else "other"
-        return respond(page(make_discussion(discussion_id)))
+    route = respx.post(GRAPHQL).mock(return_value=respond(page()))
 
-    respx.post(GRAPHQL).mock(side_effect=handler)
-
-    # Act
-    data = await call_tool(iids=[5, 8], ids=["wanted"])
-
-    # Assert
-    first, second = data["merge_requests"]
-    assert [result["iid"] for result in data["merge_requests"]] == [5, 8]
-    assert thread_ids(first) == ["wanted"]
-    assert "not_found_ids" not in first
-    assert second["threads"] == []
-    assert second["not_found_ids"] == ["wanted"]
+    # Act / Assert
+    with pytest.raises(ToolError, match="ids can only be used with a single iid"):
+        await call_tool(iids=[5, 8], ids=["wanted"])
+    assert route.call_count == 0
 
 
 @respx.mock
@@ -382,6 +402,218 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
             },
         ],
     }
+
+
+@pytest.mark.parametrize("view", ["full", "headings"])
+@respx.mock
+async def test_bot_author_display_is_compact_and_filter_uses_username(gitlab_env, view):
+    """Bot labels stay compact in every view while author filters use their original usernames."""
+    # Arrange
+    root = make_note(
+        "## Root bot note",
+        created_at="2026-10-20T12:00:00Z",
+    ) | {"author": {"username": "review-bot", "bot": True, "name": "****", "id": "gid://gitlab/User/123"}}
+    latest = make_note("Bot reply", created_at="2026-10-21T12:00:00Z") | {
+        "author": {
+            "username": "review-bot-reply",
+            "bot": True,
+            "name": "Review Reply Bot",
+            "id": "gid://gitlab/User/987",
+        },
+    }
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("bot-thread", root, latest))))
+
+    # Act
+    data = await call_tool(author="review-bot", view=view)
+    short_name_filter = await call_tool(author="bot:123", view=view)
+
+    # Assert
+    assert thread_ids(data) == ["bot-thread"]
+    if view == "full":
+        assert [note["by"] for note in data["threads"][0]["notes"]] == ["bot:123", "Review Reply Bot"]
+    else:
+        assert data["threads"][0]["by"] == "bot:123"
+        assert data["threads"][0]["last_by"] == "Review Reply Bot"
+    assert short_name_filter["threads"] == []
+    query = json.loads(route.calls[0].request.content)["query"]
+    assert "author { username bot name id }" in query
+
+
+@respx.mock
+async def test_returns_single_merge_request_triage_headers_with_headings(gitlab_env):
+    """The thread call returns compact MR status with its existing heading metadata in one query."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=respond(
+            page(
+                make_discussion("t1", make_note("## Fix the parser", author="alice")),
+                source_branch="feature/parser",
+                head_sha="a" * 40,
+                merge_status="CLEAN",
+                pipeline_status="SUCCESS",
+            ),
+        ),
+    )
+
+    # Act
+    data = await call_tool(view="headings")
+
+    # Assert
+    assert {key: data[key] for key in ("head_sha", "source_branch", "merge_status", "pipeline_status")} == {
+        "head_sha": "a" * 40,
+        "source_branch": "feature/parser",
+        "merge_status": "clean",
+        "pipeline_status": "success",
+    }
+    assert data["threads"][0]["heading"] == "Fix the parser"
+    assert route.call_count == 1
+    query = json.loads(route.calls[0].request.content)["query"]
+    assert "sourceBranch" in query
+    assert "diffRefs { headSha }" in query
+    assert "detailedMergeStatus" in query
+    assert "headPipeline { status }" in query
+
+
+@respx.mock
+async def test_returns_triage_headers_for_each_batch_entry_and_omits_absent_pipeline(gitlab_env):
+    """Batch entries carry their own compact MR status, and a missing pipeline stays omitted."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        iid = json.loads(request.content)["variables"]["iid"]
+        if iid == "5":
+            return respond(
+                page(
+                    make_discussion("thread-5"),
+                    source_branch="feature/five",
+                    head_sha="5" * 40,
+                    merge_status="CLEAN",
+                    pipeline_status="SUCCESS",
+                ),
+            )
+        return respond(
+            page(
+                make_discussion("thread-8"),
+                source_branch="feature/eight",
+                head_sha="8" * 40,
+                merge_status="BLOCKED_STATUS",
+            ),
+        )
+
+    route = respx.post(GRAPHQL).mock(side_effect=handler)
+
+    # Act
+    data = await call_tool(iids=[5, 8])
+
+    # Assert
+    first, second = data["merge_requests"]
+    assert {key: first[key] for key in ("head_sha", "source_branch", "merge_status", "pipeline_status")} == {
+        "head_sha": "5" * 40,
+        "source_branch": "feature/five",
+        "merge_status": "clean",
+        "pipeline_status": "success",
+    }
+    assert {key: second[key] for key in ("head_sha", "source_branch", "merge_status")} == {
+        "head_sha": "8" * 40,
+        "source_branch": "feature/eight",
+        "merge_status": "blocked_status",
+    }
+    assert "pipeline_status" not in second
+    assert route.call_count == len(data["merge_requests"])
+    assert [variables["iid"] for variables in sent_variables(route)] == ["5", "8"]
+
+
+@pytest.mark.parametrize(
+    ("total", "resolved", "state", "expected"),
+    [(0, 0, "open", {"open": 0, "resolved": 0}), (9, 4, "resolved", {"open": 5, "resolved": 4})],
+    ids=["zero", "counts-both-states"],
+)
+@respx.mock
+async def test_count_only_returns_exact_single_mr_counts_without_notes(gitlab_env, total, resolved, state, expected):
+    """Count-only returns exact aggregate totals and does not request discussion pages or note bodies."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(counts_page(total, resolved)))
+
+    # Act
+    data = await call_tool(count_only=True, state=state)
+
+    # Assert
+    assert data == expected
+    assert sent_variables(route) == [{"fullPath": PROJECT, "iid": str(IID)}]
+    query = json.loads(route.calls[0].request.content)["query"]
+    assert "resolvableDiscussionsCount" in query
+    assert "resolvedDiscussionsCount" in query
+    assert "discussions(" not in query.lower()
+    assert "notes" not in query.lower()
+    assert "body" not in query.lower()
+
+
+@respx.mock
+async def test_count_only_batches_counts_and_reports_missing_merge_requests(gitlab_env):
+    """Batch count mode keeps request order, deduplicates IIDs, and reports missing MRs as usual."""
+
+    # Arrange
+    def handler(request: httpx.Request) -> httpx.Response:
+        iid = json.loads(request.content)["variables"]["iid"]
+        if iid == "7":
+            return httpx.Response(200, json={"data": {"project": {"mergeRequest": None}}})
+        return respond(counts_page(total=6, resolved=2) if iid == "5" else counts_page(total=0, resolved=0))
+
+    route = respx.post(GRAPHQL).mock(side_effect=handler)
+
+    # Act
+    data = await call_tool(iids=[5, 7, 8, 5], count_only=True)
+
+    # Assert
+    assert data == {
+        "merge_requests": [
+            {"iid": 5, "open": 4, "resolved": 2},
+            {"iid": 8, "open": 0, "resolved": 0},
+        ],
+        "missing_iids": [7],
+    }
+    assert [variables["iid"] for variables in sent_variables(route)] == ["5", "7", "8"]
+    assert all("notes" not in json.loads(call.request.content)["query"].lower() for call in route.calls)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"cursor": "some-cursor"},
+        {"ids": []},
+        {"ids": ["thread-id"]},
+        {"file": "src/parser.py"},
+        {"author": "alice"},
+    ],
+    ids=["cursor", "empty-ids", "ids", "file", "author"],
+)
+@respx.mock
+async def test_count_only_rejects_thread_filters_before_network(gitlab_env, arguments):
+    """Count mode rejects page and thread filters because it does not read discussion records."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(counts_page(total=0, resolved=0)))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="count_only cannot be combined with cursor, ids, file, or author"):
+        await call_tool(count_only=True, **arguments)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_count_only_propagates_unsupported_graphql_fields_as_tool_error(gitlab_env):
+    """GraphQL field errors are reported instead of returning fabricated zero counts."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"errors": [{"message": "Field 'resolvableDiscussionsCount' doesn't exist on MergeRequest"}]},
+        ),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="GitLab GraphQL error: Field 'resolvableDiscussionsCount' doesn't exist"):
+        await call_tool(count_only=True)
+    assert route.call_count == 1
 
 
 @respx.mock
@@ -770,6 +1002,186 @@ async def test_note_bodies_are_capped_with_a_marker(gitlab_env, length, expected
     assert data["threads"][0]["notes"][0]["body"] == "x" * NOTE_CAP + expected_suffix
 
 
+@respx.mock
+async def test_finding_view_compacts_bot_greeting_and_signoff_preserving_findings(gitlab_env):
+    """Finding view removes separate bot greetings and signoffs, but keeps the full finding content."""
+    # Arrange
+    body = (
+        "👋 Hi @maintainer!\n\n"
+        "## Review findings\n\n"
+        "**File:** `src/parser.py`\n\n"
+        "1. **[P1] Keep the original parse error.**\n\n"
+        "The current code loses the original error details when parsing an invalid file.\n\n"
+        "**Fix:** Preserve `error.message` and include the source path.\n\n"
+        "```python\n"
+        "raise ParseError(error.message)\n\n"
+        'print("Thanks!")\n'
+        "```\n\n"
+        "Thanks!"
+    )
+    expected = (
+        "## Review findings\n\n"
+        "**File:** `src/parser.py`\n\n"
+        "1. **[P1] Keep the original parse error.**\n\n"
+        "The current code loses the original error details when parsing an invalid file.\n\n"
+        "**Fix:** Preserve `error.message` and include the source path.\n\n"
+        "```python\n"
+        "raise ParseError(error.message)\n\n"
+        'print("Thanks!")\n'
+        "```"
+    )
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    full = await call_tool()
+    finding = await call_tool(view="finding")
+
+    # Assert
+    assert full["threads"][0]["notes"][0]["body"] == body
+    assert finding["threads"][0]["notes"][0]["body"] == expected
+
+
+@pytest.mark.parametrize(
+    ("indent", "placement"),
+    [
+        ("    ", "greeting"),
+        ("\t", "greeting"),
+        ("    ", "signoff"),
+        ("\t", "signoff"),
+    ],
+    ids=["four-space-greeting", "tab-greeting", "four-space-signoff", "tab-signoff"],
+)
+@respx.mock
+async def test_finding_view_preserves_ambiguous_indented_paragraphs(gitlab_env, indent, placement):
+    """Indented greeting and signoff paragraphs are preserved as possibly meaningful code."""
+    # Arrange
+    finding = "1. [P1] Preserve this output example."
+    indented_line = f"{indent}{'Hi!' if placement == 'greeting' else 'Thanks!'}"
+    body = f"{indented_line}\n\n{finding}" if placement == "greeting" else f"{finding}\n\n{indented_line}"
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    data = await call_tool(view="finding")
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == body
+
+
+@pytest.mark.parametrize(
+    ("greeting", "keep_greeting"),
+    [
+        ("Peep peep! 🚂 ... Really useful work! ⭐", False),
+        ("Peep peep!", False),
+        ("Peep peep! 🚂", False),
+        ("Peep peep! 🚂 Preserve error context before merging. Really useful work! ⭐", True),
+        ("Peep peep! 🚂 This change is a joy to review. Really useful work! ⭐", True),
+        ("Peep peep! 🚂 Update src/parser.py before merging. Really useful work! ⭐", True),
+        ("Peep peep! 🚂 Keep `error.message` here. Really useful work! ⭐", True),
+        ("Peep peep! 🚂 Fix: preserve the original error. Really useful work! ⭐", True),
+        ("Peep peep! 🚂 **[P1] Preserve the original error. Really useful work! ⭐", True),
+    ],
+    ids=[
+        "issue-greeting",
+        "peep-only",
+        "train-only",
+        "useful-prose",
+        "unknown-prose",
+        "path",
+        "code-span",
+        "fix-text",
+        "finding-content",
+    ],
+)
+@respx.mock
+async def test_finding_view_only_compacts_known_standalone_bot_greetings(gitlab_env, greeting, keep_greeting):
+    """The known Peep greeting is compacted unless its paragraph includes review details."""
+    # Arrange
+    finding = "1. [P1] Keep the original error context."
+    body = f"{greeting}\n\n{finding}\n\nFull steam ahead! 💨"
+    expected = f"{greeting}\n\n{finding}" if keep_greeting else finding
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    data = await call_tool(view="finding")
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == expected
+
+
+@respx.mock
+async def test_finding_view_keeps_prose_after_multiline_signoff(gitlab_env):
+    """A second line after a signoff phrase is prose, not a removable signature."""
+    # Arrange
+    body = "1. [P1] Keep the original error context.\n\nThanks,\nPreserve error context"
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    data = await call_tool(view="finding")
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == body
+
+
+@pytest.mark.parametrize(
+    ("author", "body"),
+    [
+        ({"username": "review-bot", "bot": True}, "Thanks!"),
+        ({"username": "review-bot", "bot": True}, "Full steam ahead! 💨"),
+        (
+            {"username": "review-bot", "bot": True},
+            "Peep peep! 🚂 This review has no numbered finding. Really useful work! ⭐\n\nFull steam ahead! 💨",
+        ),
+        (
+            {"username": "alice", "bot": False},
+            "👋 Hi!\n\n1. [P1] Keep the human note unchanged.\n\nThanks!",
+        ),
+    ],
+    ids=["signoff-without-finding", "known-signoff-without-finding", "no-numbered-items", "human-note"],
+)
+@respx.mock
+async def test_finding_view_keeps_signoff_only_unstructured_and_human_notes(gitlab_env, author, body):
+    """Compaction is skipped without numbered findings and for every human-authored note."""
+    # Arrange
+    note = make_note(body, author=author["username"]) | {"author": author}
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    data = await call_tool(view="finding")
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == body
+
+
+@respx.mock
+async def test_finding_view_compacts_before_applying_body_cap(gitlab_env):
+    """The body cap applies after the removable bot greeting and signoff are compacted."""
+    # Arrange
+    finding = "1. [P1] " + "x" * 100
+    body = f"👋 Hi!\n\n{finding}\n\nThanks!"
+    note = make_note(body, author="review-bot") | {
+        "author": {"username": "review-bot", "bot": True, "name": "Review Bot", "id": "gid://gitlab/User/123"},
+    }
+    respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
+
+    # Act
+    data = await call_tool(view="finding", max_body_chars=30)
+
+    # Assert
+    assert data["threads"][0]["notes"][0]["body"] == finding[:30] + THREAD_CUT_MARKER
+
+
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
@@ -903,8 +1315,9 @@ async def test_notes_truncated_flags_more_than_fifty_notes(gitlab_env, notes_hav
     assert data["threads"][0].get("notes_truncated") is expected
 
 
+@pytest.mark.parametrize("view", ["full", "finding"])
 @respx.mock
-async def test_budget_stops_and_cursor_resumes_without_gaps_or_repeats(gitlab_env):
+async def test_budget_stops_and_cursor_resumes_without_gaps_or_repeats(gitlab_env, view):
     """A call stops before the thread that would pass the budget, and the next call starts exactly there."""
     # Arrange: t3, t4, and t5 hold three full-size notes each, 12000 characters, so only two fit in the budget.
     big_notes = [make_note("x" * NOTE_CAP) for _ in range(3)]
@@ -923,8 +1336,8 @@ async def test_budget_stops_and_cursor_resumes_without_gaps_or_repeats(gitlab_en
     )
 
     # Act
-    first = await call_tool()
-    second = await call_tool(cursor=first["next_cursor"])
+    first = await call_tool(view=view)
+    second = await call_tool(view=view, cursor=first["next_cursor"])
 
     # Assert
     assert thread_ids(first) == [f"t{n}" for n in (1, 2, 3, 4)]
