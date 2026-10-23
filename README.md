@@ -18,6 +18,9 @@ back with the same `since_sha` and requested paths. Cursors are rejected if thos
 
 ## Merge request thread triage
 
+For triage, start with `view="headings"`, then pass selected thread IDs as `ids=[...]` with `view="full"` to read their
+note bodies.
+
 Use `get_merge_request_threads` for a compact review view: `view="full"` returns capped note bodies, `view="headings"`
 returns root-note headings without bodies, and `view="finding"` trims separate greetings and signoffs from bot notes
 that contain numbered findings. `count_only=true` returns exact `open` and `resolved` totals without fetching threads
@@ -31,4 +34,5 @@ can be ambiguous across merge requests.
 
 | Tool | Description |
 | --- | --- |
+| `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |

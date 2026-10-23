@@ -249,6 +249,10 @@ mcp = FastMCP(
     instructions=(
         "Tools for GitLab developer workflows on gitlab.com or self-managed "
         "GitLab. Call get_current_user first to learn who you are acting as. "
+        "For merge request lifecycle work, push the branch before create_merge_request; "
+        "use list_labels(search=...) to find labels, "
+        'get_merge_request_threads(state="open") to triage, reply_to_thread(resolve=true) to respond or resolve, and '
+        "edit_merge_request_description to update the description. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
         "Use get_merge_request for descriptions, approvals, and jobs, and get_merge_request_diff for patches. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
@@ -277,6 +281,13 @@ class CurrentUser(BaseModel):
     id: int
 
 
+class ProjectLabels(BaseModel):
+    """A compact page of project label names."""
+
+    labels: str
+    has_more: bool
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_current_user(ctx: Context) -> CurrentUser:
     """Return the username and ID of the user that owns the GitLab token.
@@ -286,6 +297,28 @@ async def get_current_user(ctx: Context) -> CurrentUser:
     """
     user = await get_client(ctx).get("/user")
     return CurrentUser(username=user["username"], id=user["id"])
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def list_labels(ctx: Context, project: Project, search: str | None = None) -> ProjectLabels:
+    """List the first 100 project and ancestor label names, like `glab api projects/:id/labels`.
+
+    The result contains names only. If `has_more` is true, refine the search to find labels beyond the first page.
+    """
+    params: dict[str, Any] = {
+        "per_page": PROJECT_LABELS_PAGE_SIZE,
+        "include_ancestor_groups": True,
+        "page": 1,
+    }
+    if search is not None:
+        params["search"] = search
+
+    path = f"/projects/{quote(project, safe='')}/labels"
+    labels, next_page = await get_client(ctx).get_page(path, **params)
+    return ProjectLabels(
+        labels="\n".join(label["name"] for label in labels),
+        has_more=next_page is not None,
+    )
 
 
 class MergeRequestSummary(BaseModel):
@@ -1655,6 +1688,9 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     ] = False,
 ) -> Any:
     """Read compact MR triage status and review thread notes for one MR or a batch, like `glab mr note list`.
+
+    For triage, start with `view="headings"`, then pass selected thread IDs as `ids=[...]` with `view="full"` to read
+    their note bodies.
 
     - `state`: `open` (default), `resolved`, `comments` (cannot be resolved), or `all`. `ids` ignore `state`.
     - `count_only=true` returns exact counts from GitLab's resolvable and resolved discussion totals. `open` is total
