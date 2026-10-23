@@ -3,6 +3,7 @@
 import json
 import re
 from datetime import UTC, datetime
+from itertools import batched
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
@@ -21,6 +22,7 @@ from gitlab_mcp.mr_common import (
     fetch_merge_request,
     position_fields,
 )
+lazy from gitlab_mcp.client import GitLabClient
 
 # One request per page. `open_threads` is computed from the two counts.
 MERGE_REQUESTS_QUERY = """
@@ -119,6 +121,10 @@ query($fullPath: ID!, $targetBranches: [String!], $after: String, $carAfter: Str
   }
 }
 """
+
+# GitLab rejects a GraphQL query above complexity 250. Each aliased merge request costs about 23 points,
+# so 8 per query (about 184) leaves headroom. Larger batches run as several sequential queries.
+GRAPHQL_MR_CHUNK = 8
 
 # Long descriptions are cut to keep one tool result small. The flag tells the agent it was cut.
 DESCRIPTION_CAP = 4000
@@ -781,6 +787,44 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     return detail
 
 
+async def _fetch_compact_chunk(
+    client: GitLabClient,
+    project: str,
+    iids: list[int],
+    include_description: bool,
+) -> list[dict[str, Any] | None]:
+    """Fetch compact merge request nodes for one chunk of IIDs in one GraphQL query.
+
+    Each IID gets its own alias (`mr_0`, `mr_1`, ...) inside the chunk. Returns one entry per IID in chunk
+    order, where `None` means the merge request does not exist. Raises `ProjectNotFoundError` when the project
+    is missing.
+    """
+    declarations = ["$fullPath: ID!", "$includeDescription: Boolean!"]
+    variables: dict[str, Any] = {
+        "fullPath": project,
+        "includeDescription": include_description,
+    }
+    selections = []
+    for index, iid in enumerate(iids):
+        variable = f"iid{index}"
+        declarations.append(f"${variable}: String!")
+        variables[variable] = str(iid)
+        selections.append(f"mr_{index}: mergeRequest(iid: ${variable}) {{ ...CompactMergeRequest }}")
+
+    query = (
+        f"query({', '.join(declarations)}) {{\n"
+        "  project(fullPath: $fullPath) {\n"
+        f"    {' '.join(selections)}\n"
+        "  }\n"
+        "}\n"
+        f"{COMPACT_MERGE_REQUEST_FRAGMENT}"
+    )
+    data = await client.graphql(query, variables)
+    if data["project"] is None:
+        raise ProjectNotFoundError(project)
+    return [data["project"][f"mr_{index}"] for index in range(len(iids))]
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_requests(
     ctx: Context,
@@ -797,7 +841,8 @@ async def get_merge_requests(
     IIDs are deduplicated in requested order. More than 20 raw IIDs are accepted when there are at most 20 unique
     values. Missing IIDs are listed separately. This compact result has no reviewers, changes, or discussion/thread
     indexes. Descriptions are skipped by default; set `include_description` to true to include up to 4000 characters.
-    Set `description_limit` to zero to skip descriptions even when requested.
+    Set `description_limit` to zero to skip descriptions even when requested. Batches above 8 IIDs run as several
+    sequential GraphQL queries.
     """
     unique_iids = list(dict.fromkeys(iids))
     if not unique_iids:
@@ -806,34 +851,14 @@ async def get_merge_requests(
         raise ToolError("Pass no more than 20 unique merge request IIDs.")  # noqa: TRY003
 
     include_description = include_description and description_limit > 0
-    declarations = ["$fullPath: ID!", "$includeDescription: Boolean!"]
-    variables: dict[str, Any] = {
-        "fullPath": project,
-        "includeDescription": include_description,
-    }
-    selections = []
-    for index, iid in enumerate(unique_iids):
-        variable = f"iid{index}"
-        declarations.append(f"${variable}: String!")
-        variables[variable] = str(iid)
-        selections.append(f"mr_{index}: mergeRequest(iid: ${variable}) {{ ...CompactMergeRequest }}")
-
-    query = (
-        f"query({', '.join(declarations)}) {{\n"
-        "  project(fullPath: $fullPath) {\n"
-        f"    {' '.join(selections)}\n"
-        "  }\n"
-        "}\n"
-        f"{COMPACT_MERGE_REQUEST_FRAGMENT}"
-    )
-    data = await get_client(ctx).graphql(query, variables)
-    if data["project"] is None:
-        raise ProjectNotFoundError(project)
+    client = get_client(ctx)
+    nodes: list[dict[str, Any] | None] = []
+    for chunk in batched(unique_iids, GRAPHQL_MR_CHUNK, strict=False):
+        nodes.extend(await _fetch_compact_chunk(client, project, list(chunk), include_description))
 
     merge_requests = []
     missing_iids = []
-    for index, iid in enumerate(unique_iids):
-        node = data["project"][f"mr_{index}"]
+    for iid, node in zip(unique_iids, nodes, strict=True):
         if node is None:
             missing_iids.append(iid)
             continue
