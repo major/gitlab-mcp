@@ -17,7 +17,10 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
 DIFFS_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187/diffs"
+VERSIONS_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187/versions"
 HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA. Write tools need it exact, so output keeps all of it.
+OLD_SHA = "1096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
+UNKNOWN_SHA = "2096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
 HEAD_REFS = {"headSha": HEAD_SHA}
 BIG = "x" * 15000  # Three of these do not fit in one DIFF_BUDGET, but two do.
 DEFAULT_DIFF = "@@ -1 +1 @@\n-old\n+new\n"
@@ -64,6 +67,29 @@ def make_file(  # noqa: PLR0913 - each keyword is one REST flag, so the builder 
 def files_response(*files: dict[str, Any], next_page: int | None = None) -> httpx.Response:
     """Wrap diff entries in a REST response. GitLab sends an empty X-Next-Page on the last page."""
     return httpx.Response(200, json=list(files), headers={"X-Next-Page": "" if next_page is None else str(next_page)})
+
+
+def make_version(version_id: int, sha: str) -> dict[str, Any]:
+    """Build one diff version list entry."""
+    return {"id": version_id, "head_commit_sha": sha}
+
+
+def version_detail(sha: str, *files: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    """Build a collected diff version detail response."""
+    return {
+        "head_commit_sha": sha,
+        "state": "collected",
+        "real_size": str(len(files)),
+        "diffs": list(files),
+        **overrides,
+    }
+
+
+def mock_versions(*versions: dict[str, Any]) -> respx.Route:
+    """Return the requested diff versions without relying on API response order."""
+    return respx.get(VERSIONS_URL).mock(
+        return_value=httpx.Response(200, json=list(versions), headers={"X-Next-Page": ""}),
+    )
 
 
 def serve_pages(pages: dict[int, list[dict[str, Any]]]) -> Callable[[httpx.Request], httpx.Response]:
@@ -624,3 +650,414 @@ async def test_missing_flags_default_to_false(gitlab_env):
 
     # Assert
     assert data["diffs"] == [{"path": "a.py", "status": "modified", "diff": DEFAULT_DIFF}]
+
+
+@pytest.mark.parametrize("real_size", [1, "1"])
+@respx.mock
+async def test_since_accepts_string_and_integer_file_counts(gitlab_env, real_size):
+    """Collected snapshots accept GitLab's string count and equivalent integer counts."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(return_value=httpx.Response(200, json=version_detail(OLD_SHA)))
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(HEAD_SHA, make_file("new.py"), real_size=real_size),
+        ),
+    )
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert data["since_version_found"] is True
+    assert [row["path"] for row in data["files"]] == ["new.py"]
+    assert "warning" not in data
+
+
+@pytest.mark.parametrize("headers", ["", "--- a/new.py\n+++ b/new.py\n"])
+@respx.mock
+async def test_since_counts_header_like_content_inside_hunks(gitlab_env, headers):
+    """Triple-sign content lines count as changes, unlike optional file headers outside hunks."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(return_value=httpx.Response(200, json=version_detail(OLD_SHA)))
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(HEAD_SHA, make_file("new.py", diff=f"{headers}@@ -1 +1 @@\n---old\n+++new\n")),
+        ),
+    )
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert data["files"][0]["additions"] == 1
+    assert data["files"][0]["deletions"] == 1
+
+
+@respx.mock
+async def test_since_ignores_only_rebased_hunk_ranges_and_skips_graphql(gitlab_env):
+    """A target-only rebase changes numeric hunk offsets, not the patch content."""
+    # Arrange
+    mock_versions(make_version(9, HEAD_SHA), make_version(3, OLD_SHA))
+    respx.get(f"{VERSIONS_URL}/3").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(OLD_SHA, make_file("same.py", diff="@@ -4,2 +8,2 @@ fn\n-old\n+new\n")),
+        ),
+    )
+    respx.get(f"{VERSIONS_URL}/9").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(HEAD_SHA, make_file("same.py", diff="@@ -104,2 +208,2 @@ fn\n-old\n+new\n")),
+        ),
+    )
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert data == {"head_sha": HEAD_SHA, "since_version_found": True}
+    assert {call.request.method for call in respx.calls} == {"GET"}
+
+
+@respx.mock
+async def test_since_file_list_reports_changed_added_deleted_and_renamed_files(gitlab_env):
+    """The file list contains only changed snapshot entries with patch-derived counts and current anchors."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(7, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(
+                OLD_SHA,
+                make_file("edit.py", diff="@@ -1 +1 @@\n-old\n+same\n"),
+                make_file("gone.py", diff="@@ -1 +0,0 @@\n-old\n", deleted_file=True),
+                make_file("new.py", old_path="old.py", renamed_file=True, diff="@@ -1 +1 @@\n-old\n+new\n"),
+            ),
+        ),
+    )
+    respx.get(f"{VERSIONS_URL}/7").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(
+                HEAD_SHA,
+                make_file("edit.py", diff="@@ -20 +40 @@\n-old\n+changed\n"),
+                make_file("gone.py", diff="@@ -1 +0,0 @@\n-old\n", deleted_file=True),
+                make_file("added.py", diff="@@ -0,0 +1 @@\n+new\n", new_file=True),
+                make_file("new.py", old_path="old.py", diff="@@ -1 +1 @@\n-old\n+newer\n", renamed_file=True),
+            ),
+        ),
+    )
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert data["head_sha"] == HEAD_SHA
+    assert data["since_version_found"] is True
+    assert [row["path"] for row in data["files"]] == ["edit.py", "added.py", "new.py"]
+    assert data["files"] == [
+        {"path": "edit.py", "additions": 1, "deletions": 1, "new_line_ranges": [[40, 40]], "ranges_complete": True},
+        {"path": "added.py", "additions": 1, "deletions": 0, "new_line_ranges": [[1, 1]], "ranges_complete": True},
+        {"path": "new.py", "additions": 1, "deletions": 1, "new_line_ranges": [[1, 1]], "ranges_complete": True},
+    ]
+
+
+@respx.mock
+async def test_since_paths_return_latest_added_deleted_and_renamed_patches(gitlab_env):
+    """Path mode keeps the latest MR patch shape and matches either side of a rename."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(
+                OLD_SHA,
+                make_file("gone.py", diff="@@ -1 +1 @@\n-old\n+old\n"),
+                make_file("new.py", old_path="old.py", renamed_file=True),
+            ),
+        ),
+    )
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(
+                HEAD_SHA,
+                make_file("gone.py", diff="@@ -1 +0,0 @@\n-old\n", deleted_file=True),
+                make_file("added.py", diff="@@ -0,0 +1 @@\n+new\n", new_file=True),
+                make_file(
+                    "new.py",
+                    old_path="old.py",
+                    renamed_file=True,
+                    diff="@@ -4 +6 @@\n-old\n+updated\n",
+                ),
+            ),
+        ),
+    )
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA, paths=["gone.py", "added.py", "old.py"])
+
+    # Assert
+    assert data["diffs"] == [
+        {"path": "gone.py", "status": "deleted", "diff": "@@ -1 +0,0 @@\n-old\n"},
+        {"path": "added.py", "status": "added", "diff": "@@ -0,0 +1 @@\n+new\n"},
+        {
+            "path": "new.py",
+            "old_path": "old.py",
+            "status": "renamed",
+            "diff": "@@ -4 +6 @@\n-old\n+updated\n",
+        },
+    ]
+    assert "paths_not_found" not in data
+
+
+@pytest.mark.parametrize(
+    ("latest_old_path", "renamed", "patch"),
+    [
+        ("new.py", False, "@@ -1 +1 @@\n-old\n+updated\n"),
+        ("new.py", False, DEFAULT_DIFF),
+        ("other.py", True, DEFAULT_DIFF),
+    ],
+)
+@respx.mock
+async def test_since_changed_rename_origin_returns_one_latest_entry(gitlab_env, latest_old_path, renamed, patch):
+    """Destination paths identify files, and only the latest rename origin matches requested paths."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(OLD_SHA, make_file("new.py", old_path="old.py", renamed_file=True)),
+        ),
+    )
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(
+                HEAD_SHA,
+                make_file("new.py", old_path=latest_old_path, renamed_file=renamed, diff=patch),
+            ),
+        ),
+    )
+
+    # Act
+    listing = await call_tool(since_sha=OLD_SHA)
+    patches = await call_tool(since_sha=OLD_SHA, paths=["new.py", "old.py", latest_old_path])
+
+    # Assert
+    assert listing["files"] == [
+        {"path": "new.py", "additions": 1, "deletions": 1, "new_line_ranges": [[1, 1]], "ranges_complete": True},
+    ]
+    expected_diff = {"path": "new.py", "status": "renamed" if renamed else "modified", "diff": patch}
+    if renamed:
+        expected_diff["old_path"] = latest_old_path
+    assert patches["diffs"] == [expected_diff]
+    assert patches["paths_not_found"] == ["old.py"]
+    assert "warning" not in listing
+    assert "warning" not in patches
+
+
+@respx.mock
+async def test_since_returns_reverted_files_with_empty_patch_and_warning(gitlab_env):
+    """A file present only in the old snapshot is visible but has no current patch anchors."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(
+        return_value=httpx.Response(200, json=version_detail(OLD_SHA, make_file("reverted.py"))),
+    )
+    respx.get(f"{VERSIONS_URL}/2").mock(return_value=httpx.Response(200, json=version_detail(HEAD_SHA)))
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA, paths=["reverted.py"])
+
+    # Assert
+    assert data["diffs"] == [{"path": "reverted.py", "status": "modified"}]
+    assert "paths_not_found" not in data
+    assert "empty patches and no valid anchors" in data["warning"]
+
+
+@respx.mock
+async def test_since_unknown_sha_warns_without_falling_back_to_full_diff(gitlab_env):
+    """An unknown SHA is explicit and does not trigger a current-diff or GraphQL fallback."""
+    # Arrange
+    versions = mock_versions(make_version(2, HEAD_SHA), make_version(1, OLD_SHA))
+    diff_route = respx.get(DIFFS_URL).mock(return_value=files_response(make_file("current.py")))
+
+    # Act
+    data = await call_tool(since_sha=UNKNOWN_SHA)
+
+    # Assert
+    assert data == {
+        "head_sha": HEAD_SHA,
+        "since_version_found": False,
+        "warning": f"No diff version has head commit {UNKNOWN_SHA}; no full diff was returned.",
+    }
+    assert versions.call_count == 1
+    assert diff_route.call_count == 0
+    assert not any(call.request.method == "POST" for call in respx.calls)
+
+
+@respx.mock
+async def test_since_scans_paginated_versions_and_selects_highest_version_id(gitlab_env):
+    """Version pages are bounded and response order does not determine the latest snapshot."""
+    # Arrange
+    page_calls: list[int] = []
+
+    def versions_handler(request: httpx.Request) -> httpx.Response:
+        """Return two unordered version pages."""
+        page = int(request.url.params["page"])
+        page_calls.append(page)
+        entries = [make_version(5, HEAD_SHA)] if page == 1 else [make_version(2, OLD_SHA)]
+        return httpx.Response(200, json=entries, headers={"X-Next-Page": "2" if page == 1 else ""})
+
+    respx.get(VERSIONS_URL).mock(side_effect=versions_handler)
+    respx.get(f"{VERSIONS_URL}/2").mock(return_value=httpx.Response(200, json=version_detail(OLD_SHA)))
+    respx.get(f"{VERSIONS_URL}/5").mock(return_value=httpx.Response(200, json=version_detail(HEAD_SHA)))
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert page_calls == [1, 2]
+    assert data["head_sha"] == HEAD_SHA
+    assert data["since_version_found"] is True
+
+
+@respx.mock
+async def test_since_version_scan_exhaustion_is_explicit(gitlab_env):
+    """A still-paginated version list after MAX_PAGES does not claim a complete comparison."""
+
+    # Arrange
+    def versions_handler(request: httpx.Request) -> httpx.Response:
+        """Keep reporting another page until the scan budget is exhausted."""
+        page = int(request.url.params["page"])
+        return httpx.Response(
+            200,
+            json=[make_version(page, OLD_SHA if page == 1 else HEAD_SHA)],
+            headers={"X-Next-Page": str(page + 1)},
+        )
+
+    route = respx.get(VERSIONS_URL).mock(side_effect=versions_handler)
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert route.call_count == MAX_PAGES
+    assert "stopped after" in data["warning"]
+    assert "since_version_found" not in data
+    assert "files" not in data
+
+
+@pytest.mark.parametrize(
+    ("detail_options", "file_options", "expected_warning"),
+    [
+        ({"overflow": True}, {}, "overflowed"),
+        ({"state": "collecting"}, {}, "not fully collected"),
+        ({"real_size": 2}, {}, "incomplete file list"),
+        ({"real_size": "2"}, {}, "incomplete file list"),
+        ({"real_size": "1000+"}, {}, "incomplete file list"),
+        ({"real_size": None}, {}, "incomplete file list"),
+        ({"real_size": True}, {}, "incomplete file list"),
+        ({}, {"collapsed": True}, "collapsed or too-large"),
+        ({}, {"diff": ""}, "unusable file patch"),
+    ],
+)
+@respx.mock
+async def test_since_incomplete_snapshots_warn_without_claiming_no_changes(
+    gitlab_env, detail_options, file_options, expected_warning
+):
+    """Incomplete GitLab version data stops comparison instead of producing a false empty result."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(
+        return_value=httpx.Response(200, json=version_detail(OLD_SHA, make_file("old.py"))),
+    )
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(HEAD_SHA, make_file("new.py", **file_options), **detail_options),
+        ),
+    )
+
+    # Act
+    data = await call_tool(since_sha=OLD_SHA)
+
+    # Assert
+    assert data["since_version_found"] is True
+    assert "files" not in data
+    assert expected_warning in data["warning"]
+
+
+@respx.mock
+async def test_since_path_cursor_resumes_with_same_inputs_and_rejects_changed_paths(gitlab_env):
+    """Snapshot cursors resume by file index and remain bound to since SHA and requested paths."""
+    # Arrange
+    mock_versions(make_version(1, OLD_SHA), make_version(2, HEAD_SHA))
+    respx.get(f"{VERSIONS_URL}/1").mock(return_value=httpx.Response(200, json=version_detail(OLD_SHA)))
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(HEAD_SHA, *(make_file(f"f{i}.py", diff=BIG) for i in range(3))),
+        ),
+    )
+
+    # Act
+    first = await call_tool(since_sha=OLD_SHA, paths=["f0.py", "f1.py", "f2.py"])
+    before_changed_input = respx.calls.call_count
+    second = await call_tool(since_sha=OLD_SHA, paths=["f0.py", "f1.py", "f2.py"], cursor=first["next_cursor"])
+
+    # Assert
+    assert paths_of(first) == ["f0.py", "f1.py"]
+    assert paths_of(second) == ["f2.py"]
+    assert "next_cursor" not in second
+    assert respx.calls.call_count > before_changed_input
+    request_count = respx.calls.call_count
+    with pytest.raises(ToolError, match="Invalid cursor"):
+        await call_tool(since_sha=OLD_SHA, paths=["f0.py"], cursor=first["next_cursor"])
+    assert respx.calls.call_count == request_count
+
+
+@respx.mock
+async def test_since_cursor_rejects_a_new_latest_head(gitlab_env):
+    """A continuation cursor cannot be reused after the latest diff version changes."""
+    # Arrange
+    newest_sha = "3096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    versions_calls = 0
+
+    def versions_handler(request: httpx.Request) -> httpx.Response:
+        """Advance the latest version after the first list request."""
+        nonlocal versions_calls
+        versions_calls += 1
+        latest_sha = HEAD_SHA if versions_calls == 1 else newest_sha
+        return httpx.Response(
+            200,
+            json=[make_version(1, OLD_SHA), make_version(2 if versions_calls == 1 else 3, latest_sha)],
+            headers={"X-Next-Page": ""},
+        )
+
+    respx.get(VERSIONS_URL).mock(side_effect=versions_handler)
+    respx.get(f"{VERSIONS_URL}/1").mock(return_value=httpx.Response(200, json=version_detail(OLD_SHA)))
+    respx.get(f"{VERSIONS_URL}/2").mock(
+        return_value=httpx.Response(
+            200,
+            json=version_detail(
+                HEAD_SHA,
+                make_file("big.py", diff=BIG),
+                make_file("next.py", diff=BIG),
+                make_file("last.py", diff=BIG),
+            ),
+        ),
+    )
+
+    # Act
+    first = await call_tool(since_sha=OLD_SHA, paths=["big.py", "next.py", "last.py"])
+
+    # Assert
+    assert "next_cursor" in first
+    with pytest.raises(ToolError, match="Invalid cursor"):
+        await call_tool(since_sha=OLD_SHA, paths=["big.py", "next.py", "last.py"], cursor=first["next_cursor"])
