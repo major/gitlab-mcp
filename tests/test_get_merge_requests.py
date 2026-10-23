@@ -15,6 +15,9 @@ from mcp_helpers import call_tool as call_mcp_tool
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
+MR_REST = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/{iid}"
+HIDDEN_BLOCKERS = 2
+COMMITS_BEHIND = 5
 
 
 def make_mr(iid: int, **overrides: Any) -> dict[str, Any]:
@@ -120,6 +123,149 @@ async def test_deduplicates_in_order_and_reports_missing_iids(gitlab_env):
     assert "diffRefs { headSha }" in query
     for excluded_selection in ("reviewers", "discussions", "notes", "diffStats", "resolvableDiscussionsCount"):
         assert excluded_selection not in query
+
+
+def blockers_node(visible: list[int], hidden: int = 0) -> dict[str, Any]:
+    """Build the aliased node of the blockers query for one merge request."""
+    return {
+        "blockingMergeRequests": {"visibleMergeRequests": [{"iid": str(iid)} for iid in visible], "hiddenCount": hidden}
+    }
+
+
+def serve_batch_with_blockers(
+    statuses: dict[int, str],
+    blockers: dict[int, dict[str, Any]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer the batch query with one node per IID, and the blockers query with the nodes in `blockers`."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Route by query text. Blocker nodes are answered in request order, one alias per IID."""
+        body = json.loads(request.content)
+        iids = [int(value) for key, value in body["variables"].items() if key.startswith("iid")]
+        if "blockingMergeRequests" in body["query"]:
+            nodes = {f"mr_{index}": blockers[iid] for index, iid in enumerate(iids)}
+            return httpx.Response(200, json={"data": {"project": nodes}})
+        return batch_response(*(make_mr(iid, detailedMergeStatus=statuses[iid]) for iid in iids))
+
+    return respond
+
+
+@respx.mock
+async def test_only_blocked_merge_requests_share_one_blockers_query(gitlab_env):
+    """Two blocked MRs out of three share one blockers query, which asks for their IIDs only."""
+    # Arrange
+    statuses = {9: "BLOCKED_STATUS", 2: "MERGEABLE", 4: "BLOCKED_STATUS"}
+    blockers = {9: blockers_node([100, 101]), 4: blockers_node([], hidden=HIDDEN_BLOCKERS)}
+    route = respx.post(GRAPHQL).mock(side_effect=serve_batch_with_blockers(statuses, blockers))
+
+    # Act
+    data = await call_tool([9, 2, 4])
+
+    # Assert
+    blocker_calls = [
+        call for call in route.calls if "blockingMergeRequests" in json.loads(call.request.content)["query"]
+    ]
+    assert len(blocker_calls) == 1
+    assert json.loads(blocker_calls[0].request.content)["variables"] == {"fullPath": PROJECT, "iid0": "9", "iid1": "4"}
+    first, unblocked, second = data["merge_requests"]
+    assert first["blocked_by"] == [100, 101]
+    assert "hidden_blockers" not in first
+    assert {"blocked_by", "hidden_blockers"}.isdisjoint(unblocked)
+    assert "blocked_by" not in second
+    assert second["hidden_blockers"] == HIDDEN_BLOCKERS
+
+
+@respx.mock
+async def test_failed_blockers_query_keeps_the_batch(gitlab_env):
+    """A failed blockers lookup leaves the blocker fields out, and the batch still returns every merge request."""
+
+    # Arrange
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Fail only the blockers query, so the main batch read is answered as usual."""
+        if "blockingMergeRequests" in json.loads(request.content)["query"]:
+            return httpx.Response(500, json={"message": "Boom"})
+        return batch_response(make_mr(9, detailedMergeStatus="BLOCKED_STATUS"), make_mr(2))
+
+    respx.post(GRAPHQL).mock(side_effect=respond)
+
+    # Act
+    data = await call_tool([9, 2])
+
+    # Assert
+    assert [mr["iid"] for mr in data["merge_requests"]] == [9, 2]
+    assert "blocked_by" not in data["merge_requests"][0]
+    assert "hidden_blockers" not in data["merge_requests"][0]
+
+
+def serve_batch(overrides: dict[int, dict[str, Any]]) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer the batch query with one node per IID, with the fields in `overrides` changed for that IID."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Build the alias response for the IIDs in one request."""
+        iids = [int(value) for key, value in json.loads(request.content)["variables"].items() if key.startswith("iid")]
+        return batch_response(*(make_mr(iid, **overrides.get(iid, {})) for iid in iids))
+
+    return respond
+
+
+@respx.mock
+async def test_commits_behind_is_read_only_for_open_merge_requests(gitlab_env):
+    """Each open MR gets one divergence read. A merged MR gets no read and no field."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({2: {"state": "merged"}}))
+    open_zero = respx.get(MR_REST.format(iid=9)).mock(
+        return_value=httpx.Response(200, json={"diverged_commits_count": 0}),
+    )
+    merged = respx.get(MR_REST.format(iid=2)).mock(return_value=httpx.Response(200, json={}))
+    open_five = respx.get(MR_REST.format(iid=4)).mock(
+        return_value=httpx.Response(200, json={"diverged_commits_count": COMMITS_BEHIND}),
+    )
+
+    # Act
+    data = await call_tool([9, 2, 4], include_commits_behind=True)
+
+    # Assert
+    assert open_zero.call_count == 1
+    assert open_five.call_count == 1
+    assert merged.call_count == 0
+    assert [mr.get("commits_behind") for mr in data["merge_requests"]] == [0, None, COMMITS_BEHIND]
+    assert "commits_behind" not in data["merge_requests"][1]
+
+
+@respx.mock
+async def test_commits_behind_is_not_read_unless_asked(gitlab_env):
+    """Without the flag, no divergence read is sent and no MR gets the field."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({}))
+    rest = respx.get(MR_REST.format(iid=9)).mock(
+        return_value=httpx.Response(200, json={"diverged_commits_count": 3}),
+    )
+
+    # Act
+    data = await call_tool([9])
+
+    # Assert
+    assert rest.call_count == 0
+    assert "commits_behind" not in data["merge_requests"][0]
+
+
+@respx.mock
+async def test_failed_commits_behind_read_leaves_only_that_merge_request_without_it(gitlab_env):
+    """One refused divergence read leaves that MR without the field, and the other MRs keep theirs."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({}))
+    respx.get(MR_REST.format(iid=9)).mock(return_value=httpx.Response(500, json={"message": "Boom"}))
+    respx.get(MR_REST.format(iid=4)).mock(
+        return_value=httpx.Response(200, json={"diverged_commits_count": COMMITS_BEHIND})
+    )
+
+    # Act
+    data = await call_tool([9, 4], include_commits_behind=True)
+
+    # Assert
+    first, second = data["merge_requests"]
+    assert "commits_behind" not in first
+    assert second["commits_behind"] == COMMITS_BEHIND
 
 
 @respx.mock

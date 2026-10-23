@@ -15,6 +15,9 @@ from gitlab_mcp.errors import InvalidCursorError, raise_review_preflight_error
 # thread filters run on our side. Keeps one tool call from walking a huge project.
 MAX_PAGES = 5
 MAX_BATCH_MERGE_REQUESTS = 20
+# GitLab rejects a GraphQL query above complexity 250. Each aliased merge request costs about 23 points,
+# so 8 per query (about 184) leaves headroom. Larger batches run as several sequential queries.
+GRAPHQL_MR_CHUNK = 8
 HTTP_REQUEST_TIMEOUT = 408
 HTTP_SERVER_ERROR = 500
 # Discussion GIDs start with this. Output IDs are bare SHAs, so the prefix is only stripped from input.

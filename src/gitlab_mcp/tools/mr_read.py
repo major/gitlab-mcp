@@ -12,14 +12,25 @@ from pydantic import BaseModel, Field
 lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
-from gitlab_mcp.common import MAX_BATCH_MERGE_REQUESTS, MAX_PAGES, Iid, PositiveIid, Project, bare_id, lower_or_empty
+from gitlab_mcp.common import (
+    GRAPHQL_MR_CHUNK,
+    MAX_BATCH_MERGE_REQUESTS,
+    MAX_PAGES,
+    Iid,
+    PositiveIid,
+    Project,
+    bare_id,
+    lower_or_empty,
+)
 from gitlab_mcp.errors import ProjectNotFoundError
 from gitlab_mcp.mr_common import (
     ThreadIndex,
     ThreadRef,
     author_display,
     diff_refs_head_sha,
+    fetch_blockers,
     fetch_merge_request,
+    mr_rest_path,
     position_fields,
 )
 lazy from gitlab_mcp.client import GitLabClient
@@ -29,7 +40,8 @@ MERGE_REQUESTS_QUERY = """
 query(
   $fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $search: String,
   $createdAfter: Time, $updatedAfter: Time, $targetBranches: [String!],
-  $includeSourceBranch: Boolean!, $includeLabels: Boolean!, $first: Int!, $after: String
+  $includeSourceBranch: Boolean!, $includeTargetBranch: Boolean!, $includeLabels: Boolean!,
+  $first: Int!, $after: String
 ) {
   project(fullPath: $fullPath) {
     mergeRequests(
@@ -41,6 +53,7 @@ query(
       nodes {
         iid title state draft updatedAt
         sourceBranch @include(if: $includeSourceBranch)
+        targetBranch @include(if: $includeTargetBranch)
         labels(first: 100) @include(if: $includeLabels) {
           nodes { title }
           pageInfo { hasNextPage }
@@ -122,9 +135,8 @@ query($fullPath: ID!, $targetBranches: [String!], $after: String, $carAfter: Str
 }
 """
 
-# GitLab rejects a GraphQL query above complexity 250. Each aliased merge request costs about 23 points,
-# so 8 per query (about 184) leaves headroom. Larger batches run as several sequential queries.
-GRAPHQL_MR_CHUNK = 8
+# The lowercased detailed merge status of an MR that GitLab reports as blocked.
+BLOCKED_STATUS = "blocked_status"
 
 # Long descriptions are cut to keep one tool result small. The flag tells the agent it was cut.
 DESCRIPTION_CAP = 4000
@@ -149,6 +161,7 @@ class MergeRequestSummary(BaseModel):
     iid: int
     title: str
     source_branch: str | None = None
+    target_branch: str | None = None
     labels: list[str] = Field(default_factory=list)
     labels_truncated: bool = False
     author: str | None  # Null when the author was deleted or banned.
@@ -168,7 +181,8 @@ class MergeRequestList(BaseModel):
         description=(
             "TSV with a header row. Columns: iid, title, author, state, draft, approved, "
             "approved_by, open_threads, updated. approved_by is comma-separated usernames. "
-            "An empty cell means none. Booleans are true/false. source_branch and labels are appended only when asked; "
+            "An empty cell means none. Booleans are true/false. source_branch, target_branch, and labels are appended "
+            "only when asked; "
             "labels is a JSON array in one cell, and labels_complete reports whether all returned labels were included."
         ),
     )
@@ -229,6 +243,9 @@ class MergeRequestDetail(BaseModel):
     failed_jobs: str = Field(default="", exclude_if=lambda value: not value)
     jobs_complete: bool = Field(default=True, exclude_if=lambda value: value)
     auto_merge_strategy: str = Field(default="", exclude_if=lambda v: not v)
+    blocked_by: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)  # Blocked MRs only.
+    hidden_blockers: int = Field(default=0, exclude_if=lambda v: not v)  # Blockers the token cannot see.
+    commits_behind: int | None = Field(default=None, exclude_if=lambda value: value is None)  # Open MRs, when asked.
     changes: DiffSummary | None = Field(default=None, exclude_if=lambda v: v is None)
     threads: ThreadIndex
 
@@ -252,6 +269,9 @@ class CompactMergeRequest(BaseModel):
     approved: bool
     approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     pipeline_status: str = Field(default="", exclude_if=lambda v: not v)
+    blocked_by: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)  # Blocked MRs only.
+    hidden_blockers: int = Field(default=0, exclude_if=lambda v: not v)  # Blockers the token cannot see.
+    commits_behind: int | None = Field(default=None, exclude_if=lambda value: value is None)  # Open MRs, when asked.
     description: str = Field(default="", exclude_if=lambda v: not v)
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
 
@@ -283,12 +303,15 @@ def _to_tsv(
     mrs: list[MergeRequestSummary],
     *,
     include_source_branch: bool = False,
+    include_target_branch: bool = False,
     include_labels: bool = False,
 ) -> str:
     """Render merge requests as TSV, appending optional data columns when requested."""
     columns = list(TSV_COLUMNS)
     if include_source_branch:
         columns.append("source_branch")
+    if include_target_branch:
+        columns.append("target_branch")
     if include_labels:
         columns.append("labels")
     lines = ["\t".join(columns)]
@@ -296,6 +319,8 @@ def _to_tsv(
         values = [_cell(getattr(mr, column)) for column in TSV_COLUMNS]
         if include_source_branch:
             values.append(_cell(mr.source_branch))
+        if include_target_branch:
+            values.append(_cell(mr.target_branch))
         if include_labels:
             # JSON escaping keeps tabs and newlines inside one TSV cell.
             values.append(json.dumps(mr.labels, ensure_ascii=False, separators=(",", ":")))
@@ -307,6 +332,7 @@ def _to_summary(
     node: dict[str, Any],
     *,
     include_source_branch: bool = False,
+    include_target_branch: bool = False,
     include_labels: bool = False,
 ) -> MergeRequestSummary:
     """Convert one GraphQL merge request node into a summary."""
@@ -317,6 +343,7 @@ def _to_summary(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
         source_branch=node.get("sourceBranch") if include_source_branch else None,
+        target_branch=node.get("targetBranch") if include_target_branch else None,
         labels=[label["title"] for label in label_connection["nodes"]] if label_connection else [],
         labels_truncated=label_connection["pageInfo"]["hasNextPage"] if label_connection else False,
         author=author["username"] if author else None,
@@ -405,6 +432,10 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         bool,
         Field(description="Append the source branch column. Defaults to false to keep output compact."),
     ] = False,
+    include_target_branch: Annotated[
+        bool,
+        Field(description="Append the target branch column. Defaults to false to keep output compact."),
+    ] = False,
     include_labels: Annotated[
         bool,
         Field(description="Append labels as a JSON array in one TSV cell. Defaults to false."),
@@ -424,8 +455,8 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
     `search` uses GitLab's `Project.mergeRequests(search:)` filter, which matches
     text in the title or description.
     `created_after` and `updated_after` accept timezone-aware ISO 8601 datetimes.
-    `target_branch` filters by target branch. `include_source_branch` and `include_labels`
-    append columns only when requested. Labels are JSON arrays inside a TSV cell;
+    `target_branch` filters by target branch. `include_source_branch`, `include_target_branch`, and
+    `include_labels` append columns only when requested, in that order. Labels are JSON arrays inside a TSV cell;
     `labels_complete` is false when any returned label list exceeds its first 100 labels.
     `approved` and `has_open_threads` are filtered after fetching, so the tool
     scans at most 5 pages. If `has_more` is true but fewer than `limit` MRs
@@ -445,6 +476,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         "updatedAfter": updated_after,
         "targetBranches": [target_branch] if target_branch is not None else None,
         "includeSourceBranch": include_source_branch,
+        "includeTargetBranch": include_target_branch,
         "includeLabels": include_labels,
         "after": None,
         "first": 100 if filtered else limit,
@@ -458,7 +490,12 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
             raise ProjectNotFoundError(project)
         connection = data["project"]["mergeRequests"]
         summaries = [
-            _to_summary(node, include_source_branch=include_source_branch, include_labels=include_labels)
+            _to_summary(
+                node,
+                include_source_branch=include_source_branch,
+                include_target_branch=include_target_branch,
+                include_labels=include_labels,
+            )
             for node in connection["nodes"]
         ]
         collected.extend(mr for mr in summaries if _matches(mr, approved, has_open_threads))
@@ -474,6 +511,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         merge_requests=_to_tsv(
             displayed,
             include_source_branch=include_source_branch,
+            include_target_branch=include_target_branch,
             include_labels=include_labels,
         ),
         has_more=len(collected) > limit or has_next,
@@ -711,6 +749,50 @@ def _to_compact_detail(
     )
 
 
+async def _add_blockers(
+    client: GitLabClient,
+    project: str,
+    details: list[MergeRequestDetail] | list[CompactMergeRequest],
+) -> None:
+    """Fill the blocker fields of every blocked merge request, using one lookup for all of them.
+
+    The lookup is extra detail, so a failure leaves the fields empty and the read still succeeds.
+    """
+    blocked = [detail for detail in details if detail.merge_status == BLOCKED_STATUS]
+    if not blocked:
+        return
+    try:
+        blockers = await fetch_blockers(client, project, [detail.iid for detail in blocked])
+    except ToolError:
+        # Some GitLab editions lack this field, and a token may not be allowed to read it. The MR status still stands.
+        return
+    for detail in blocked:
+        found = blockers[detail.iid]
+        detail.blocked_by = found.iids
+        detail.hidden_blockers = found.hidden
+
+
+async def _add_commits_behind(
+    client: GitLabClient,
+    project: str,
+    details: list[MergeRequestDetail] | list[CompactMergeRequest],
+) -> None:
+    """Fill `commits_behind` for each open merge request, with one REST call per merge request.
+
+    Merged and closed merge requests are skipped, because their source branch no longer moves and the count
+    means little. The count is extra detail, like blockers, so a failed read leaves the field empty and the
+    merge request read still succeeds. A refused read, such as a token limit, must not hide the rest of the MR.
+    """
+    for detail in details:
+        if detail.state != "opened":
+            continue
+        try:
+            mr = await client.get(mr_rest_path(project, detail.iid), include_diverged_commits_count=True)
+        except ToolError:
+            continue
+        detail.commits_behind = mr.get("diverged_commits_count")  # GitLab may send null.
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls one optional detail.
     ctx: Context,
@@ -728,6 +810,15 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         int,
         Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
     ] = DESCRIPTION_CAP,
+    include_commits_behind: Annotated[
+        bool,
+        Field(
+            description=(
+                "Add commits_behind, the number of target branch commits missing from the source branch. "
+                "One extra REST call per MR. Defaults to false."
+            ),
+        ),
+    ] = False,
 ) -> MergeRequestDetail:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
@@ -742,6 +833,9 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       4000 characters.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
       the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
+    - Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are not visible to the token.
+    - `commits_behind` (with `include_commits_behind=true`) counts target branch commits missing from the source
+      branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
     """
     include_description = include_description and description_limit > 0
     client = get_client(ctx)
@@ -754,6 +848,9 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         includeJobs=include_jobs,
     )
     detail = _to_detail(node, include_description=include_description, description_limit=description_limit)
+    await _add_blockers(client, project, [detail])
+    if include_commits_behind:
+        await _add_commits_behind(client, project, [detail])
     pipeline = node["headPipeline"]
     if not include_jobs or pipeline is None:
         return detail
@@ -826,7 +923,7 @@ async def _fetch_compact_chunk(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
-async def get_merge_requests(
+async def get_merge_requests(  # noqa: PLR0913, PLR0917 - each argument controls one optional detail.
     ctx: Context,
     project: Project,
     iids: Annotated[list[PositiveIid], Field(description="Positive merge request IIDs. Up to 20 unique IIDs.")],
@@ -835,6 +932,15 @@ async def get_merge_requests(
         int,
         Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
     ] = DESCRIPTION_CAP,
+    include_commits_behind: Annotated[
+        bool,
+        Field(
+            description=(
+                "Add commits_behind, the number of target branch commits missing from the source branch. "
+                "One extra REST call per MR. Defaults to false."
+            ),
+        ),
+    ] = False,
 ) -> MergeRequestBatch:
     """Return compact status for up to 20 merge requests, similar to `glab mr view`.
 
@@ -842,7 +948,9 @@ async def get_merge_requests(
     values. Missing IIDs are listed separately. This compact result has no reviewers, changes, or discussion/thread
     indexes. Descriptions are skipped by default; set `include_description` to true to include up to 4000 characters.
     Set `description_limit` to zero to skip descriptions even when requested. Batches above 8 IIDs run as several
-    sequential GraphQL queries.
+    sequential GraphQL queries. Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are
+    not visible to the token. With `include_commits_behind=true`, each open MR also gets `commits_behind`, read with
+    one REST call per MR in sequence.
     """
     unique_iids = list(dict.fromkeys(iids))
     if not unique_iids:
@@ -869,4 +977,7 @@ async def get_merge_requests(
                 description_limit=description_limit,
             ),
         )
+    await _add_blockers(client, project, merge_requests)
+    if include_commits_behind:
+        await _add_commits_behind(client, project, merge_requests)
     return MergeRequestBatch(merge_requests=merge_requests, missing_iids=missing_iids)

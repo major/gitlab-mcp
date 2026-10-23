@@ -2,6 +2,7 @@
 
 import json
 from typing import Any
+lazy from collections.abc import Callable
 
 import httpx
 import pytest
@@ -17,7 +18,10 @@ from mcp_helpers import call_tool as call_mcp_tool
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
+BLOCKER_IIDS = [2100, 2101]
+HIDDEN_BLOCKERS = 3
 PIPELINE_JOBS = "https://gitlab.example.com/api/v4/projects/group%2Fproject/pipelines/123/jobs"
+MR_REST = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187"
 HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA. Write tools need it exact, so output keeps all of it.
 POSITION = {"oldPath": "docs/sop.md", "newPath": "docs/sop.md", "oldLine": None, "newLine": 212}
 RENAMED_POSITION = {"oldPath": "docs/old.md", "newPath": "docs/new.md", "oldLine": None, "newLine": 3}
@@ -157,6 +161,153 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
             "index_complete": True,
         },
     }
+
+
+def blockers_response(visible: list[int], hidden: int = 0) -> httpx.Response:
+    """Wrap visible blocker IIDs in the aliased reply of the blockers query for one merge request."""
+    node = {
+        "blockingMergeRequests": {"visibleMergeRequests": [{"iid": str(iid)} for iid in visible], "hiddenCount": hidden}
+    }
+    return httpx.Response(200, json={"data": {"project": {"mr_0": node}}})
+
+
+def serve_mr_and_blockers(node: dict[str, Any], blockers: httpx.Response) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer the blockers query with `blockers`, and every other GraphQL query with the merge request node."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Route by query text, the way GitLab would answer the two different queries."""
+        if "blockingMergeRequests" in json.loads(request.content)["query"]:
+            return blockers
+        return graphql_response(node)
+
+    return handler
+
+
+@respx.mock
+async def test_blocked_merge_request_lists_visible_and_hidden_blockers(gitlab_env):
+    """A blocked merge request gets its blocker IIDs from one extra query, plus the count of hidden ones."""
+    # Arrange
+    node = make_mr(detailedMergeStatus="BLOCKED_STATUS")
+    route = respx.post(GRAPHQL).mock(
+        side_effect=serve_mr_and_blockers(node, blockers_response(BLOCKER_IIDS, HIDDEN_BLOCKERS))
+    )
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    queries = [json.loads(call.request.content)["query"] for call in route.calls]
+    assert ["blockingMergeRequests" in query for query in queries] == [False, True]
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid0": str(IID)}
+    assert data["merge_status"] == "blocked_status"
+    assert data["blocked_by"] == BLOCKER_IIDS
+    assert data["hidden_blockers"] == HIDDEN_BLOCKERS
+
+
+@pytest.mark.parametrize("merge_status", ["MERGEABLE", "DISCUSSIONS_NOT_RESOLVED"])
+@respx.mock
+async def test_unblocked_merge_request_sends_no_blockers_query(gitlab_env, merge_status):
+    """Only blocked merge requests look up blockers, so other reads keep their single query."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(detailedMergeStatus=merge_status)))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert route.call_count == 1
+    assert "blockingMergeRequests" not in json.loads(route.calls.last.request.content)["query"]
+    assert "blocked_by" not in data
+    assert "hidden_blockers" not in data
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (200, {"errors": [{"message": "Field 'blockingMergeRequests' doesn't exist on type 'MergeRequest'"}]}),
+        (500, {"message": "Boom"}),
+    ],
+    ids=["field-missing-on-this-edition", "http-500"],
+)
+@respx.mock
+async def test_failed_blockers_query_keeps_the_merge_request_read(gitlab_env, status, body):
+    """Blocker data is extra, so a failed lookup leaves the blocker fields out and the read still succeeds."""
+    # Arrange
+    node = make_mr(detailedMergeStatus="BLOCKED_STATUS")
+    respx.post(GRAPHQL).mock(side_effect=serve_mr_and_blockers(node, httpx.Response(status, json=body)))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert data["iid"] == IID
+    assert data["merge_status"] == "blocked_status"
+    assert "blocked_by" not in data
+    assert "hidden_blockers" not in data
+
+
+@respx.mock
+async def test_commits_behind_is_not_read_unless_asked(gitlab_env):
+    """Without the flag, the divergence count is never requested, so the extra REST call is saved."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+    rest = respx.get(MR_REST).mock(return_value=httpx.Response(200, json={"diverged_commits_count": 4}))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert rest.call_count == 0
+    assert "commits_behind" not in data
+
+
+@pytest.mark.parametrize("count", [0, 7, None], ids=["zero", "positive", "null"])
+@respx.mock
+async def test_include_commits_behind_reads_the_divergence_count(gitlab_env, count):
+    """The flag asks REST for the count. Zero is a real answer, and a null count leaves the field out."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+    rest = respx.get(MR_REST).mock(return_value=httpx.Response(200, json={"diverged_commits_count": count}))
+
+    # Act
+    data = await call_tool(include_commits_behind=True)
+
+    # Assert
+    assert rest.calls.last.request.url.params["include_diverged_commits_count"] == "true"
+    assert data.get("commits_behind") == count
+    assert ("commits_behind" in data) is (count is not None)
+
+
+@pytest.mark.parametrize("status", [403, 500], ids=["forbidden", "server-error"])
+@respx.mock
+async def test_failed_commits_behind_read_keeps_the_merge_request(gitlab_env, status):
+    """A refused divergence read leaves the field out, and the merge request read still succeeds."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+    respx.get(MR_REST).mock(return_value=httpx.Response(status, json={"message": "Boom"}))
+
+    # Act
+    data = await call_tool(include_commits_behind=True)
+
+    # Assert
+    assert data["iid"] == IID
+    assert "commits_behind" not in data
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+@respx.mock
+async def test_finished_merge_request_skips_the_divergence_read(gitlab_env, state):
+    """Only open MRs get a count, because a merged or closed source branch no longer moves."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(state=state)))
+    rest = respx.get(MR_REST).mock(return_value=httpx.Response(200, json={"diverged_commits_count": 4}))
+
+    # Act
+    data = await call_tool(include_commits_behind=True)
+
+    # Assert
+    assert rest.call_count == 0
+    assert "commits_behind" not in data
 
 
 @respx.mock

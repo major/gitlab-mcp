@@ -24,7 +24,7 @@ NEW_SHA = "0f1e2d3c4b5a69788796a5b4c3d2e1f00fedcba9"  # The head after a rebase.
 MERGE_ERROR = "Rebase failed because the source branch changed."
 KNOWN_USERS = ("alice", "bob")
 MUTATION_PAYLOADS = ("mergeRequestSetDraft", "mergeRequestSetReviewers", "mergeRequestSetAssignees")
-GRAPHQL_MARKERS = ("users(", *MUTATION_PAYLOADS, "mergeRequest(")
+GRAPHQL_MARKERS = ("users(", *MUTATION_PAYLOADS, "blockingMergeRequests", "mergeRequest(")
 READ_BACK = {
     "state": "opened",
     "draft": False,
@@ -69,12 +69,16 @@ def mr_body(**fields: Any) -> dict[str, Any]:
 
 
 def default_graphql_body(query: str) -> dict[str, Any]:
-    """Answer like a healthy GitLab: every user exists, every mutation succeeds, and the MR is open."""
+    """Answer like a healthy GitLab: users exist, mutations succeed, the MR is open, and it has no blockers."""
     if "users(" in query:
         return {"data": {"users": {"nodes": [{"username": name} for name in KNOWN_USERS]}}}
     for payload in MUTATION_PAYLOADS:
         if payload in query:
             return {"data": {payload: {"errors": []}}}
+    if "blockingMergeRequests" in query:
+        return {
+            "data": {"project": {"mr_0": {"blockingMergeRequests": {"visibleMergeRequests": [], "hiddenCount": 0}}}}
+        }
     return mr_body()
 
 
@@ -449,6 +453,121 @@ async def test_block_lookup_failure_skips_the_deletes(gitlab_env, router):
     assert "HTTP 500" in data["failed"]["remove_blocked_by"]
 
 
+def blockers_reply(visible: list[int], hidden: int = 0) -> dict[str, Any]:
+    """Build the GraphQL reply of the blockers query for this merge request."""
+    node = {
+        "blockingMergeRequests": {"visibleMergeRequests": [{"iid": str(iid)} for iid in visible], "hiddenCount": hidden}
+    }
+    return {"data": {"project": {"mr_0": node}}}
+
+
+async def test_blocked_by_lists_every_visible_blocker_after_an_add(gitlab_env, router):
+    """After an add, blocked_by is the full list, so blockers that were already there are shown too."""
+    # Arrange
+    routes = serve_writes(router, replies={"blockingMergeRequests": blockers_reply([6, 5])})
+
+    # Act
+    data = await call_tool(add_blocked_by=[5])
+
+    # Assert
+    assert data["applied"] == ["blocked_by:5"]
+    assert data["blocked_by"] == [6, 5]
+    assert graphql_calls(routes["graphql"], "blockingMergeRequests") == [{"fullPath": PROJECT, "iid0": str(IID)}]
+
+
+async def test_blocked_by_is_an_empty_list_after_the_last_blocker_is_removed(gitlab_env, router):
+    """Removing the last blocker sends an empty list, so the caller can tell that none are left."""
+    # Arrange
+    routes = serve_writes(router, replies={"blockingMergeRequests": blockers_reply([])})
+    routes["list_blocks"].mock(return_value=httpx.Response(200, json=[block(10, 5)]))
+    router.delete(f"{MR}/blocks/10").mock(return_value=httpx.Response(204))
+
+    # Act
+    data = await call_tool(remove_blocked_by=[5])
+
+    # Assert
+    assert data["applied"] == ["blocked_by:5"]
+    assert data["blocked_by"] == []
+
+
+async def test_blockers_are_not_read_without_a_blocker_change(gitlab_env, router):
+    """A call that does not touch blockers does not ask for them, and the result has no blocked_by."""
+    # Arrange
+    routes = serve_writes(router)
+
+    # Act
+    data = await call_tool(title="New")
+
+    # Assert
+    assert graphql_calls(routes["graphql"], "blockingMergeRequests") == []
+    assert "blocked_by" not in data
+
+
+async def test_failed_blockers_read_omits_blocked_by_and_warns(gitlab_env, router):
+    """A failed blockers read leaves blocked_by out, and the warning says the blockers could not be read."""
+    # Arrange
+    serve_writes(router, replies={"blockingMergeRequests": httpx.Response(500, json={"message": "Boom"})})
+
+    # Act
+    data = await call_tool(add_blocked_by=[5])
+
+    # Assert
+    assert data["applied"] == ["blocked_by:5"]
+    assert "blocked_by" not in data
+    assert data["warning"].startswith("Could not read the blockers back")
+
+
+@pytest.mark.parametrize(
+    "node",
+    [None, {"blockingMergeRequests": None}],
+    ids=["missing-merge-request", "null-connection"],
+)
+async def test_missing_blocker_data_means_no_blockers(gitlab_env, router, node):
+    """A missing merge request node or a null connection reads as no blockers, not as an error."""
+    # Arrange
+    serve_writes(router, replies={"blockingMergeRequests": {"data": {"project": {"mr_0": node}}}})
+
+    # Act
+    data = await call_tool(add_blocked_by=[5])
+
+    # Assert
+    assert data["blocked_by"] == []
+    assert "warning" not in data
+
+
+async def test_missing_project_on_the_blockers_read_warns(gitlab_env, router):
+    """A null project in the blockers read is a failed read, so blocked_by is left out with a warning."""
+    # Arrange
+    serve_writes(router, replies={"blockingMergeRequests": {"data": {"project": None}}})
+
+    # Act
+    data = await call_tool(add_blocked_by=[5])
+
+    # Assert
+    assert "blocked_by" not in data
+    assert "not found" in data["warning"]
+
+
+async def test_failed_reread_and_failed_blockers_read_both_warn(gitlab_env, router):
+    """When both reads fail, the warning keeps both messages."""
+    # Arrange
+    serve_writes(
+        router,
+        replies={
+            "blockingMergeRequests": httpx.Response(500, json={"message": "Boom"}),
+            "mergeRequest(": httpx.Response(500, json={"message": "Boom"}),
+        },
+    )
+
+    # Act
+    data = await call_tool(add_blocked_by=[5])
+
+    # Assert
+    assert "blocked_by" not in data
+    assert "Could not read the merge request back" in data["warning"]
+    assert "Could not read the blockers back" in data["warning"]
+
+
 async def test_approve_sends_the_head_sha(gitlab_env, router):
     """Approve sends the full head SHA as the guard."""
     # Arrange
@@ -646,6 +765,7 @@ async def test_steps_run_in_the_documented_order(gitlab_env, router):
         "POST /blocks",
         "POST /approve",
         "mergeRequest(",
+        "blockingMergeRequests",
     ]
 
 

@@ -12,7 +12,7 @@ lazy from fastmcp import Context
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import MAX_PAGES, Iid, Project, lower_or_empty
-from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_merge_request, mr_rest_path
+from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_blockers, fetch_merge_request, mr_rest_path
 from gitlab_mcp.tools.labels import validate_project_labels
 
 # Queries and mutations for update_merge_request. Each one changes one thing, so each step can fail on its own. 🔧
@@ -103,6 +103,8 @@ class MergeRequestUpdate(BaseModel):
     head_sha: str = Field(default="", exclude_if=lambda v: not v)  # Full head SHA after the update.
     reviewers: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     assignees: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Full list of visible blockers after a blocker change. An empty list means none are left.
+    blocked_by: list[int] | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the final state could not be read.
 
 
@@ -342,6 +344,19 @@ class _Update:
                 final["assignees"] = assignees
         return final
 
+    async def read_blockers(self) -> tuple[list[int] | None, str]:
+        """Re-read the blockers after a blocker change. Returns the IIDs, or a warning when the read fails.
+
+        A failed read gives `None` for the IIDs, so the result does not claim a list that was never checked.
+        """
+        if not (self.changes.add_blocked_by or self.changes.remove_blocked_by):
+            return None, ""
+        try:
+            blockers = await fetch_blockers(self.client, self.project, [self.iid])
+        except ToolError as exc:
+            return None, f"Could not read the blockers back. Check them with get_merge_request. {exc}"
+        return blockers[self.iid].iids, ""
+
     async def _fields(self) -> None:
         """Send one PUT with every plain field that was given."""
         body = self.changes.fields_body()
@@ -526,6 +541,7 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     - `approve` needs `sha`, the full `head_sha` from get_merge_request. Approve in its own call, because
       approval may not survive a rebase or a target_branch change.
     - Usernames must be real users. Blockers are IIDs of MRs in this same project.
+    - After a blocker change, `blocked_by` lists the visible blocker IIDs. An empty list means none are left.
     - An invalid request sends nothing: no changes, the same item in an add and a remove list,
       or approve with rebase or target_branch.
     - Needs a token with the `api` scope.
@@ -555,10 +571,15 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     if not (update.applied or update.pending or update.unknown):
         raise ToolError("; ".join(f"{name}: {reason}" for name, reason in update.failed.items()))
     final = await update.read_back()
+    blocked_by, blockers_warning = await update.read_blockers()
+    if blockers_warning:
+        # Both re-reads can fail. Join the warnings so neither one is lost.
+        final["warning"] = " ".join(filter(None, (final.get("warning"), blockers_warning)))
     return MergeRequestUpdate(
         applied=update.applied,
         pending=update.pending,
         unknown=update.unknown,
         failed=update.failed,
+        blocked_by=blocked_by,
         **final,
     )
