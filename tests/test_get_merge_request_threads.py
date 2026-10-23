@@ -683,7 +683,7 @@ async def test_headings_view_uses_newest_human_note_with_deleted_author(gitlab_e
     ("body", "expected"),
     [
         ("  \n First useful line \nAnother line", "First useful line"),
-        ("# " + "x" * 180, "x" * 160),
+        ("# " + "x" * 240, "x" * 200),
         ("<!-- review-bot:finding only marker -->", ""),
     ],
     ids=["first-nonempty-line", "heading-cap", "stripped-review-marker"],

@@ -65,6 +65,20 @@ query($fullPath: ID!, $iid: String!, $after: String) {
 }
 """
 
+# Discussion IDs and resolution flags only, for resolve_open_threads. 🔓
+OPEN_THREAD_IDS_QUERY = """
+query($fullPath: ID!, $iid: String!, $after: String) {
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) {
+      discussions(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id resolvable resolved }
+      }
+    }
+  }
+}
+"""
+
 # Exact thread totals without fetching discussion pages or note bodies. 🧮
 THREAD_COUNTS_QUERY = """
 query($fullPath: ID!, $iid: String!) {
@@ -88,7 +102,7 @@ THREAD_BODY_BUDGET = 30000
 # Serialized character budget for compact heading results.
 THREAD_HEADING_BUDGET = 30000
 # Headings are capped so one unusually long note cannot dominate a compact result.
-THREAD_HEADING_CAP = 160
+THREAD_HEADING_CAP = 200
 
 
 # "comment" means the discussion cannot be resolved, like a plain MR comment.
@@ -236,6 +250,17 @@ class ThreadReplyBatchResult(BaseModel):
     results: list[ThreadReplyBatchItem]
 
 
+class ResolveOpenThreadsResult(BaseModel):
+    """The outcome of resolving every open thread on one merge request."""
+
+    resolved: list[str]  # Bare thread IDs, in the order GitLab listed them.
+    problems: list[ThreadReplyBatchItem] = Field(default_factory=list, exclude_if=lambda value: not value)
+    # The MR's open thread count after the writes, or None if it could not be read.
+    open_threads: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    # False means more than MAX_PAGES pages of discussions exist. Run the tool again after these resolve.
+    complete: bool = Field(default=True, exclude_if=lambda value: value)
+
+
 def _bare_ids(ids: list[str]) -> list[str]:
     """Return bare discussion SHAs in input order, without duplicates. Full GIDs and bare SHAs both work."""
     return list(dict.fromkeys(bare_id(thread_id) for thread_id in ids))
@@ -285,7 +310,7 @@ def _strip_trailing_finding(body: str) -> str:
 
 
 def _thread_heading(body: str) -> str:
-    """Return the first Markdown heading, or the first nonempty line, capped at 160 characters."""
+    """Return the first Markdown heading, or the first nonempty line, capped at 200 characters."""
     body = _strip_trailing_finding(body)
     markdown_heading = re.search(r"(?m)^[ \t]{0,3}#{1,6}(?:[ \t]+|$)(.*)$", body)
     if markdown_heading:
@@ -558,7 +583,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - Trailing `review-bot:finding` comments are removed.
     - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
       the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
-      160 characters. It includes no note bodies or replies.
+      200 characters. It includes no note bodies or replies.
     - `view="finding"` returns full notes like `full`, but compacts recognized bot findings. Numbered findings lose
       separate greetings and signoffs. Section findings keep the bold title and the "Needs to be improved", "Failure
       scenario", and "How to fix" sections, including their code and diagrams. A bold-heading action-bullet format
@@ -728,6 +753,33 @@ async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write 
     return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=True if resolve else None)
 
 
+def _is_uncertain_write_error(exc: ToolError) -> bool:
+    """Return True when a failed write may still have reached GitLab, so its outcome is unknown.
+
+    Connection errors, timeouts, and 5xx responses can hide a completed write. Other API errors are definite failures.
+    """
+    return (
+        isinstance(exc, GitLabConnectionError)
+        or (isinstance(exc, GitLabAPIError) and (exc.status == HTTP_REQUEST_TIMEOUT or exc.status >= HTTP_SERVER_ERROR))
+        or "outcome is unknown" in str(exc).lower()
+    )
+
+
+def _failed_write_item(iid: int, thread_id: str, exc: ToolError) -> ThreadReplyBatchItem:
+    """Return the batch row for a write that raised. Uncertain outcomes are marked "unknown", not "failed"."""
+    uncertain = _is_uncertain_write_error(exc)
+    warning = str(exc)
+    if uncertain and "outcome is unknown" not in warning.lower():
+        warning = f"Write outcome is unknown: {warning} Check get_merge_request_threads before retrying."
+    return ThreadReplyBatchItem(
+        iid=iid,
+        thread_id=thread_id,
+        status="unknown" if uncertain else "failed",
+        resolved=None,
+        warning=warning,
+    )
+
+
 @mcp.tool(
     annotations={
         "readOnlyHint": False,
@@ -803,26 +855,7 @@ async def reply_to_threads(
                 reply.resolve,
             )
         except ToolError as exc:
-            uncertain = (
-                isinstance(exc, GitLabConnectionError)
-                or (
-                    isinstance(exc, GitLabAPIError)
-                    and (exc.status == HTTP_REQUEST_TIMEOUT or exc.status >= HTTP_SERVER_ERROR)
-                )
-                or "outcome is unknown" in str(exc).lower()
-            )
-            warning = str(exc)
-            if uncertain and "outcome is unknown" not in warning.lower():
-                warning = f"Write outcome is unknown: {warning} Check get_merge_request_threads before retrying."
-            results.append(
-                ThreadReplyBatchItem(
-                    iid=reply.iid,
-                    thread_id=thread_id,
-                    status="unknown" if uncertain else "failed",
-                    resolved=None,
-                    warning=warning,
-                )
-            )
+            results.append(_failed_write_item(reply.iid, thread_id, exc))
             continue
 
         warning = outcome.warning
@@ -850,3 +883,62 @@ async def reply_to_threads(
             )
         )
     return ThreadReplyBatchResult(results=results)
+
+
+async def _open_thread_ids(client: GitLabClient, project: str, iid: int) -> tuple[list[str], bool]:
+    """Return the bare IDs of open resolvable threads, and whether every discussion page was read.
+
+    Reads at most MAX_PAGES pages. The second value is False when more pages exist after that.
+    """
+    open_ids: list[str] = []
+    after: str | None = None
+    for _ in range(MAX_PAGES):
+        node = await fetch_merge_request(client, OPEN_THREAD_IDS_QUERY, project, iid, after=after)
+        connection = node["discussions"]
+        open_ids.extend(
+            bare_id(discussion["id"])
+            for discussion in connection["nodes"]
+            if discussion["resolvable"] and not discussion["resolved"]
+        )
+        page_info = connection["pageInfo"]
+        if not page_info["hasNextPage"]:
+            return open_ids, True
+        after = page_info["endCursor"]
+    return open_ids, False
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+async def resolve_open_threads(ctx: Context, project: Project, iid: Iid) -> ResolveOpenThreadsResult:
+    """Resolve every open review thread on one merge request. Like `glab mr note resolve` for each open thread.
+
+    Get user approval before resolving threads. This only resolves; it posts no replies. Threads resolve one at a
+    time, and a failed thread does not stop the rest. Writes are never retried. `resolved` lists the bare IDs of
+    threads that were resolved. `problems` lists each thread that failed or has an unknown outcome, with a status and
+    warning. `open_threads` is the MR's open thread count after the writes, and it is left out if that count cannot
+    be read. `complete=false` means the MR has more discussions than fit in the scan limit, so run this tool again.
+    Cheaper than listing thread IDs and then calling `reply_to_threads`.
+    """
+    client = get_client(ctx)
+    thread_ids, complete = await _open_thread_ids(client, project, iid)
+    resolved: list[str] = []
+    problems: list[ThreadReplyBatchItem] = []
+    for thread_id in thread_ids:
+        try:
+            outcome = await _write_thread_reply(client, project, iid, thread_id, None, True)
+        except ToolError as exc:
+            problems.append(_failed_write_item(iid, thread_id, exc))
+            continue
+        resolved.append(outcome.thread_id)
+    return ResolveOpenThreadsResult(
+        resolved=resolved,
+        problems=problems,
+        open_threads=await _read_open_threads(client, project, iid),
+        complete=complete,
+    )
