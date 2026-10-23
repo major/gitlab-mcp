@@ -83,6 +83,7 @@ STEP_STATUS_REASONS = {
 BLOCKS_PAGE_SIZE = 100
 # A rebase is watched for about 10 seconds: poll this many times, waiting this long before each poll. ⏱️
 REBASE_POLL_ATTEMPTS = 5
+# Tests set this to 0 so the poll loop runs instantly. ⚡
 REBASE_POLL_DELAY = 2.0
 
 
@@ -116,11 +117,6 @@ def _verified_usernames(connection: Any) -> list[str] | None:
     ):
         return None
     return [node["username"] for node in nodes]
-
-
-async def _wait(seconds: float) -> None:
-    """Pause for `seconds`. It is a module-level function, so tests can replace it with a no-op."""
-    await asyncio.sleep(seconds)
 
 
 class NothingToUpdateError(ToolError):
@@ -463,7 +459,7 @@ class _Update:
         `merge_error`. A failed poll leaves it pending, because GitLab already accepted the write.
         """
         for _ in range(REBASE_POLL_ATTEMPTS):
-            await _wait(REBASE_POLL_DELAY)
+            await asyncio.sleep(REBASE_POLL_DELAY)
             try:
                 mr = await self.client.get(self.path, include_rebase_in_progress=True)
             except ToolError:
