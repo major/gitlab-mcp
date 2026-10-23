@@ -7,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from gitlab_mcp.server import MAX_PAGES
+from gitlab_mcp.common import MAX_PAGES
 from mcp_helpers import call_tool_result as call_mcp_tool_result
 
 BASE = "https://gitlab.example.com/api/v4"

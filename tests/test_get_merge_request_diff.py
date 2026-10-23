@@ -10,7 +10,8 @@ import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import DIFF_BUDGET, MAX_PAGES
+from gitlab_mcp.common import MAX_PAGES
+from gitlab_mcp.tools.mr_diff import DIFF_BUDGET
 from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
