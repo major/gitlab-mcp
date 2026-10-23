@@ -9,7 +9,8 @@ import respx
 from fastmcp.exceptions import ToolError
 lazy from mcp.types import CallToolResult, TextContent
 
-from gitlab_mcp.server import MAX_PAGES, TSV_COLUMNS
+from gitlab_mcp.common import MAX_PAGES
+from gitlab_mcp.tools.mr_read import TSV_COLUMNS
 from mcp_helpers import call_tool_result as call_mcp_tool_result
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"

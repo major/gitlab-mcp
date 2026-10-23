@@ -8,7 +8,7 @@ import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import DESCRIPTION_CAP
+from gitlab_mcp.tools.mr_read import DESCRIPTION_CAP
 from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
