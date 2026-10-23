@@ -11,14 +11,19 @@ from gitlab_mcp.server import mcp
 # One name per line, alphabetical, so a new tool is a one-line change.
 READ_ONLY_TOOLS = {
     "get_current_user",
+    "get_job",
+    "get_job_log",
     "get_merge_request",
     "get_merge_request_diff",
     "get_merge_request_threads",
     "get_merge_requests",
+    "get_pipeline",
     "get_work_item",
     "list_labels",
     "list_merge_requests",
     "list_merge_train",
+    "list_pipeline_schedules",
+    "list_pipelines",
     "list_work_item_notes",
 }
 WRITE_TOOLS = {
@@ -187,6 +192,15 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             set(),
             {"created_after", "updated_after", "target_branch", "include_source_branch", "include_labels"},
         ),
+        (
+            "list_pipelines",
+            {"project"},
+            {"mr_iid", "schedule_id", "ref", "status", "source", "updated_after", "limit", "cursor"},
+        ),
+        ("get_pipeline", {"project", "pipeline_id"}, {"statuses", "include_retried", "limit", "cursor"}),
+        ("get_job", {"project", "job_id"}, set()),
+        ("list_pipeline_schedules", {"project"}, {"active", "limit", "cursor"}),
+        ("get_job_log", {"project", "job_id"}, {"view", "max_chars"}),
     ],
 )
 async def test_new_and_extended_options_are_in_the_schema(tools, name, required, optional):
@@ -219,3 +233,78 @@ async def test_work_item_iid_descriptions_are_scoped_to_work_item_tools(tools, n
 
     # Act / Assert
     assert iid_schema["description"] == expected_description
+
+
+def integer_schema(prop: dict[str, Any]) -> dict[str, Any]:
+    """Return the integer branch of a property schema. Optional fields wrap it in anyOf with null."""
+    branches = prop.get("anyOf", [prop])
+    return next(branch for branch in branches if branch.get("type") == "integer")
+
+
+def enum_values(prop: dict[str, Any]) -> list[str]:
+    """Return the enum values of a Literal property. Optional fields wrap it in anyOf with null."""
+    branches = prop.get("anyOf", [prop])
+    return next(branch["enum"] for branch in branches if "enum" in branch)
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "minimum", "maximum"),
+    [
+        ("list_pipelines", "mr_iid", 1, None),
+        ("list_pipelines", "schedule_id", 1, None),
+        ("list_pipelines", "limit", 1, 100),
+        ("get_pipeline", "pipeline_id", 1, None),
+        ("get_pipeline", "limit", 1, 100),
+        ("get_job", "job_id", 1, None),
+        ("list_pipeline_schedules", "limit", 1, 100),
+        ("get_job_log", "job_id", 1, None),
+        ("get_job_log", "max_chars", 1, 16000),
+    ],
+)
+async def test_ci_ids_are_positive_and_paging_or_output_sizes_are_bounded(tools, name, field, minimum, maximum):
+    """CI IDs must be positive, and limits or character counts have an upper bound in the schema."""
+    # Arrange
+    prop = tools[name].input_schema["properties"][field]
+
+    # Act
+    bounds = integer_schema(prop)
+
+    # Assert
+    assert bounds["minimum"] == minimum
+    assert bounds.get("maximum") == maximum
+
+
+async def test_status_and_source_are_separate_enums(tools):
+    """`scheduled` is a pipeline state and `schedule` is a pipeline source, so each enum keeps only its own value."""
+    # Arrange
+    properties = tools["list_pipelines"].input_schema["properties"]
+
+    # Act
+    statuses = enum_values(properties["status"])
+    sources = enum_values(properties["source"])
+
+    # Assert
+    assert "scheduled" in statuses
+    assert "schedule" not in statuses
+    assert "schedule" in sources
+    assert "scheduled" not in sources
+
+
+async def test_get_job_log_views_default_to_tail(tools):
+    """The log tool offers exactly the two bounded views, and tail is the default."""
+    # Arrange
+    view = tools["get_job_log"].input_schema["properties"]["view"]
+
+    # Act / Assert
+    assert enum_values(view) == ["tail", "head"]
+    assert view["default"] == "tail"
+
+
+CI_TOOLS = {"list_pipelines", "get_pipeline", "get_job", "list_pipeline_schedules", "get_job_log"}
+
+
+@pytest.mark.parametrize("name", sorted(CI_TOOLS))
+async def test_ci_tool_descriptions_name_the_glab_equivalent(tools, name):
+    """Each CI tool names the glab command or glab api call it mirrors, so agents can map it to the CLI."""
+    # Act / Assert
+    assert "glab" in tools[name].description
