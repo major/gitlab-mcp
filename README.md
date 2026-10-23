@@ -44,6 +44,7 @@ Example MCP client config:
 | `get_merge_request_threads` | `glab mr note list` / `glab mr view --comments` | `{"threads", "next_cursor", "not_found_ids"}`                        |
 | `get_merge_request_diff`    | `glab mr diff`                                  | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}` |
 | `land_merge_request`        | `glab mr merge`                                 | `{"result", "state", "merge_status", ...}`                           |
+| `update_merge_request`      | `glab mr update` / `approve` / `rebase`         | `{"applied", "pending", "unknown", "failed", ...}`                   |
 
 `list_merge_requests` needs a token with the `read_api` scope. Pass `project`
 as the full path, like `group/subgroup/project`, not the numeric ID or the
