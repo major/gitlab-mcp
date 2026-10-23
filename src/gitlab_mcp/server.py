@@ -68,6 +68,29 @@ query($fullPath: ID!, $iid: String!) {
 }
 """
 
+# One active train and one page of its active cars per request, limiting nested overfetch.
+# GraphQL's car index includes historical cars, so positions come from active car order instead.
+MERGE_TRAIN_QUERY = """
+query($fullPath: ID!, $targetBranches: [String!], $after: String, $carAfter: String, $first: Int!) {
+  project(fullPath: $fullPath) {
+    mergeTrains(status: ACTIVE, targetBranches: $targetBranches, first: 1, after: $after) {
+      nodes {
+        targetBranch
+        cars(activityStatus: ACTIVE, first: $first, after: $carAfter) {
+          nodes {
+            status
+            mergeRequest { iid title author { username } }
+            pipeline { id status }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
 # One page of discussions with their notes, for get_merge_request_threads. 🧵
 THREADS_QUERY = """
 query($fullPath: ID!, $iid: String!, $after: String) {
@@ -219,6 +242,19 @@ class MergeRequestList(BaseModel):
             "TSV with a header row. Columns: iid, title, author, state, draft, approved, "
             "approved_by, open_threads, updated. approved_by is comma-separated usernames. "
             "An empty cell means none. Booleans are true/false."
+        ),
+    )
+    has_more: bool
+
+
+class MergeTrainList(BaseModel):
+    """A page of active merge train entries."""
+
+    web_url_prefix: str = Field(description="Append an iid to get the MR link.")
+    entries: str = Field(
+        description=(
+            "TSV with a header row. Columns: target_branch, position, iid, title, author, status, "
+            "pipeline_id, pipeline_status. Empty cells mean unknown or none."
         ),
     )
     has_more: bool
@@ -425,6 +461,27 @@ def _matches(mr: MergeRequestSummary, approved: bool | None, has_open_threads: b
     return has_open_threads is None or (mr.open_threads > 0) == has_open_threads
 
 
+def _to_merge_train_entry(target_branch: str, position: int, car: dict[str, Any]) -> str:
+    """Render one merge train car as a sanitized TSV row."""
+    merge_request = car["mergeRequest"]
+    author = merge_request["author"]
+    pipeline = car["pipeline"]
+    pipeline_id = pipeline["id"] if pipeline else None
+    if pipeline_id:
+        pipeline_id = pipeline_id.rsplit("/", 1)[-1]
+    values = (
+        target_branch,
+        position,
+        merge_request["iid"],
+        merge_request["title"],
+        author["username"] if author else None,
+        _lower(car["status"]),
+        pipeline_id,
+        _lower(pipeline["status"]) if pipeline else "",
+    )
+    return "\t".join(_cell(value) for value in values)
+
+
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a user-facing filter.
     ctx: Context,
@@ -485,6 +542,78 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         web_url_prefix=f"{client.settings.url}/{project}/-/merge_requests/",
         merge_requests=_to_tsv(collected[:limit]),
         has_more=len(collected) > limit or has_next,
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def list_merge_train(
+    ctx: Context,
+    project: Project,
+    target_branch: Annotated[
+        str | None,
+        Field(description="Only this target branch. Omit for all active trains."),
+    ] = None,
+    limit: Annotated[int, Field(ge=1, le=100)] = 20,
+) -> MergeTrainList:
+    """List active merge train entries, like `glab api projects/:id/merge_trains?scope=active&sort=asc`.
+
+    Requires the `read_api` scope and GitLab Premium or Ultimate. Active trains include cars that are waiting,
+    not only cars currently running. TSV columns are `target_branch`, `position`, `iid`, `title`, `author`, `status`,
+    `pipeline_id`, and `pipeline_status`; positions are one-based within each target branch, not a global queue.
+    Empty cells mean unknown or none. The scan reads at most 5 pages; `has_more` means entries or trains remain,
+    or the page cap stopped the scan. Set `target_branch` to narrow the scan, or increase `limit` for more entries.
+    """
+    client = get_client(ctx)
+    entries: list[str] = []
+    outer_after: str | None = None
+    car_after: str | None = None
+    position = 1
+    has_more = False
+
+    for _ in range(MAX_PAGES):
+        variables = {
+            "fullPath": project,
+            "targetBranches": [target_branch] if target_branch is not None else None,
+            "after": outer_after,
+            "carAfter": car_after,
+            "first": limit - len(entries),
+        }
+        data = await client.graphql(MERGE_TRAIN_QUERY, variables)
+        if data["project"] is None:
+            raise ProjectNotFoundError(project)
+        trains = data["project"]["mergeTrains"]
+        train_nodes = trains["nodes"]
+        if not train_nodes:
+            # The connection can drain between pages. An empty page is complete even if pageInfo is stale.
+            has_more = False
+            break
+
+        train = train_nodes[0]
+        cars = train["cars"]
+        car_nodes = cars["nodes"]
+        entries.extend(
+            _to_merge_train_entry(train["targetBranch"], car_position, car)
+            for car_position, car in enumerate(car_nodes, start=position)
+        )
+        position += len(car_nodes)
+
+        cars_page_info = cars["pageInfo"]
+        trains_page_info = trains["pageInfo"]
+        has_more = cars_page_info["hasNextPage"] or trains_page_info["hasNextPage"]
+        if len(entries) >= limit or not has_more:
+            break
+        if cars_page_info["hasNextPage"]:
+            car_after = cars_page_info["endCursor"]
+        else:
+            outer_after = trains_page_info["endCursor"]
+            car_after = None
+            position = 1
+
+    header = "target_branch\tposition\tiid\ttitle\tauthor\tstatus\tpipeline_id\tpipeline_status"
+    return MergeTrainList(
+        web_url_prefix=f"{client.settings.url}/{project}/-/merge_requests/",
+        entries="\n".join([header, *entries]),
+        has_more=has_more,
     )
 
 

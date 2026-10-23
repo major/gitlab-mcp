@@ -40,6 +40,7 @@ Example MCP client config:
 | --------------------------- | ----------------------------------------------- | -------------------------------------------------------------------- |
 | `get_current_user`          | `glab api user --jq .username`                  | `{"username", "id"}`                                                 |
 | `list_merge_requests`       | `glab mr list` + filters                        | `{"web_url_prefix", "merge_requests": "<TSV>", "has_more"}`          |
+| `list_merge_train`          | `glab api projects/:id/merge_trains?scope=active&sort=asc` | `{"web_url_prefix", "entries": "<TSV>", "has_more"}`                |
 | `get_merge_request`         | `glab mr view`                                  | `{"iid", "title", "merge_status", "threads", ...}`                   |
 | `get_merge_request_threads` | `glab mr note list` / `glab mr view --comments` | `{"threads", "next_cursor", "not_found_ids"}`                        |
 | `get_merge_request_diff`    | `glab mr diff`                                  | `{"head_sha", "files" or "diffs", "next_cursor", "paths_not_found"}` |
@@ -51,6 +52,9 @@ as the full path, like `group/subgroup/project`, not the numeric ID or the
 URL. The TSV has a header row with the columns `iid`, `title`, `author`,
 `state`, `draft`, `approved`, `approved_by`, `open_threads`, and `updated`.
 Every row has every column, and an empty cell means none.
+
+`list_merge_train` lists active merge train cars on GitLab Premium and Ultimate.
+Its `position` is one-based within each `target_branch`, not a global queue position.
 
 ## Development
 
