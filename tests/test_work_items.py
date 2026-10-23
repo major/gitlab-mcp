@@ -3,84 +3,22 @@
 import base64
 import hashlib
 import json
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import httpx
 import pytest
 import respx
-from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.work_items import (
-    NOTE_BODY_BUDGET,
-    read_work_item,
-    read_work_item_for_edit,
-    read_work_item_notes,
-)
+from gitlab_mcp.work_items import NOTE_BODY_BUDGET
 from mcp_helpers import call_tool as call_mcp_tool
-lazy from gitlab_mcp.client import GitLabClient
-lazy from gitlab_mcp.config import Settings
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 42
-TEST_APP = FastMCP("work-item-tests")
+WORK_ITEM_ID = "gid://gitlab/WorkItem/123"
+UPDATED = {"data": {"workItemUpdate": {"errors": [], "workItem": {"id": WORK_ITEM_ID}}}}
 EXPECTED_PAGE_REQUESTS = 2
-
-
-@TEST_APP.tool
-async def get_work_item(  # noqa: PLR0913, PLR0917 - mirrors the production wrapper arguments.
-    project: str,
-    iid: Any,
-    scope: Any = "project",
-    include_description: Any = True,
-    description_limit: Any = 4000,
-    cursor: Any = None,
-) -> Any:
-    """Expose the detail helper through an in-memory test server."""
-    client = GitLabClient(Settings.from_env())
-    try:
-        return await read_work_item(
-            client,
-            project,
-            cast("int", iid),
-            cast("Literal['project', 'group']", scope),
-            cast("bool", include_description),
-            cast("int", description_limit),
-            cast("str | None", cursor),
-        )
-    finally:
-        await client.aclose()
-
-
-@TEST_APP.tool
-async def get_work_item_notes(
-    project: str,
-    iid: int,
-    scope: Literal["project", "group"] = "project",
-    cursor: Any = None,
-    max_body_chars: int = 4000,
-) -> Any:
-    """Expose the notes helper through an in-memory test server."""
-    client = GitLabClient(Settings.from_env())
-    try:
-        return await read_work_item_notes(client, project, iid, scope, cast("str | None", cursor), max_body_chars)
-    finally:
-        await client.aclose()
-
-
-@TEST_APP.tool
-async def get_work_item_source(
-    project: str,
-    iid: int,
-    scope: Literal["project", "group"] = "project",
-) -> Any:
-    """Expose the exact edit-source reader through the in-memory test server."""
-    client = GitLabClient(Settings.from_env())
-    try:
-        return await read_work_item_for_edit(client, project, iid, scope)
-    finally:
-        await client.aclose()
 
 
 def work_item(**overrides: Any) -> dict[str, Any]:
@@ -177,21 +115,18 @@ def request_variables(route: respx.Route) -> list[dict[str, Any]]:
 
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Call one helper on the test-only FastMCP app and return its structured result."""
-    return await call_mcp_tool(name, arguments, app=TEST_APP)
+    """Call one registered production tool and return its structured result."""
+    return await call_mcp_tool(name, arguments)
 
 
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
-        ({"scope": "namespace"}, "scope must be either"),
+        ({"scope": "namespace"}, "Input should be 'project' or 'group'"),
         ({"project": " "}, "project must not be blank"),
         ({"iid": 0}, "iid must be a positive integer"),
-        ({"iid": True}, "iid must be a positive integer"),
-        ({"description_limit": -1}, "description_limit must be between 0 and 4000"),
-        ({"description_limit": 4001}, "description_limit must be between 0 and 4000"),
-        ({"description_limit": True}, "description_limit must be between 0 and 4000"),
-        ({"include_description": 1}, "include_description must be a boolean"),
+        ({"description_limit": -1}, "greater than or equal to 0"),
+        ({"description_limit": 4001}, "less than or equal to 4000"),
     ],
 )
 @respx.mock
@@ -448,15 +383,23 @@ async def test_detail_cursor_is_bound_to_arguments(gitlab_env, changed_arguments
     assert route.call_count == 1
 
 
-@pytest.mark.parametrize("cursor", [123, "not-a-cursor", encode_cursor([]), encode_cursor({})])
+@pytest.mark.parametrize(
+    ("cursor", "message"),
+    [
+        (123, "Input should be a valid string"),
+        ("not-a-cursor", "Invalid cursor"),
+        (encode_cursor([]), "Invalid cursor"),
+        (encode_cursor({}), "Invalid cursor"),
+    ],
+)
 @respx.mock
-async def test_malformed_detail_cursors_fail_before_request(gitlab_env, cursor):
-    """Detail cursors with invalid encoding or payload shapes are rejected early."""
+async def test_malformed_detail_cursors_fail_before_request(gitlab_env, cursor, message):
+    """Detail cursors with invalid types, encoding, or payload shapes are rejected early."""
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=response(work_item()))
 
     # Act / Assert
-    with pytest.raises(ToolError, match="Invalid cursor"):
+    with pytest.raises(ToolError, match=message):
         await call_tool("get_work_item", {"project": PROJECT, "iid": IID, "cursor": cursor})
     assert route.call_count == 0
 
@@ -752,31 +695,48 @@ async def test_detail_null_description_is_omitted(gitlab_env):
 
 @respx.mock
 async def test_edit_source_reads_full_description_and_global_id(gitlab_env):
-    """The edit helper returns the exact description instead of the compact cap."""
+    """The edit tool writes the whole description, not the compact 4000-character cap."""
     # Arrange
-    full_description = "d" * 10000
-    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=full_description)))
+    description = "start " + "d" * 10000 + " end"
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[response(work_item(description=description)), httpx.Response(200, json=UPDATED)],
+    )
 
     # Act
-    source = await call_tool("get_work_item_source", {"project": PROJECT, "iid": IID})
+    await call_tool(
+        "edit_work_item_description",
+        {"project": PROJECT, "iid": IID, "old_text": "start", "new_text": "begin", "return_diff": False},
+    )
 
     # Assert
-    assert source == {"id": "gid://gitlab/WorkItem/123", "description": full_description}
-    assert "description @include" not in json.loads(route.calls.last.request.content)["query"]
+    read_query = json.loads(route.calls[0].request.content)["query"]
+    assert "description @include" not in read_query
+    assert request_variables(route)[1] == {
+        "input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": "begin " + "d" * 10000 + " end"}},
+    }
 
 
 @respx.mock
 async def test_edit_source_treats_null_description_as_empty(gitlab_env):
-    """A work item with a null description has an empty, editable description."""
+    """A work item with a null description reads as an empty string, so any non-empty match fails cleanly."""
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=None)))
 
-    # Act
-    source = await call_tool("get_work_item_source", {"project": PROJECT, "iid": IID})
-
-    # Assert
-    assert source == {"id": "gid://gitlab/WorkItem/123", "description": ""}
+    # Act / Assert
+    with pytest.raises(ToolError, match="old_text was not found"):
+        await call_tool(
+            "edit_work_item_description",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "old_text": "anything",
+                "new_text": "x",
+                # The hash of "" proves the null description was read as an empty string.
+                "expected_hash": hashlib.sha256(b"").hexdigest(),
+            },
+        )
     assert "scopeNamespace: project(fullPath: $fullPath)" in json.loads(route.calls.last.request.content)["query"]
+    assert route.call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -788,13 +748,16 @@ async def test_edit_source_treats_null_description_as_empty(gitlab_env):
 )
 @respx.mock
 async def test_edit_source_rejects_mismatched_iid_and_invalid_description(gitlab_env, overrides, message):
-    """Edit source reads require the requested IID and a string description."""
+    """The edit read requires the requested IID and a string description, and writes nothing on failure."""
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=response(work_item(**overrides)))
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_tool("get_work_item_source", {"project": PROJECT, "iid": IID})
+        await call_tool(
+            "edit_work_item_description",
+            {"project": PROJECT, "iid": IID, "old_text": "A long", "new_text": "x"},
+        )
     assert route.call_count == 1
 
 
@@ -865,7 +828,7 @@ async def test_notes_filter_system_notes_cap_bodies_and_paginate_discussions(git
 
     # Act
     result = await call_tool(
-        "get_work_item_notes",
+        "list_work_item_notes",
         {"project": PROJECT, "iid": IID, "max_body_chars": 5},
     )
 
@@ -891,7 +854,7 @@ async def test_group_notes_use_group_scope_root(gitlab_env):
     route = respx.post(GRAPHQL).mock(return_value=notes_response([], scope="group", path="group"))
 
     # Act
-    result = await call_tool("get_work_item_notes", {"project": "group", "iid": IID, "scope": "group"})
+    result = await call_tool("list_work_item_notes", {"project": "group", "iid": IID, "scope": "group"})
 
     # Assert
     query = json.loads(route.calls.last.request.content)["query"]
@@ -908,7 +871,7 @@ async def test_notes_reject_a_different_returned_iid(gitlab_env):
 
     # Act / Assert
     with pytest.raises(ToolError, match="different work item IID"):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
 
@@ -921,7 +884,7 @@ async def test_notes_report_invalid_returned_iid_field(gitlab_env, item_iid):
 
     # Act / Assert
     with pytest.raises(ToolError, match="notes query field"):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
 
@@ -943,9 +906,9 @@ async def test_notes_cursor_resumes_and_is_bound_to_arguments(gitlab_env, change
     route = respx.post(GRAPHQL).mock(side_effect=[first, second])
 
     # Act
-    first_result = await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+    first_result = await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     second_result = await call_tool(
-        "get_work_item_notes",
+        "list_work_item_notes",
         {"project": PROJECT, "iid": IID, "cursor": first_result["next_cursor"]},
     )
 
@@ -954,7 +917,7 @@ async def test_notes_cursor_resumes_and_is_bound_to_arguments(gitlab_env, change
     assert second_result["notes"][0]["body"] == "next page"
     with pytest.raises(ToolError, match="Invalid cursor"):
         await call_tool(
-            "get_work_item_notes",
+            "list_work_item_notes",
             {
                 "project": PROJECT,
                 "iid": IID,
@@ -966,34 +929,37 @@ async def test_notes_cursor_resumes_and_is_bound_to_arguments(gitlab_env, change
 
 
 @pytest.mark.parametrize(
-    "cursor",
+    ("cursor", "message"),
     [
-        123,
-        "not-a-cursor",
-        "",
-        encode_cursor([]),
-        encode_cursor({}),
-        encode_cursor(
-            {
-                "version": 1,
-                "scope": "project",
-                "project": PROJECT,
-                "iid": IID,
-                "max_body_chars": 4000,
-                "after": 123,
-            },
+        (123, "Input should be a valid string"),
+        ("not-a-cursor", "Invalid cursor"),
+        ("", "Invalid cursor"),
+        (encode_cursor([]), "Invalid cursor"),
+        (encode_cursor({}), "Invalid cursor"),
+        (
+            encode_cursor(
+                {
+                    "version": 1,
+                    "scope": "project",
+                    "project": PROJECT,
+                    "iid": IID,
+                    "max_body_chars": 4000,
+                    "after": 123,
+                },
+            ),
+            "Invalid cursor",
         ),
     ],
 )
 @respx.mock
-async def test_invalid_notes_cursor_fails_before_request(gitlab_env, cursor):
+async def test_invalid_notes_cursor_fails_before_request(gitlab_env, cursor, message):
     """Malformed or explicitly empty cursors cannot restart a notes scan silently."""
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=notes_response([]))
 
     # Act / Assert
-    with pytest.raises(ToolError, match="Invalid cursor"):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID, "cursor": cursor})
+    with pytest.raises(ToolError, match=message):
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID, "cursor": cursor})
     assert route.call_count == 0
 
 
@@ -1011,7 +977,7 @@ async def test_notes_respect_total_body_budget(gitlab_env, discussion_count, exp
     respx.post(GRAPHQL).mock(return_value=notes_response(discussions))
 
     # Act
-    result = await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+    result = await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
 
     # Assert
     assert len(result["notes"]) == expected_notes
@@ -1031,7 +997,7 @@ async def test_missing_notes_widget_is_an_error(gitlab_env):
 
     # Act / Assert
     with pytest.raises(ToolError, match="did not return the work item's notes widget"):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
 
@@ -1068,7 +1034,7 @@ async def test_invalid_notes_discussion_pages_are_reported(gitlab_env, widget, m
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
 
@@ -1092,7 +1058,7 @@ async def test_invalid_nested_note_pages_are_reported(gitlab_env, discussion, me
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
 
@@ -1115,7 +1081,7 @@ async def test_invalid_human_note_values_are_reported(gitlab_env, note_node, mes
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+        await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
     assert route.call_count == 1
 
 
@@ -1139,7 +1105,7 @@ async def test_notes_allow_null_authors_and_missing_timestamps(gitlab_env):
     )
 
     # Act
-    result = await call_tool("get_work_item_notes", {"project": PROJECT, "iid": IID})
+    result = await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
 
     # Assert
     assert result["notes"] == [{"body": "body", "at": "2026-10-21"}, {"body": "", "at": ""}]

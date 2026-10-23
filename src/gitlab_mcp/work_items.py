@@ -246,24 +246,15 @@ def _raise_data_error(message: str, *, cause: BaseException | None = None) -> No
     raise WorkItemDataError(message) from cause
 
 
-def _validate_arguments(
-    scope: str,
-    project: str,
-    iid: int,
-    *,
-    bounded_limit: tuple[str, int, int] | None = None,
-) -> None:
-    """Validate helper arguments before sending any request."""
-    if scope not in ("project", "group"):
-        _raise_tool_error("scope must be either 'project' or 'group'.")
+def _validate_arguments(project: str, iid: int) -> None:
+    """Validate helper arguments before sending any request.
+
+    The tool schema already checks `scope`, limits, and types. These checks cover what the schema allows. 🛡️
+    """
     if not project.strip():
         _raise_tool_error("project must not be blank.")
     if type(iid) is not int or iid < 1:
         _raise_tool_error("iid must be a positive integer.")
-    if bounded_limit is not None:
-        limit_name, limit, limit_cap = bounded_limit
-        if type(limit) is not int or limit < 0 or limit > limit_cap:
-            _raise_tool_error(f"{limit_name} must be between 0 and {limit_cap}.")
 
 
 def _validate_section_options(
@@ -642,8 +633,6 @@ def _pack_cursor(payload: dict[str, Any]) -> str:
 
 def _decode_cursor_payload(cursor: str, tool: str) -> dict[str, Any]:
     """Decode one opaque cursor or report that it is malformed."""
-    if not isinstance(cursor, str):
-        raise InvalidWorkItemCursorError(tool)
     try:
         raw = base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True)
         payload = json.loads(raw)
@@ -757,14 +746,7 @@ async def read_work_item(  # noqa: PLR0913, PLR0917 - signature is part of the p
     no fallback to the other namespace type. Focused section reads share the description
     limit and cannot be combined with a widget cursor.
     """
-    _validate_arguments(
-        scope,
-        project,
-        iid,
-        bounded_limit=("description_limit", description_limit, DESCRIPTION_CAP),
-    )
-    if not isinstance(include_description, bool):
-        _raise_tool_error("include_description must be a boolean.")
+    _validate_arguments(project, iid)
     _validate_section_options(section, headings_only, include_description, description_limit, cursor)
     cursor_include_description = include_description
     include_description = include_description and description_limit > 0
@@ -860,7 +842,7 @@ async def read_work_item_for_edit(
     text. It is intended for future edit tools that need a safe read-modify-write
     sequence.
     """
-    _validate_arguments(scope, project, iid)
+    _validate_arguments(project, iid)
     _, item = await _resolved_item(client, (_EDIT_SOURCE_QUERY, {}), scope, project, iid)
     if _positive_graphql_iid(item.get("iid")) != iid:
         _raise_data_error("GitLab returned a different work item IID than requested.")
@@ -982,7 +964,7 @@ async def read_work_item_notes(  # noqa: PLR0913, PLR0917 - helper signature is 
     discussion has additional notes, or the response body budget is reached,
     `notes_truncated` is true rather than silently hiding that fact.
     """
-    _validate_arguments(scope, project, iid, bounded_limit=("max_body_chars", max_body_chars, NOTE_BODY_CAP))
+    _validate_arguments(project, iid)
     after = _unpack_cursor(cursor, scope, project, iid, max_body_chars) if cursor is not None else None
     data = await client.graphql(
         _query_for_scope(_NOTES_QUERY, scope),

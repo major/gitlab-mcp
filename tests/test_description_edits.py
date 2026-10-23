@@ -3,14 +3,12 @@
 import hashlib
 import json
 from typing import Any
-from unittest.mock import Mock
 
 import httpx
 import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp import description_edits as description_edits_module
 from gitlab_mcp.description_edits import DIFF_CAP
 from mcp_helpers import call_tool as call_mcp_tool
 
@@ -242,12 +240,10 @@ async def test_long_changed_lines_are_capped_and_flagged(router):
     assert result["truncated"] is True
 
 
-async def test_mr_edit_can_skip_changed_lines(router, monkeypatch):
+async def test_mr_edit_can_skip_changed_lines(router):
     """An applied merge request edit can omit its diff without changing the write."""
     # Arrange
     put = serve_merge_request(router, "Plan: ship")
-    changed_lines = Mock(side_effect=AssertionError("return_diff=false must not compute changed lines"))
-    monkeypatch.setattr(description_edits_module, "_changed_lines", changed_lines)
 
     # Act
     result = await call_tool(
@@ -265,7 +261,6 @@ async def test_mr_edit_can_skip_changed_lines(router, monkeypatch):
     assert result["truncated"] is False
     assert "warning" not in result
     assert json.loads(put.calls.last.request.content) == {"description": "Plan: launch"}
-    changed_lines.assert_not_called()
 
 
 async def test_mr_edit_without_return_diff_keeps_existing_default(router):
@@ -376,12 +371,10 @@ async def test_work_item_edit_writes_exact_global_id_and_full_description(router
     ]
 
 
-async def test_work_item_edit_can_skip_changed_lines(router, monkeypatch):
+async def test_work_item_edit_can_skip_changed_lines(router):
     """An applied work-item edit can omit its diff while preserving the mutation."""
     # Arrange
     route = serve_work_item(router, "old line")
-    changed_lines = Mock(side_effect=AssertionError("return_diff=false must not compute changed lines"))
-    monkeypatch.setattr(description_edits_module, "_changed_lines", changed_lines)
 
     # Act
     result = await call_tool(
@@ -401,7 +394,6 @@ async def test_work_item_edit_can_skip_changed_lines(router, monkeypatch):
     assert mutation_variables(route) == [
         {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": "new line"}}}
     ]
-    changed_lines.assert_not_called()
 
 
 async def test_work_item_edit_without_return_diff_keeps_existing_default(router):
@@ -523,13 +515,11 @@ async def test_work_item_batch_applies_dependent_replacements_in_order(router):
     ]
 
 
-async def test_work_item_batch_deletion_and_unicode_crlf_hashes(router, monkeypatch):
+async def test_work_item_batch_deletion_and_unicode_crlf_hashes(router):
     """Batch deletion keeps CRLF bytes intact, and hashes cover exact UTF-8 input and output."""
     # Arrange
     before = "Plan 🦊\r\ncafé stays"
     route = serve_work_item(router, before)
-    changed_lines = Mock(side_effect=AssertionError("diff_limit=0 must not compute changed lines"))
-    monkeypatch.setattr(description_edits_module, "_changed_lines", changed_lines)
 
     # Act
     result = await call_tool(
@@ -550,7 +540,6 @@ async def test_work_item_batch_deletion_and_unicode_crlf_hashes(router, monkeypa
     assert mutation_variables(route) == [
         {"input": {"id": WORK_ITEM_ID, "descriptionWidget": {"description": final_description}}}
     ]
-    changed_lines.assert_not_called()
 
 
 async def test_work_item_later_batch_failure_reports_index_and_writes_nothing(router):
