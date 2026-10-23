@@ -259,6 +259,8 @@ mcp = FastMCP(
         "Use get_merge_request for descriptions, approvals, and jobs, and get_merge_request_diff for patches. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
         "Get the user's explicit APPROVE before posting notes with post_review_notes. "
+        "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "
+        "Do not call validate_only again. "
         "Use update_merge_request for reviewer, assignee, and approval changes."
     ),
     lifespan=gitlab_lifespan,
@@ -619,24 +621,28 @@ def _raise_review_preflight_error(message: str, *, cause: BaseException | None =
 
 
 class ReviewNote(BaseModel):
-    """One note to post on a changed line in a merge request."""
+    """One inline note with exactly one positive line side and one nonblank body source.
 
-    file: str = Field(min_length=1, description="Exact old or new path in the merge request diff.")
+    Set exactly one of ``line`` or ``old_line``, and exactly one of ``body`` or ``body_path``. The body may contain
+    up to 100000 UTF-8 bytes. ``body_path`` must be an absolute server-local path to a regular UTF-8 file.
+    """
+
+    file: str = Field(min_length=1, description="Diff path.")
     line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
         default=None,
-        description="Positive line number on the new side. Set this or old_line, but not both.",
+        description="New-side line.",
     )
     old_line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
         default=None,
-        description="Positive line number on the old side. Set this or line, but not both.",
+        description="Old-side line.",
     )
     body: str | None = Field(
         default=None,
-        description="Nonblank inline text, up to 100000 UTF-8 bytes. Set this or body_path, but not both.",
+        description="Inline note text.",
     )
     body_path: str | None = Field(
         default=None,
-        description="Absolute server-local UTF-8 file path, up to 100000 bytes. Set this or body, but not both.",
+        description="Absolute server-local note file.",
     )
 
     @model_validator(mode="after")
@@ -669,6 +675,7 @@ class PostReviewNotesResult(BaseModel):
 
     results: list[ReviewNotePostResult]
     warning: str = Field(default="", exclude_if=lambda value: not value)
+    current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class MergeRequestDiff(BaseModel):
@@ -2509,11 +2516,17 @@ def _full_sha(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
 
 
-def _unattempted_review_notes(count: int, warning: str) -> PostReviewNotesResult:
+def _unattempted_review_notes(
+    count: int,
+    warning: str,
+    *,
+    current_head_sha: str | None = None,
+) -> PostReviewNotesResult:
     """Build a result row for every note when preflight stops before posting."""
     return PostReviewNotesResult(
         results=[ReviewNotePostResult(index=index, status="unattempted") for index in range(count)],
         warning=warning[:500],
+        current_head_sha=current_head_sha,
     )
 
 
@@ -2720,7 +2733,7 @@ async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is pa
     try:
         refs = await _get_review_diff_refs(client, project, iid)
         if refs["sha"] != head_sha.lower() or refs["head_sha"] != head_sha.lower():
-            return [], {}, "The supplied head_sha is stale. No notes were posted."
+            return [], refs, "The supplied head_sha is stale. No notes were posted."
         paths = await _scan_review_paths(client, project, iid, {note.file for note in notes})
         prepared = [
             (body, _review_position(paths[note.file][0], note)) for note, body in zip(notes, bodies, strict=True)
@@ -2754,15 +2767,23 @@ def _review_response_ids(response: Any) -> tuple[str, int | None, dict[str, Any]
 def _review_response_position(
     actual: dict[str, Any] | None,
 ) -> dict[str, str | int]:
-    """Return the non-null fields of a response position in compact form."""
+    """Return one path and line coordinate, plus the old path for a rename."""
     if actual is None:
         return {}
-    keys = ("position_type", "base_sha", "start_sha", "head_sha", "old_path", "new_path", "old_line", "new_line")
-    return {
-        key: actual[key]
-        for key in keys
-        if key in actual and actual[key] is not None and isinstance(actual[key], (str, int))
-    }
+    old_path = actual.get("old_path")
+    path = actual.get("path") or actual.get("new_path") or old_path
+    compact: dict[str, str | int] = {}
+    if isinstance(path, str):
+        compact["path"] = path
+    if isinstance(old_path, str) and old_path != path:
+        compact["old_path"] = old_path
+    new_line = actual.get("line", actual.get("new_line"))
+    old_line = actual.get("old_line")
+    if type(new_line) is int:
+        compact["line"] = new_line
+    elif type(old_line) is int:
+        compact["old_line"] = old_line
+    return compact
 
 
 def _review_response_matches(
@@ -2897,7 +2918,9 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
 
     Like `glab mr note create`, but creates diff discussions. Set `validate_only` to true to run all body, path, line,
     and SHA checks without writing; validation does not need the user's `APPROVE`. Actual posting still requires the
-    user's explicit `APPROVE`. `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
+    user's explicit `APPROVE`. After APPROVE, call this tool directly; it reruns the same checks before the first
+    write. Do not call `validate_only` again. `head_sha` must be the full SHA from `get_merge_request` or
+    `get_merge_request_diff`.
     A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
     computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
@@ -2918,23 +2941,15 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         return _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted.")
     prepared, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, bodies)
     if warning:
-        return _unattempted_review_notes(len(notes), warning)
+        current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
+        return _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
     if validate_only:
         return PostReviewNotesResult(
             results=[
                 ReviewNotePostResult(
                     index=index,
                     status="validated",
-                    position={
-                        key: value
-                        for key, value in {
-                            **location,
-                            "base_sha": refs["base_sha"],
-                            "start_sha": refs["start_sha"],
-                            "head_sha": refs["head_sha"],
-                        }.items()
-                        if value is not None
-                    },
+                    position=_review_response_position(location),
                 )
                 for index, (_, location) in enumerate(prepared)
             ],
@@ -3181,6 +3196,8 @@ query($fullPath: ID!, $iid: String!) {
     mergeRequest(iid: $iid) {
       state draft detailedMergeStatus
       diffRefs { headSha }
+      reviewers { nodes { username } }
+      assignees { nodes { username } }
     }
   }
 }
@@ -3213,7 +3230,22 @@ class MergeRequestUpdate(BaseModel):
     draft: bool = Field(default=False, exclude_if=lambda v: not v)
     merge_status: str = Field(default="", exclude_if=lambda v: not v)  # GitLab's detailed status, lowercased.
     head_sha: str = Field(default="", exclude_if=lambda v: not v)  # Full head SHA after the update.
+    reviewers: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    assignees: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the final state could not be read.
+
+
+def _verified_usernames(connection: Any) -> list[str] | None:
+    """Return a complete username list from a valid GraphQL connection, or None when it cannot be verified."""
+    if not isinstance(connection, dict):
+        return None
+    nodes = connection.get("nodes")
+    if not isinstance(nodes, list) or any(
+        not isinstance(node, dict) or not isinstance(node.get("username"), str) or not node["username"].strip()
+        for node in nodes
+    ):
+        return None
+    return [node["username"] for node in nodes]
 
 
 class NothingToUpdateError(ToolError):
@@ -3472,12 +3504,21 @@ class _Update:
             node = await _fetch_merge_request(self.client, MERGE_REQUEST_STATE_QUERY, self.project, self.iid)
         except ToolError as exc:
             return {"warning": f"Could not read the merge request back. Check it with get_merge_request. {exc}"}
-        return {
+        final: dict[str, Any] = {
             "state": node["state"],
             "draft": node["draft"],
             "merge_status": _lower(node["detailedMergeStatus"]),
             "head_sha": _head_sha(node["diffRefs"]),
         }
+        if self.changes.add_reviewers or self.changes.remove_reviewers:
+            reviewers = _verified_usernames(node.get("reviewers"))
+            if reviewers is not None:
+                final["reviewers"] = reviewers
+        if self.changes.add_assignees or self.changes.remove_assignees:
+            assignees = _verified_usernames(node.get("assignees"))
+            if assignees is not None:
+                final["assignees"] = assignees
+        return final
 
     async def _fields(self) -> None:
         """Send one PUT with every plain field that was given."""
@@ -3582,31 +3623,31 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     ctx: Context,
     project: Project,
     iid: Iid,
-    approve: Annotated[bool | None, Field(description="True approves. False removes your approval.")] = None,
+    approve: Annotated[bool | None, Field(description="Approve or remove your approval.")] = None,
     sha: Annotated[
         str | None,
-        Field(description="Full head SHA from get_merge_request. Required when approve is true."),
+        Field(description="Full head SHA, required to approve."),
     ] = None,
-    state: Annotated[Literal["close", "reopen"] | None, Field(description="Close or reopen the MR.")] = None,
-    draft: Annotated[bool | None, Field(description="True marks it as draft. False marks it ready.")] = None,
+    state: Annotated[Literal["close", "reopen"] | None, Field(description="Close or reopen.")] = None,
+    draft: Annotated[bool | None, Field(description="Set draft status.")] = None,
     title: Annotated[str | None, Field(description="New title.")] = None,
-    description: Annotated[str | None, Field(description="New description. An empty string clears it.")] = None,
+    description: Annotated[str | None, Field(description="New description; empty clears it.")] = None,
     target_branch: Annotated[str | None, Field(description="New target branch.")] = None,
     add_labels: Annotated[list[str] | None, Field(description="Labels to add.")] = None,
     remove_labels: Annotated[list[str] | None, Field(description="Labels to remove.")] = None,
-    add_reviewers: Annotated[list[str] | None, Field(description="Usernames to add as reviewers.")] = None,
-    remove_reviewers: Annotated[list[str] | None, Field(description="Usernames to remove as reviewers.")] = None,
-    add_assignees: Annotated[list[str] | None, Field(description="Usernames to add as assignees.")] = None,
-    remove_assignees: Annotated[list[str] | None, Field(description="Usernames to remove as assignees.")] = None,
+    add_reviewers: Annotated[list[str] | None, Field(description="Reviewer usernames to add.")] = None,
+    remove_reviewers: Annotated[list[str] | None, Field(description="Reviewer usernames to remove.")] = None,
+    add_assignees: Annotated[list[str] | None, Field(description="Assignee usernames to add.")] = None,
+    remove_assignees: Annotated[list[str] | None, Field(description="Assignee usernames to remove.")] = None,
     add_blocked_by: Annotated[
         list[int] | None,
-        Field(description="IIDs of MRs in this same project that should block this one."),
+        Field(description="Same-project blocker IIDs to add."),
     ] = None,
     remove_blocked_by: Annotated[
         list[int] | None,
-        Field(description="IIDs of blocking MRs in this same project to unblock."),
+        Field(description="Same-project blocker IIDs to remove."),
     ] = None,
-    rebase: Annotated[bool, Field(description="True asks GitLab to rebase the source branch.")] = False,
+    rebase: Annotated[bool, Field(description="Ask GitLab to rebase.")] = False,
 ) -> MergeRequestUpdate:
     """Reviewer and assignee changes for merge request review. Like `glab mr update`.
 

@@ -142,29 +142,12 @@ async def test_validate_only_checks_new_and_old_side_positions_without_posting(g
         {
             "index": 0,
             "status": "validated",
-            "position": {
-                "position_type": "text",
-                "base_sha": BASE_SHA,
-                "start_sha": START_SHA,
-                "head_sha": HEAD,
-                "old_path": "src.py",
-                "new_path": "src.py",
-                "new_line": 6,
-            },
+            "position": {"path": "src.py", "line": 6},
         },
         {
             "index": 1,
             "status": "validated",
-            "position": {
-                "position_type": "text",
-                "base_sha": BASE_SHA,
-                "start_sha": START_SHA,
-                "head_sha": HEAD,
-                "old_path": "src.py",
-                "new_path": "src.py",
-                "old_line": 5,
-                "new_line": 5,
-            },
+            "position": {"path": "src.py", "line": 5},
         },
     ]
     assert "warning" not in data
@@ -290,8 +273,10 @@ async def test_validates_lines_and_derives_positions_from_added_context_removed_
     assert [item["position"] for item in sent] == expected_positions
     assert sent[-1]["body"] == "Read from the server.\n"
     assert [item["status"] for item in data["results"]] == ["posted"] * 5
-    assert data["results"][3]["position"]["old_path"] == "old.py"
-    assert data["results"][3]["position"]["new_path"] == "new.py"
+    assert data["results"][0]["position"] == {"path": "added.py", "line": 2}
+    assert data["results"][2]["position"] == {"path": "removed.py", "old_line": 2}
+    assert data["results"][3]["position"] == {"path": "new.py", "old_path": "old.py", "line": 7}
+    assert data["results"][4]["position"] == {"path": "gone.py", "old_line": 2}
     assert data["results"][0]["note_id"] == POSTED_NOTE_ID
     assert data["results"][0]["discussion_id"] == "discussion-1"
 
@@ -336,6 +321,33 @@ async def test_stale_head_sha_stops_before_diff_scan_or_post(gitlab_env):
     # Assert
     assert data["results"] == [{"index": 0, "status": "unattempted"}]
     assert "stale" in data["warning"]
+    assert data["current_head_sha"] == HEAD
+    assert len(mr_route.calls) == 1
+    assert not diff_route.called
+    assert not post_route.called
+
+
+@respx.mock
+async def test_stale_head_sha_reports_source_sha_when_diff_head_differs(gitlab_env):
+    """A stale supplied SHA reports the MR source SHA, not the diff-ref head SHA."""
+    # Arrange
+    source_sha = "d" * 40
+    mr_route, diff_route = add_preflight(
+        [([diff_file("src.py")], None)],
+        merge_requests=[merge_request(sha=source_sha, head_sha=HEAD)],
+    )
+    post_route = respx.post(DISCUSSIONS_URL).mock(return_value=response({"id": "unused", "notes": []}, status=201))
+    notes = [review_note("src.py", 1), review_note("src.py", 1, "Second note.")]
+
+    # Act
+    data = await call_tool(notes=notes, head_sha=HEAD)
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "unattempted"},
+        {"index": 1, "status": "unattempted"},
+    ]
+    assert data["current_head_sha"] == source_sha
     assert len(mr_route.calls) == 1
     assert not diff_route.called
     assert not post_route.called
@@ -598,7 +610,7 @@ async def test_mismatched_success_response_is_unverified_with_returned_ids(gitla
     assert result["status"] == "unverified"
     assert result["note_id"] == RESPONSE_NOTE_ID
     assert result["discussion_id"] == "discussion-9"
-    assert result["position"]["new_line"] == MISMATCHED_LINE
+    assert result["position"] == {"path": "src.py", "line": MISMATCHED_LINE}
     assert "did not match" in data["warning"]
     assert len(post_route.calls) == 1
 
@@ -824,6 +836,7 @@ async def test_old_side_context_position_contains_both_coordinates(gitlab_env):
     assert position["old_line"] == OLD_CONTEXT_LINE
     assert position["new_line"] == NEW_CONTEXT_LINE
     assert data["results"][0]["status"] == "posted"
+    assert data["results"][0]["position"] == {"path": "src.py", "line": NEW_CONTEXT_LINE}
 
 
 @pytest.mark.parametrize(
