@@ -55,6 +55,7 @@ even when the returned content is focused or truncated.
 | `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome. |
 | `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
 | `update_merge_request` | Change MR fields, reviewers, assignees, blockers, or approval; rebase reports `applied`, `pending` (still running after about 10 seconds), or `failed` (for example, when the MR has conflicts). |
+| `land_merge_request` | Queue, merge now, or cancel an MR; `auto` and `now` also return the queued `head_sha` and `pipeline_status`. |
 
 Work-item table-cell edits support standalone pipe-delimited Markdown tables with a unique, non-empty header and a
 valid separator row. The first column is the row key. A section can limit selection to an exact ATX heading and its

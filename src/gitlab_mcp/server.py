@@ -3028,6 +3028,8 @@ query($fullPath: ID!, $iid: String!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
       state detailedMergeStatus autoMergeStrategy mergeCommitSha
+      diffRefs { headSha }
+      headPipeline { status }
     }
   }
 }
@@ -3042,6 +3044,9 @@ class MergeRequestLanding(BaseModel):
     merge_status: str = Field(default="", exclude_if=lambda v: not v)  # GitLab's detailed status, lowercased.
     auto_merge_strategy: str = Field(default="", exclude_if=lambda v: not v)  # Lowercased.
     merge_commit_sha: str = Field(default="", exclude_if=lambda v: not v)
+    # The head SHA GitLab queued or merged. Only auto and now fill it, so cancel keeps its shorter shape.
+    head_sha: str = Field(default="", exclude_if=lambda v: not v)
+    pipeline_status: str = Field(default="", exclude_if=lambda v: not v)  # Head pipeline status, lowercased.
     warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the write worked but the read did not.
 
 
@@ -3132,14 +3137,23 @@ def _land_result(mode: LandMode, node: dict[str, Any]) -> LandResult:
 
 
 def _to_landing(mode: LandMode, node: dict[str, Any]) -> MergeRequestLanding:
-    """Convert the read-back state into the landing result."""
-    return MergeRequestLanding(
-        result=_land_result(mode, node),
-        state=node["state"],
-        merge_status=_lower(node["detailedMergeStatus"]),
-        auto_merge_strategy=_lower(node["autoMergeStrategy"]),
-        merge_commit_sha=node["mergeCommitSha"] or "",
-    )
+    """Convert the read-back state into the landing result.
+
+    Cancel leaves out the head SHA and pipeline status. Its result only says what the queue looks like now.
+    """
+    fields: dict[str, Any] = {
+        "result": _land_result(mode, node),
+        "state": node["state"],
+        "merge_status": _lower(node["detailedMergeStatus"]),
+        "auto_merge_strategy": _lower(node["autoMergeStrategy"]),
+        "merge_commit_sha": node["mergeCommitSha"] or "",
+    }
+    if mode != "cancel":
+        # A null headPipeline means the head has no pipeline, so the status stays empty and is left out.
+        pipeline = node["headPipeline"] or {}
+        fields["head_sha"] = _head_sha(node["diffRefs"])
+        fields["pipeline_status"] = _lower(pipeline.get("status"))
+    return MergeRequestLanding(**fields)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
@@ -3165,6 +3179,7 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
     - `cancel`: leave the merge train or cancel auto-merge. Takes no `sha`, `squash`, or `remove_source_branch`.
     - Get `sha` from get_merge_request. GitLab refuses the merge with 409 when the head has moved.
     - `result`: `merge_train`, `auto_merge`, `merged`, `cancelled`, or `pending`. Use get_merge_request to see blockers.
+    - `auto` and `now` also return `head_sha` and `pipeline_status`, so you can confirm which commit was queued.
     - A refused merge (405, 406, 409, 422) says to check blockers. Never retry a failed write without checking first.
     """
     _check_land_args(mode, sha, squash, remove_source_branch)

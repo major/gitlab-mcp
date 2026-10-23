@@ -28,6 +28,8 @@ def make_landing_node(**overrides: Any) -> dict[str, Any]:
         "detailedMergeStatus": "MERGEABLE",
         "autoMergeStrategy": None,
         "mergeCommitSha": None,
+        "diffRefs": {"headSha": HEAD_SHA},
+        "headPipeline": {"status": "SUCCESS"},
     }
     return node | overrides
 
@@ -82,7 +84,7 @@ async def test_sends_merge_body_and_omits_unset_flags(gitlab_env, mode, squash, 
 
 @respx.mock
 async def test_cancel_posts_to_cancel_endpoint(gitlab_env):
-    """Cancel calls the cancel endpoint and reports a cleared queue."""
+    """Cancel calls the cancel endpoint and reports a cleared queue, without the head SHA or pipeline."""
     # Arrange
     route = respx.post(CANCEL_URL).mock(return_value=httpx.Response(200, json={}))
     respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node()))
@@ -163,6 +165,47 @@ async def test_maps_read_back_state_to_result(gitlab_env, mode, node_fields, exp
 
 
 @respx.mock
+async def test_merge_train_result_names_the_queued_head_and_pipeline(gitlab_env):
+    """A queued merge echoes the head SHA and the lowercased pipeline status that GitLab reports for it."""
+    # Arrange
+    respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    node = make_landing_node(autoMergeStrategy="MERGE_TRAIN", headPipeline={"status": "RUNNING"})
+    respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert data == {
+        "result": "merge_train",
+        "state": "opened",
+        "merge_status": "mergeable",
+        "auto_merge_strategy": "merge_train",
+        "head_sha": HEAD_SHA,
+        "pipeline_status": "running",
+    }
+
+
+@pytest.mark.parametrize(
+    ("node_fields", "absent_field"),
+    [({"headPipeline": None}, "pipeline_status"), ({"diffRefs": None}, "head_sha")],
+    ids=["no-pipeline", "no-diff-refs"],
+)
+@respx.mock
+async def test_missing_head_sha_or_pipeline_is_left_out(gitlab_env, node_fields, absent_field):
+    """A head with no pipeline, or GitLab with no diff refs, leaves that field out instead of guessing."""
+    # Arrange
+    respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node(**node_fields)))
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert absent_field not in data
+
+
+@respx.mock
 async def test_returns_landing_fields_in_lowercase_and_omits_empty_ones(gitlab_env):
     """Strategy and status are lowercased, and empty fields are left out."""
     # Arrange
@@ -179,12 +222,14 @@ async def test_returns_landing_fields_in_lowercase_and_omits_empty_ones(gitlab_e
         "state": "opened",
         "merge_status": "mergeable",
         "auto_merge_strategy": "merge_train",
+        "head_sha": HEAD_SHA,
+        "pipeline_status": "success",
     }
 
 
 @respx.mock
 async def test_returns_merge_commit_sha_after_merge(gitlab_env):
-    """A merged MR returns its merge commit SHA."""
+    """A merged MR returns its merge commit SHA, with the head SHA and pipeline that were merged."""
     # Arrange
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     node = make_landing_node(state="merged", mergeCommitSha=MERGE_SHA)
@@ -199,6 +244,8 @@ async def test_returns_merge_commit_sha_after_merge(gitlab_env):
         "state": "merged",
         "merge_status": "mergeable",
         "merge_commit_sha": MERGE_SHA,
+        "head_sha": HEAD_SHA,
+        "pipeline_status": "success",
     }
 
 
