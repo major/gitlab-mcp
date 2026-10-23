@@ -159,6 +159,77 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
 
 
 @respx.mock
+async def test_merged_merge_request_includes_date_and_username(gitlab_env):
+    """A merged merge request includes its date and merging user's username."""
+    # Arrange
+    node = make_mr(
+        state="merged",
+        mergedAt="2025-06-17T12:34:56Z",
+        mergeUser={"username": "mhayden"},
+    )
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "mergedAt" in query
+    assert "mergeUser { username }" in query
+    assert data["merged_at"] == "2025-06-17"
+    assert data["merged_by"] == "mhayden"
+
+
+@respx.mock
+async def test_batch_merged_metadata_omits_missing_and_open_values(gitlab_env):
+    """Batch results include provided merged metadata and omit null or non-merged values."""
+    # Arrange
+    merged_with_user = make_mr(
+        state="merged",
+        mergedAt="2025-06-17T12:34:56Z",
+        mergeUser={"username": "mhayden"},
+    )
+    merged_without_user = make_mr(
+        state="merged",
+        mergedAt="2025-06-18T00:00:00Z",
+        mergeUser=None,
+    )
+    opened = make_mr()
+    route = respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "project": {
+                        "mr_0": merged_with_user,
+                        "mr_1": merged_without_user,
+                        "mr_2": opened,
+                    },
+                },
+            },
+        ),
+    )
+
+    # Act
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "get_merge_requests",
+            {"project": PROJECT, "iids": [IID, IID + 1, IID + 2]},
+        )
+    merge_requests = result.structured_content["merge_requests"]
+
+    # Assert
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "mergedAt" in query
+    assert "mergeUser { username }" in query
+    assert merge_requests[0]["merged_at"] == "2025-06-17"
+    assert merge_requests[0]["merged_by"] == "mhayden"
+    assert merge_requests[1]["merged_at"] == "2025-06-18"
+    assert "merged_by" not in merge_requests[1]
+    assert {"merged_at", "merged_by"}.isdisjoint(merge_requests[2])
+
+
+@respx.mock
 async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
     """Explicit job lookup returns failed job IDs and names, even for a successful pipeline."""
     # Arrange
