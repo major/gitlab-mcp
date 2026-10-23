@@ -90,10 +90,10 @@ def sent_variables(route: respx.Route) -> dict[str, Any]:
     return json.loads(route.calls.last.request.content)["variables"]
 
 
-async def call_tool() -> dict:
+async def call_tool(**extra: Any) -> dict:
     """Call get_merge_request through the MCP protocol and return its data."""
     async with Client(mcp) as client:
-        result = await client.call_tool("get_merge_request", {"project": PROJECT, "iid": IID})
+        result = await client.call_tool("get_merge_request", {"project": PROJECT, "iid": IID, **extra})
     return result.structured_content
 
 
@@ -252,6 +252,21 @@ async def test_description_is_capped(gitlab_env, length, expected_truncated):
     # Assert
     assert len(data["description"]) == DESCRIPTION_CAP
     assert ("description_truncated" in data) is expected_truncated
+
+
+@respx.mock
+async def test_include_description_false_skips_description(gitlab_env):
+    """With include_description=False, a long description and its cut flag are both left out."""
+    # Arrange
+    long_description = "d" * (DESCRIPTION_CAP + 1)
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=long_description)))
+
+    # Act
+    data = await call_tool(include_description=False)
+
+    # Assert
+    assert {"description", "description_truncated"}.isdisjoint(data)
+    assert data["title"] == "Rebuild support"
 
 
 @pytest.mark.parametrize(

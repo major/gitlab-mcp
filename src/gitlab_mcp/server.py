@@ -133,6 +133,10 @@ MergeRequestState = Literal["opened", "closed", "locked", "merged", "all"]
 # never have to guess whether a missing key means "empty" or "not sent".
 TSV_COLUMNS = ("iid", "title", "author", "state", "draft", "approved", "approved_by", "open_threads", "updated")
 
+# Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
+Project = Annotated[str, Field(description="Project path, like group/project.")]
+Iid = Annotated[int, Field(description="MR number.")]
+
 
 @lifespan
 async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
@@ -426,7 +430,7 @@ def _matches(mr: MergeRequestSummary, approved: bool | None, has_open_threads: b
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a user-facing filter.
     ctx: Context,
-    project: Annotated[str, Field(description="Full project path, like 'group/subgroup/project'.")],
+    project: Project,
     state: MergeRequestState = "opened",
     author: Annotated[str | None, Field(description="Author username.")] = None,
     approved: Annotated[
@@ -607,13 +611,16 @@ def _short_head_sha(diff_refs: dict[str, Any] | None) -> str:
     return diff_refs["headSha"][:SHORT_SHA] if diff_refs else ""
 
 
-def _to_detail(node: dict[str, Any]) -> MergeRequestDetail:
-    """Convert one GraphQL merge request node into the detail shape."""
+def _to_detail(node: dict[str, Any], *, include_description: bool) -> MergeRequestDetail:
+    """Convert one GraphQL merge request node into the detail shape.
+
+    When `include_description` is False, the description and its flag are left out.
+    """
     # A deleted or banned author comes back as null.
     author = node["author"]
     # headPipeline can be null, so check before reading it.
     pipeline = node["headPipeline"]
-    description, description_truncated = _cap_description(node["description"])
+    description, description_truncated = _cap_description(node["description"] if include_description else None)
     return MergeRequestDetail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
@@ -641,8 +648,9 @@ def _to_detail(node: dict[str, Any]) -> MergeRequestDetail:
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_request(
     ctx: Context,
-    project: Annotated[str, Field(description="Full project path, like group/project.")],
-    iid: Annotated[int, Field(description="MR number, like 2187 for !2187.")],
+    project: Project,
+    iid: Iid,
+    include_description: Annotated[bool, Field(description="False skips the description to save tokens.")] = True,
 ) -> MergeRequestDetail:
     """Show one merge request's status, approvals, and open threads. Like `glab mr view`.
 
@@ -654,7 +662,7 @@ async def get_merge_request(
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
     """
     node = await _fetch_merge_request(get_client(ctx), MERGE_REQUEST_QUERY, project, iid)
-    return _to_detail(node)
+    return _to_detail(node, include_description=include_description)
 
 
 def _bare_id(thread_id: str) -> str:
@@ -810,8 +818,8 @@ async def _scan_threads(
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_request_threads(  # noqa: PLR0913, PLR0917 - each argument is a user-facing filter.
     ctx: Context,
-    project: Annotated[str, Field(description="Full project path, like group/project.")],
-    iid: Annotated[int, Field(description="MR number, like 2187 for !2187.")],
+    project: Project,
+    iid: Iid,
     state: Literal["open", "resolved", "comments", "all"] = "open",
     ids: Annotated[list[str] | None, Field(description="Thread IDs from threads.open. Ignores state.")] = None,
     file: Annotated[str | None, Field(description="Only threads on this path, old or new.")] = None,
@@ -949,8 +957,8 @@ async def _scan_diffs(
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def get_merge_request_diff(
     ctx: Context,
-    project: Annotated[str, Field(description="Full project path, like group/project.")],
-    iid: Annotated[int, Field(description="MR number, like 2187 for !2187.")],
+    project: Project,
+    iid: Iid,
     paths: Annotated[
         list[str] | None,
         Field(description="Paths to read patches for, old or new. Omit for the file list."),
