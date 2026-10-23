@@ -28,6 +28,7 @@ def make_landing_node(**overrides: Any) -> dict[str, Any]:
         "detailedMergeStatus": "MERGEABLE",
         "autoMergeStrategy": None,
         "mergeCommitSha": None,
+        "targetBranch": "main",
         "diffRefs": {"headSha": HEAD_SHA},
         "headPipeline": {"status": "SUCCESS"},
     }
@@ -316,3 +317,141 @@ async def test_failed_read_back_returns_pending_with_warning(gitlab_env, reread)
     assert data["result"] == "pending"
     assert "accepted" in data["warning"]
     assert set(data) == {"result", "warning"}
+
+
+PIPELINE_GID = "gid://gitlab/Ci::Pipeline/731"
+EXPECTED_POSITION = 2  # The MR is second of three active cars.
+TRAIN_MARKER = "mergeTrains"
+
+
+def make_car(iid: int, status: str = "IDLE", pipeline_gid: str | None = PIPELINE_GID) -> dict[str, Any]:
+    """Build one active merge train car in the shape of the TRAIN_POSITION_QUERY response."""
+    pipeline = {"id": pipeline_gid} if pipeline_gid else None
+    # GraphQL IIDs are strings, like the real response.
+    return {"status": status, "mergeRequest": {"iid": str(iid)}, "pipeline": pipeline}
+
+
+def make_train_page(*cars: dict[str, Any]) -> httpx.Response:
+    """Wrap active cars in the project.mergeTrains envelope of the position query."""
+    body = {"data": {"project": {"mergeTrains": {"nodes": [{"cars": {"nodes": list(cars)}}]}}}}
+    return httpx.Response(200, json=body)
+
+
+def mock_graphql(land_node: dict[str, Any], train_reply: httpx.Response | Exception) -> respx.Route:
+    """Answer the train position query with `train_reply`, and every other GraphQL call with the land read-back."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if TRAIN_MARKER not in json.loads(request.content)["query"]:
+            return graphql_response(land_node)
+        if isinstance(train_reply, Exception):
+            raise train_reply
+        return train_reply
+
+    return respx.post(GRAPHQL).mock(side_effect=respond)
+
+
+def graphql_bodies(route: respx.Route, marker: str) -> list[dict[str, Any]]:
+    """Return the GraphQL request bodies whose query text contains `marker`."""
+    bodies = [json.loads(call.request.content) for call in route.calls]
+    return [body for body in bodies if marker in body["query"]]
+
+
+@pytest.mark.parametrize(
+    ("pipeline_gid", "expected_pipeline_id"),
+    [(PIPELINE_GID, 731), (None, None)],
+    ids=["with-pipeline", "no-pipeline"],
+)
+@respx.mock
+async def test_merge_train_result_reports_position_among_active_cars(gitlab_env, pipeline_gid, expected_pipeline_id):
+    """The MR is second of three active cars, so its position is 2 and its car status and pipeline come along."""
+    # Arrange
+    respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    cars = [
+        make_car(2186, status="MERGING"),
+        make_car(IID, status="IDLE", pipeline_gid=pipeline_gid),
+        make_car(2188, status="FRESH"),
+    ]
+    graphql = mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), make_train_page(*cars))
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert data["train_position"] == EXPECTED_POSITION
+    assert data["train_status"] == "idle"
+    assert data.get("train_pipeline_id") == expected_pipeline_id
+    assert graphql_bodies(graphql, TRAIN_MARKER)[0]["variables"] == {"fullPath": PROJECT, "targetBranches": ["main"]}
+
+
+@respx.mock
+async def test_mr_missing_from_active_cars_leaves_train_fields_out(gitlab_env):
+    """When the MR is not among the active cars, the result has no train fields and no warning."""
+    # Arrange
+    respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    cars = [make_car(2186), make_car(2188)]
+    mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), make_train_page(*cars))
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert data == {
+        "result": "merge_train",
+        "state": "opened",
+        "merge_status": "mergeable",
+        "auto_merge_strategy": "merge_train",
+        "head_sha": HEAD_SHA,
+        "pipeline_status": "success",
+    }
+
+
+@pytest.mark.parametrize(
+    "train_reply",
+    [
+        httpx.Response(500, json={"message": "Boom"}),
+        httpx.Response(200, json={"errors": [{"message": "Boom"}]}),
+        httpx.ConnectError("connection reset"),
+    ],
+    ids=["api-error", "graphql-error", "connection-error"],
+)
+@respx.mock
+async def test_failed_position_read_keeps_the_landing_with_a_warning(gitlab_env, train_reply):
+    """A failed position read leaves the land result intact and says the position is missing."""
+    # Arrange
+    respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), train_reply)
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert data["result"] == "merge_train"
+    assert data["auto_merge_strategy"] == "merge_train"
+    assert "train_position" not in data
+    assert "could not be read" in data["warning"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "node_fields"),
+    [
+        ("auto", {"autoMergeStrategy": "MERGE_WHEN_CHECKS_PASS"}),
+        ("auto", {}),
+        ("now", {"state": "merged", "mergeCommitSha": MERGE_SHA}),
+        ("auto", {"state": "merged", "autoMergeStrategy": "MERGE_TRAIN"}),
+        ("cancel", {}),
+    ],
+    ids=["auto-merge", "nothing-queued", "now-merged", "merged-beats-train", "cancelled"],
+)
+@respx.mock
+async def test_non_train_results_do_not_read_the_train(gitlab_env, mode, node_fields):
+    """Only a merge_train result asks for the train position. Other results send just the read-back."""
+    # Arrange
+    mock_write(mode, return_value=httpx.Response(200, json={}))
+    graphql = mock_graphql(make_landing_node(**node_fields), make_train_page(make_car(IID)))
+
+    # Act
+    await call_land(mode=mode, sha=None if mode == "cancel" else HEAD_SHA)
+
+    # Assert
+    assert graphql_bodies(graphql, TRAIN_MARKER) == []
+    assert graphql.call_count == 1
