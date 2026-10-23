@@ -12,18 +12,10 @@ lazy from fastmcp import Context
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import MAX_PAGES, Iid, Project, lower_or_empty
-from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_blockers, fetch_merge_request, mr_rest_path
+from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_blockers, fetch_merge_request, mr_rest_path, set_people
 from gitlab_mcp.tools.labels import validate_project_labels
 
 # Queries and mutations for update_merge_request. Each one changes one thing, so each step can fail on its own. 🔧
-USERS_QUERY = """
-query($usernames: [String!]) {
-  users(usernames: $usernames) {
-    nodes { username }
-  }
-}
-"""
-
 SET_DRAFT_MUTATION = """
 mutation($projectPath: ID!, $iid: String!, $draft: Boolean!) {
   mergeRequestSetDraft(input: {projectPath: $projectPath, iid: $iid, draft: $draft}) {
@@ -31,32 +23,6 @@ mutation($projectPath: ID!, $iid: String!, $draft: Boolean!) {
   }
 }
 """
-
-REVIEWERS_MUTATION = """
-mutation($projectPath: ID!, $iid: String!, $usernames: [String!]!, $mode: MutationOperationMode) {
-  mergeRequestSetReviewers(
-    input: {projectPath: $projectPath, iid: $iid, reviewerUsernames: $usernames, operationMode: $mode}
-  ) {
-    errors
-  }
-}
-"""
-
-ASSIGNEES_MUTATION = """
-mutation($projectPath: ID!, $iid: String!, $usernames: [String!]!, $mode: MutationOperationMode) {
-  mergeRequestSetAssignees(
-    input: {projectPath: $projectPath, iid: $iid, assigneeUsernames: $usernames, operationMode: $mode}
-  ) {
-    errors
-  }
-}
-"""
-
-# Maps each person list to its mutation and the payload field that holds the errors.
-PEOPLE_MUTATIONS = {
-    "reviewers": (REVIEWERS_MUTATION, "mergeRequestSetReviewers"),
-    "assignees": (ASSIGNEES_MUTATION, "mergeRequestSetAssignees"),
-}
 
 # A small re-read for the final state, so the tool does not fetch discussions it does not need.
 MERGE_REQUEST_STATE_QUERY = """
@@ -232,16 +198,6 @@ class _Changes:
         return any(value is not None for value in given) or any(lists) or self.rebase
 
 
-async def _known_usernames(client: GitLabClient, usernames: set[str]) -> dict[str, str]:
-    """Return the known users among `usernames`, keyed by lowercased name.
-
-    GitLab leaves unknown names out of the answer without an error, so a missing
-    name means unknown. Matching ignores case, because usernames ignore case too.
-    """
-    data = await client.graphql(USERS_QUERY, {"usernames": sorted(usernames)})
-    return {node["username"].lower(): node["username"] for node in data["users"]["nodes"]}
-
-
 async def _list_blocks(client: GitLabClient, mr_path: str) -> tuple[list[dict[str, Any]], bool]:
     """Return the block entries of a merge request, and whether the scan stopped before the last page.
 
@@ -382,7 +338,7 @@ class _Update:
             await self.attempt("draft", self.client.mutate(SET_DRAFT_MUTATION, variables, "mergeRequestSetDraft"))
 
     async def _people(self) -> None:
-        """Check every username with one query, then send one call per list that still has known names."""
+        """Add or remove reviewers and assignees, using one shared username lookup and one call per list."""
         changes = self.changes
         jobs = [
             ("reviewers", "add_reviewers", "APPEND", changes.add_reviewers),
@@ -390,30 +346,10 @@ class _Update:
             ("assignees", "add_assignees", "APPEND", changes.add_assignees),
             ("assignees", "remove_assignees", "REMOVE", changes.remove_assignees),
         ]
-        requested = [job for job in jobs if job[3]]
-        if not requested:
-            return
-        try:
-            known = await _known_usernames(self.client, {name for *_, names in requested for name in names})
-        except ToolError as exc:
-            self.failed["usernames"] = str(exc)
-            return
-        for kind, step, mode, names in requested:
-            found = self._resolve(kind, names, known)
-            if found:
-                mutation, payload_field = PEOPLE_MUTATIONS[kind]
-                variables = {"projectPath": self.project, "iid": str(self.iid), "usernames": found, "mode": mode}
-                await self.attempt(step, self.client.mutate(mutation, variables, payload_field))
-
-    def _resolve(self, kind: str, names: list[str], known: dict[str, str]) -> list[str]:
-        """Return GitLab's spelling of each known name. Each unknown name is recorded as a failure."""
-        found: list[str] = []
-        for name in names:
-            if name.lower() in known:
-                found.append(known[name.lower()])
-            else:
-                self.failed[f"{kind}:{name}"] = "unknown user"
-        return found
+        outcome = await set_people(self.client, self.project, self.iid, jobs)
+        self.applied.extend(outcome.applied)
+        self.unknown.extend(outcome.unknown)
+        self.failed.update(outcome.failed)
 
     async def _blocks(self) -> None:
         """Add or remove blocks. Each blocker IID gets its own request, so one failure stays on its own item."""

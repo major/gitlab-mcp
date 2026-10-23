@@ -28,6 +28,10 @@ NEW_CONTEXT_LINE = 11
 MR_URL = f"{BASE}/projects/{ENCODED_PROJECT}/merge_requests/{IID}"
 DIFF_URL = f"{MR_URL}/diffs"
 DISCUSSIONS_URL = f"{MR_URL}/discussions"
+GRAPHQL = "https://gitlab.example.com/api/graphql"
+KNOWN_USERS = ("alice", "bob")
+# GraphQL operations that change people, plus the username lookup. write_order() looks for these names.
+PEOPLE_OPERATIONS = ("users(", "mergeRequestSetReviewers", "mergeRequestSetAssignees")
 
 
 def response(body: Any, *, status: int = 200, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -100,14 +104,16 @@ def review_note(file: str, line: int, body: str = "Please check this.", **extra:
 
 
 async def call_tool(
-    *, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False
+    *, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False, **arguments: Any
 ) -> dict[str, Any]:
-    """Call post_review_notes through the real in-memory MCP client."""
-    result = await call_tool_result(notes=notes, head_sha=head_sha, validate_only=validate_only)
+    """Call post_review_notes through the real in-memory MCP client. Extra arguments are passed through."""
+    result = await call_tool_result(notes=notes, head_sha=head_sha, validate_only=validate_only, **arguments)
     return result.structured_content
 
 
-async def call_tool_result(*, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False) -> Any:
+async def call_tool_result(
+    *, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False, **arguments: Any
+) -> Any:
     """Call the tool and return its protocol result, including input validation errors."""
     return await call_mcp_tool_result(
         "post_review_notes",
@@ -117,9 +123,39 @@ async def call_tool_result(*, notes: list[dict[str, Any]], head_sha: str = HEAD,
             "head_sha": head_sha,
             "notes": notes,
             "validate_only": validate_only,
+            **arguments,
         },
         raise_on_error=False,
     )
+
+
+def serve_people(request: httpx.Request) -> httpx.Response:
+    """Answer the username lookup with the known users, and each people mutation with no errors."""
+    query = json.loads(request.content)["query"]
+    if "users(" in query:
+        return response({"data": {"users": {"nodes": [{"username": name} for name in KNOWN_USERS]}}})
+    payload = "mergeRequestSetReviewers" if "mergeRequestSetReviewers" in query else "mergeRequestSetAssignees"
+    return response({"data": {payload: {"errors": []}}})
+
+
+def graphql_variables(route: respx.Route, marker: str) -> list[dict[str, Any]]:
+    """Return the variables of each GraphQL call whose query contains `marker`, in order."""
+    bodies = [json.loads(call.request.content) for call in route.calls]
+    return [body["variables"] for body in bodies if marker in body["query"]]
+
+
+def write_order() -> list[str]:
+    """Name each POST in the order respx received it, so tests can check that people changes come last.
+
+    Discussion posts have no GraphQL query, so they are named "discussion".
+    """
+    names = []
+    for call in respx.calls:
+        if call.request.method != "POST":
+            continue
+        query = json.loads(call.request.content).get("query", "")
+        names.append(next((name for name in PEOPLE_OPERATIONS if name in query), "discussion"))
+    return names
 
 
 @respx.mock
@@ -1175,4 +1211,151 @@ async def test_missing_gitlab_configuration_stops_before_requests(monkeypatch):
     assert data["results"] == [{"index": 0, "status": "unattempted"}]
     assert "setup failed" in data["warning"]
     assert not mr_route.called
+    assert not post_route.called
+
+
+@respx.mock
+async def test_people_change_after_every_note_posts_in_gitlab_spelling(gitlab_env):
+    """Once all notes post, reviewers and assignees get one APPEND call each, after the discussion posts."""
+    # Arrange
+    add_preflight([([diff_file("src.py", patch="@@ -1,2 +1,2 @@\n one\n two")], None)])
+    respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+    notes = [review_note("src.py", 1), review_note("src.py", 2)]
+
+    # Act
+    data = await call_tool(notes=notes, add_reviewers=["Alice"], add_assignees=["bob"])
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["posted", "posted"]
+    assert data["people"] == {"applied": ["add_reviewers", "add_assignees"]}
+    assert "warning" not in data
+    assert graphql_variables(graphql_route, "mergeRequestSetReviewers") == [
+        {"projectPath": PROJECT, "iid": str(IID), "usernames": ["alice"], "mode": "APPEND"}
+    ]
+    assert graphql_variables(graphql_route, "mergeRequestSetAssignees") == [
+        {"projectPath": PROJECT, "iid": str(IID), "usernames": ["bob"], "mode": "APPEND"}
+    ]
+    assert write_order() == [
+        "discussion",
+        "discussion",
+        "users(",
+        "mergeRequestSetReviewers",
+        "mergeRequestSetAssignees",
+    ]
+
+
+@respx.mock
+async def test_unknown_reviewer_is_reported_and_known_assignee_is_still_added(gitlab_env):
+    """An unknown name fails only its own item, and the known assignee is still added."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], add_reviewers=["ghost"], add_assignees=["bob"])
+
+    # Assert
+    assert data["people"] == {"applied": ["add_assignees"], "failed": {"reviewers:ghost": "unknown user"}}
+    assert graphql_variables(graphql_route, "mergeRequestSetReviewers") == []
+
+
+def reject_post(request: httpx.Request) -> httpx.Response:
+    """Refuse the post with a client error, as GitLab does for a position it cannot use."""
+    return response({"message": "bad position"}, status=422)
+
+
+@pytest.mark.parametrize(
+    ("notes", "post_reply"),
+    [
+        pytest.param(
+            [review_note("src.py", 1), review_note("src.py", 99)],
+            create_response,
+            id="preflight-failure",
+        ),
+        pytest.param([review_note("src.py", 1), review_note("src.py", 2)], reject_post, id="rejected-post"),
+    ],
+)
+@respx.mock
+async def test_people_are_skipped_when_a_note_does_not_post(gitlab_env, notes, post_reply):
+    """If any note fails to post, nobody is added, and the warning says why."""
+    # Arrange
+    add_preflight([([diff_file("src.py", patch="@@ -1,2 +1,2 @@\n one\n two")], None)])
+    respx.post(DISCUSSIONS_URL).mock(side_effect=post_reply)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(notes=notes, add_reviewers=["alice"], add_assignees=["bob"])
+
+    # Assert
+    assert "people" not in data
+    assert data["warning"].endswith("Reviewers and assignees were not changed because not every note posted.")
+    assert not graphql_route.called
+
+
+@respx.mock
+async def test_connection_error_on_a_people_write_is_unknown(gitlab_env):
+    """A connection error on a people write may have reached GitLab, so it is unknown and not failed."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    respx.post(GRAPHQL).mock(
+        side_effect=[
+            response({"data": {"users": {"nodes": [{"username": "alice"}]}}}),
+            httpx.ConnectError("connection closed"),
+        ]
+    )
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], add_reviewers=["alice"])
+
+    # Assert
+    assert data["results"][0]["status"] == "posted"
+    assert data["people"] == {"applied": [], "unknown": ["add_reviewers"]}
+
+
+@respx.mock
+async def test_gitlab_error_on_a_people_write_is_failed_with_its_reason(gitlab_env):
+    """A GitLab refusal of a people write is a failed item with GitLab's reason, and the notes stay posted."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    respx.post(GRAPHQL).mock(
+        side_effect=[
+            response({"data": {"users": {"nodes": [{"username": "alice"}]}}}),
+            response({"message": "Boom"}, status=500),
+        ]
+    )
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], add_reviewers=["alice"])
+
+    # Assert
+    assert data["results"][0]["status"] == "posted"
+    assert data["people"]["applied"] == []
+    assert "HTTP 500" in data["people"]["failed"]["add_reviewers"]
+
+
+@respx.mock
+async def test_validate_only_ignores_people_and_sends_no_people_requests(gitlab_env):
+    """Validation returns positions only. People are applied by the real post, not by validation."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(
+        notes=[review_note("src.py", 1)],
+        validate_only=True,
+        add_reviewers=["alice"],
+        add_assignees=["bob"],
+    )
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}}]
+    assert "people" not in data
+    assert "warning" not in data
+    assert not graphql_route.called
     assert not post_route.called
