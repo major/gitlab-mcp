@@ -11,8 +11,8 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from gitlab_mcp import mcp
 from gitlab_mcp.common import MAX_BATCH_MERGE_REQUESTS, MAX_PAGES
-from gitlab_mcp.server import mcp
 from gitlab_mcp.tools.mr_threads import (
     NOTE_CAP,
     THREAD_CUT_MARKER,

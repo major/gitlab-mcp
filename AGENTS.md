@@ -20,11 +20,25 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 
 ## Layout
 
-- `src/gitlab_mcp/server.py`: the `mcp` FastMCP app, lifespan, and every `@mcp.tool`. New tools go here.
+- `src/gitlab_mcp/__init__.py`: exports `mcp` and `main()`, and imports `gitlab_mcp.tools` so every tool registers. 🔌
+- `src/gitlab_mcp/app.py`: the `mcp` FastMCP app, the shared lifespan, and `get_client(ctx)`.
+- `src/gitlab_mcp/errors.py`: caller-facing `ToolError` types shared by the tool modules.
+- `src/gitlab_mcp/common.py`: generic limits (like `MAX_PAGES`), the `Project` and `Iid` argument types, cursor helpers, and the local file reader.
+- `src/gitlab_mcp/mr_common.py`: merge request helpers shared by several tool modules.
+- `src/gitlab_mcp/tools/`: one module per area: `users`, `labels`, `ci`, `mr_read`, `mr_threads`, `mr_diff`, `mr_review`, `mr_land`, `mr_update`, `mr_create`, and `work_items`. Every `@mcp.tool` lives here.
+- `src/gitlab_mcp/tools/__init__.py`: imports every tool module, so importing the package registers all tools.
+- `src/gitlab_mcp/work_items.py`, `description_edits.py`, `description_tables.py`, `findings.py`, `ci_*.py`: pure helpers for work items, review findings, and CI. No tool registration.
 - `src/gitlab_mcp/client.py`: `GitLabClient.get()` and `.get_page()` (REST, base `/api/v4`; `get_page` also returns `X-Next-Page`), `.request()` (POST/PUT/DELETE), `.graphql()` (absolute `/api/graphql` URL), and `.mutate()` (also checks `data.<field>.errors`). HTTP, network, and GraphQL errors become `ToolError` subclasses with friendly hints.
 - `src/gitlab_mcp/config.py`: `Settings.from_env()` reads `GITLAB_URL`, `GITLAB_TOKEN`, `GITLAB_TIMEOUT`.
 - Config errors must not crash the server: the lifespan stores the error and `get_client(ctx)` raises it as a `ToolError` on the next tool call.
-- When you add a tool, also add a row to the README `Tools` table.
+
+## Adding a tool ✅
+
+- (a) Put the tool in the matching `tools/<area>.py`. For a new area, make a new module and add it to `tools/__init__.py`.
+- (b) Move a helper to `common.py`, `mr_common.py`, or `errors.py` only when a second module needs it. Tool modules should not import each other. The exception: `mr_create.py` and `mr_update.py` import `validate_project_labels` from `tools/labels.py`.
+- (c) Add `tests/test_<tool>.py` that calls the tool through `tests/mcp_helpers.py`.
+- (d) Add the tool name to `READ_ONLY_TOOLS` or `WRITE_TOOLS` in `tests/test_tool_inventory.py`.
+- (e) Add a row to the README `Tools` table.
 
 ## Tool design rules
 

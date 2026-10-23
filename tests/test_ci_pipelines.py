@@ -10,7 +10,7 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.server import mcp
+from gitlab_mcp import mcp
 
 API = "https://gitlab.example.com/api/v4"
 GRAPHQL = "https://gitlab.example.com/api/graphql"
