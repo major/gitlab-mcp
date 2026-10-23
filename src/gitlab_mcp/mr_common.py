@@ -1,16 +1,28 @@
 """Merge request helpers and thread models shared by several tool areas 🔀."""
 
 import re
+from dataclasses import dataclass
+from itertools import batched
 from typing import Any
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
-from gitlab_mcp.common import DIFF_PAGE_SIZE
+from gitlab_mcp.common import DIFF_PAGE_SIZE, GRAPHQL_MR_CHUNK
 from gitlab_mcp.errors import MergeRequestNotFoundError, ProjectNotFoundError
 lazy from gitlab_mcp.client import GitLabClient
 
 DIFF_HUNK_PATTERN = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Selection for one aliased merge request. This field is Premium-only, so it is never part of the main queries.
+BLOCKERS_SELECTION = "blockingMergeRequests { visibleMergeRequests { iid } hiddenCount }"
+
+
+@dataclass(frozen=True)
+class Blockers:
+    """The merge requests that block one merge request."""
+
+    iids: list[int]  # IIDs of the blockers the token can see.
+    hidden: int  # Blockers the token cannot see.
 
 
 class ThreadLocation(BaseModel):
@@ -98,6 +110,55 @@ async def fetch_merge_request(
     if node is None:
         raise MergeRequestNotFoundError(project, iid)
     return node
+
+
+async def fetch_blockers(client: GitLabClient, project: str, iids: list[int]) -> dict[int, Blockers]:
+    """Return the blocking merge requests of each IID, using one GraphQL query per chunk of IIDs.
+
+    Callers should pass only blocked merge requests, because the field needs GitLab Premium.
+    GitLab errors propagate as ToolError, so each caller decides whether blocker data is optional.
+
+    Raises:
+        ProjectNotFoundError: When GitLab has no such project, or the token cannot see it.
+    """
+    blockers: dict[int, Blockers] = {}
+    for chunk in batched(iids, GRAPHQL_MR_CHUNK, strict=False):
+        blockers |= await _fetch_blockers_chunk(client, project, list(chunk))
+    return blockers
+
+
+async def _fetch_blockers_chunk(client: GitLabClient, project: str, iids: list[int]) -> dict[int, Blockers]:
+    """Fetch the blockers for one chunk of IIDs in one GraphQL query, using one alias per IID (`mr_0`, `mr_1`, ...)."""
+    declarations = ["$fullPath: ID!"]
+    variables: dict[str, Any] = {"fullPath": project}
+    selections = []
+    for index, iid in enumerate(iids):
+        variable = f"iid{index}"
+        declarations.append(f"${variable}: String!")
+        variables[variable] = str(iid)
+        selections.append(f"mr_{index}: mergeRequest(iid: ${variable}) {{ {BLOCKERS_SELECTION} }}")
+
+    query = (
+        f"query({', '.join(declarations)}) {{\n"
+        "  project(fullPath: $fullPath) {\n"
+        f"    {' '.join(selections)}\n"
+        "  }\n"
+        "}\n"
+    )
+    data = await client.graphql(query, variables)
+    if data["project"] is None:
+        raise ProjectNotFoundError(project)
+    return {iid: _to_blockers(data["project"][f"mr_{index}"]) for index, iid in enumerate(iids)}
+
+
+def _to_blockers(node: dict[str, Any] | None) -> Blockers:
+    """Convert one aliased merge request node. A missing node or a null connection means no blockers."""
+    connection = node["blockingMergeRequests"] if node else None
+    if connection is None:
+        return Blockers(iids=[], hidden=0)
+    # GraphQL sends IIDs as strings, so they become ints to match the REST and tool output.
+    visible = [int(merge_request["iid"]) for merge_request in connection["visibleMergeRequests"]]
+    return Blockers(iids=visible, hidden=connection["hiddenCount"])
 
 
 def diff_refs_head_sha(diff_refs: dict[str, Any] | None) -> str:

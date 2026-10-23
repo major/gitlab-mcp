@@ -109,6 +109,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "updatedAfter": None,
         "targetBranches": None,
         "includeSourceBranch": False,
+        "includeTargetBranch": False,
         "includeLabels": False,
         "after": None,
         "first": 5,
@@ -156,6 +157,7 @@ async def test_filters_and_optional_columns(gitlab_env):
         "updatedAfter": "2026-10-02T00:00:00Z",
         "targetBranches": ["release/1"],
         "includeSourceBranch": True,
+        "includeTargetBranch": False,
         "includeLabels": True,
         "after": None,
         "first": 1,
@@ -171,6 +173,38 @@ async def test_filters_and_optional_columns(gitlab_env):
     assert row["source_branch"] == "feature line break"
     assert row["labels"] == json.dumps(["Group::One", "path\tname"], ensure_ascii=False, separators=(",", ":"))
     assert data["labels_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_columns"),
+    [
+        ({}, {}),
+        ({"include_target_branch": True}, {"target_branch": "release/1"}),
+        ({"include_source_branch": True}, {"source_branch": "feature/x"}),
+        (
+            {"include_target_branch": True, "include_source_branch": True},
+            {"source_branch": "feature/x", "target_branch": "release/1"},  # Source comes first, then target.
+        ),
+    ],
+    ids=["default-omits-both", "target-only", "source-only", "source-then-target"],
+)
+@respx.mock
+async def test_target_branch_column_is_optional_and_follows_source_branch(gitlab_env, arguments, expected_columns):
+    """The target branch column is sent only when asked, and it appears right after the source branch column."""
+    # Arrange
+    node = make_node(5, sourceBranch="feature/x", targetBranch="release/1")
+    route = respx.post(GRAPHQL).mock(return_value=make_page(node))
+
+    # Act
+    data = await call_tool(arguments)
+
+    # Assert
+    assert sent_variables(route)["includeTargetBranch"] is arguments.get("include_target_branch", False)
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "targetBranch @include(if: $includeTargetBranch)" in query
+    row = rows(data)[0]
+    assert list(row) == [*HEADER.split("\t"), *expected_columns]
+    assert {column: row[column] for column in expected_columns} == expected_columns
 
 
 @pytest.mark.parametrize(
@@ -209,6 +243,7 @@ async def test_defaults_list_open_mrs_by_any_author(gitlab_env):
         "updatedAfter": None,
         "targetBranches": None,
         "includeSourceBranch": False,
+        "includeTargetBranch": False,
         "includeLabels": False,
         "after": None,
         "first": 20,
@@ -469,6 +504,7 @@ async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
             "updatedAfter": None,
             "targetBranches": None,
             "includeSourceBranch": False,
+            "includeTargetBranch": False,
             "includeLabels": False,
             "after": None,
             "first": FULL_PAGE,
@@ -482,6 +518,7 @@ async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
             "updatedAfter": None,
             "targetBranches": None,
             "includeSourceBranch": False,
+            "includeTargetBranch": False,
             "includeLabels": False,
             "after": "c1",
             "first": FULL_PAGE,
