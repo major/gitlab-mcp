@@ -22,9 +22,11 @@ from gitlab_mcp.mr_common import (
     fetch_diff_page,
     full_sha,
     mr_rest_path,
+    set_people,
 )
 
 REVIEW_NOTE_REASON_CAP = 200
+PEOPLE_SKIPPED_WARNING = "Reviewers and assignees were not changed because not every note posted."
 
 
 class ReviewNote(BaseModel):
@@ -89,12 +91,21 @@ class _CheckedNote:
     reason: str = ""
 
 
+class PeopleResult(BaseModel):
+    """Reviewer and assignee changes made after every note posted. Names match update_merge_request."""
+
+    applied: list[str]  # Steps GitLab confirmed, such as add_reviewers.
+    unknown: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
+    failed: dict[str, str] = Field(default_factory=dict, exclude_if=lambda value: not value)  # Step or item -> reason.
+
+
 class PostReviewNotesResult(BaseModel):
     """One bounded result per requested note and a reason when the batch stops."""
 
     results: list[ReviewNotePostResult]
     warning: str = Field(default="", exclude_if=lambda value: not value)
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def _unattempted_review_notes(
@@ -508,6 +519,63 @@ async def _post_review_note_batch(
     return PostReviewNotesResult(results=results, warning=warning[:500])
 
 
+async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the batch request.
+    ctx: Context,
+    project: str,
+    iid: int,
+    head_sha: str,
+    notes: list[ReviewNote],
+    validate_only: bool,
+) -> PostReviewNotesResult:
+    """Run preflight, then validate or post the notes. The public tool adds people changes after this returns."""
+    if not full_sha(head_sha):
+        return _unattempted_review_notes(
+            len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
+        )
+    checks = _read_review_note_bodies(notes)
+    if all(check.reason for check in checks):
+        return _review_preflight_result(checks)
+
+    try:
+        client = get_client(ctx)
+    except ToolError as exc:
+        return _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted.")
+    checks, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, checks)
+    if warning:
+        current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
+        return _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
+    if validate_only or any(check.reason for check in checks):
+        return _review_preflight_result(checks)
+    return await _post_review_note_batch(client, project, iid, checks, refs)
+
+
+async def _add_people_after_posts(  # noqa: PLR0913, PLR0917 - each argument is one part of the people request.
+    ctx: Context,
+    project: str,
+    iid: int,
+    result: PostReviewNotesResult,
+    add_reviewers: list[str] | None,
+    add_assignees: list[str] | None,
+) -> PostReviewNotesResult:
+    """Add the requested reviewers and assignees, but only when every note posted.
+
+    When a note did not post, people stay as they are and the warning says so. The rule keeps a partly
+    posted review from also changing who is assigned to it.
+    """
+    if not (add_reviewers or add_assignees):
+        return result
+    if not all(row.status == "posted" for row in result.results):
+        warning = " ".join(filter(None, (result.warning, PEOPLE_SKIPPED_WARNING)))
+        return result.model_copy(update={"warning": warning[:500]})
+    jobs = [
+        ("reviewers", "add_reviewers", "APPEND", add_reviewers or []),
+        ("assignees", "add_assignees", "APPEND", add_assignees or []),
+    ]
+    outcome = await set_people(get_client(ctx), project, iid, jobs)
+    people = PeopleResult(applied=outcome.applied, unknown=outcome.unknown, failed=outcome.failed)
+    return result.model_copy(update={"people": people})
+
+
 @mcp.tool(
     annotations={
         "readOnlyHint": False,
@@ -525,6 +593,14 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         Field(description="Full 40-character head SHA from get_merge_request or get_merge_request_diff."),
     ],
     notes: Annotated[list[ReviewNote], Field(min_length=1, max_length=20)],
+    add_reviewers: Annotated[
+        list[str] | None,
+        Field(description="Reviewer usernames to add after every note posts."),
+    ] = None,
+    add_assignees: Annotated[
+        list[str] | None,
+        Field(description="Assignee usernames to add after every note posts."),
+    ] = None,
     validate_only: Annotated[
         bool,
         Field(description="Run all preflight checks and return positions without posting any notes."),
@@ -546,23 +622,10 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
     and never retried. Check every result before deciding what to do next.
+    `add_reviewers` and `add_assignees` add people only after every note posts, in the same call. They are ignored
+    when `validate_only` is true.
     """
-    if not full_sha(head_sha):
-        return _unattempted_review_notes(
-            len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
-        )
-    checks = _read_review_note_bodies(notes)
-    if all(check.reason for check in checks):
-        return _review_preflight_result(checks)
-
-    try:
-        client = get_client(ctx)
-    except ToolError as exc:
-        return _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted.")
-    checks, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, checks)
-    if warning:
-        current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
-        return _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
-    if validate_only or any(check.reason for check in checks):
-        return _review_preflight_result(checks)
-    return await _post_review_note_batch(client, project, iid, checks, refs)
+    result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only)
+    if validate_only:
+        return result
+    return await _add_people_after_posts(ctx, project, iid, result, add_reviewers, add_assignees)

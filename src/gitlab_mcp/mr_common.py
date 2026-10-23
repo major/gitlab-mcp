@@ -6,8 +6,10 @@ from itertools import batched
 from typing import Any
 from urllib.parse import quote
 
+from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
+from gitlab_mcp.client import GitLabConnectionError
 from gitlab_mcp.common import DIFF_PAGE_SIZE, GRAPHQL_MR_CHUNK
 from gitlab_mcp.errors import MergeRequestNotFoundError, ProjectNotFoundError
 lazy from gitlab_mcp.client import GitLabClient
@@ -15,6 +17,40 @@ lazy from gitlab_mcp.client import GitLabClient
 DIFF_HUNK_PATTERN = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Selection for one aliased merge request. This field is Premium-only, so it is never part of the main queries.
 BLOCKERS_SELECTION = "blockingMergeRequests { visibleMergeRequests { iid } hiddenCount }"
+# Usernames are checked in one query. GitLab leaves unknown names out of the answer instead of failing.
+USERS_QUERY = """
+query($usernames: [String!]) {
+  users(usernames: $usernames) {
+    nodes { username }
+  }
+}
+"""
+
+REVIEWERS_MUTATION = """
+mutation($projectPath: ID!, $iid: String!, $usernames: [String!]!, $mode: MutationOperationMode) {
+  mergeRequestSetReviewers(
+    input: {projectPath: $projectPath, iid: $iid, reviewerUsernames: $usernames, operationMode: $mode}
+  ) {
+    errors
+  }
+}
+"""
+
+ASSIGNEES_MUTATION = """
+mutation($projectPath: ID!, $iid: String!, $usernames: [String!]!, $mode: MutationOperationMode) {
+  mergeRequestSetAssignees(
+    input: {projectPath: $projectPath, iid: $iid, assigneeUsernames: $usernames, operationMode: $mode}
+  ) {
+    errors
+  }
+}
+"""
+
+# Maps each person list to its mutation and the payload field that holds the errors.
+PEOPLE_MUTATIONS = {
+    "reviewers": (REVIEWERS_MUTATION, "mergeRequestSetReviewers"),
+    "assignees": (ASSIGNEES_MUTATION, "mergeRequestSetAssignees"),
+}
 
 
 @dataclass(frozen=True)
@@ -195,3 +231,66 @@ def mr_rest_path(project: str, iid: int) -> str:
     """
     encoded = quote(project, safe="")
     return f"/projects/{encoded}/merge_requests/{iid}"
+
+
+@dataclass
+class PeopleOutcome:
+    """What one set of people changes did. Each list holds step names, or `kind:name` items in `failed`."""
+
+    applied: list[str]  # Steps GitLab confirmed, such as add_reviewers.
+    unknown: list[str]  # Steps whose write may have reached GitLab. Check before retrying.
+    failed: dict[str, str]  # Step or item -> reason.
+
+
+async def known_usernames(client: GitLabClient, usernames: set[str]) -> dict[str, str]:
+    """Return the known users among `usernames`, keyed by lowercased name.
+
+    GitLab leaves unknown names out of the answer without an error, so a missing
+    name means unknown. Matching ignores case, because usernames ignore case too.
+    """
+    data = await client.graphql(USERS_QUERY, {"usernames": sorted(usernames)})
+    return {node["username"].lower(): node["username"] for node in data["users"]["nodes"]}
+
+
+async def set_people(
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    jobs: list[tuple[str, str, str, list[str]]],
+) -> PeopleOutcome:
+    """Change reviewers or assignees of one merge request, and report each step's outcome.
+
+    Each job is (kind, step, mode, names). `kind` is "reviewers" or "assignees", `step` names the
+    outcome, and `mode` is "APPEND" or "REMOVE". Jobs with no names are skipped. All names are checked
+    with one lookup, then each job with known names sends one mutation. A failure in one job never stops the others.
+    """
+    outcome = PeopleOutcome(applied=[], unknown=[], failed={})
+    requested = [job for job in jobs if job[3]]
+    if not requested:
+        return outcome
+    try:
+        known = await known_usernames(client, {name for *_, names in requested for name in names})
+    except ToolError as exc:
+        outcome.failed["usernames"] = str(exc)
+        return outcome
+    for kind, step, mode, names in requested:
+        found = []
+        for name in names:
+            if name.lower() in known:
+                found.append(known[name.lower()])
+            else:
+                outcome.failed[f"{kind}:{name}"] = "unknown user"
+        if not found:
+            continue
+        mutation, payload_field = PEOPLE_MUTATIONS[kind]
+        variables = {"projectPath": project, "iid": str(iid), "usernames": found, "mode": mode}
+        try:
+            await client.mutate(mutation, variables, payload_field)
+        except GitLabConnectionError:
+            # The write may have reached GitLab, so it is not reported as failed.
+            outcome.unknown.append(step)
+        except ToolError as exc:
+            outcome.failed[step] = str(exc)
+        else:
+            outcome.applied.append(step)
+    return outcome
