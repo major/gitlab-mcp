@@ -49,6 +49,8 @@ mcp = FastMCP(
         "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "
         "Do not call validate_only again. "
         "Use update_merge_request for reviewer, assignee, and approval changes. "
+        "If a merge request has conflicts, do not call the rebase API; rebase locally and "
+        "push with --force-with-lease. "
         # 🔍 Main arguments, so one tool search is enough. Client searches often cut long signatures.
         "Main arguments: "
         "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, view=full|headings|finding, "

@@ -673,13 +673,43 @@ async def test_conflicted_mr_fails_without_sending_a_rebase(gitlab_env, router, 
     """GitLab cannot rebase an MR with conflicts, so the rebase endpoint is never called."""
     # Arrange
     routes = serve_writes(router)
+    reads = router.get(MR).mock(
+        return_value=httpx.Response(
+            200,
+            json=mr_state(has_conflicts=True, source_branch="feature", target_branch="main", sha=SHA),
+        )
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError) as error:
+        await call_tool(rebase=True)
+
+    # Assert
+    assert "source branch 'feature'" in str(error.value)
+    assert "target branch 'main'" in str(error.value)
+    assert SHA in str(error.value)
+    assert f"--force-with-lease=feature:{SHA}" in str(error.value)
+    assert routes["rebase"].call_count == 0
+    assert reads.call_count == 1  # Only the preflight, no polls or extra metadata reads.
+
+
+async def test_conflicted_mr_without_metadata_uses_safe_generic_guidance(gitlab_env, router, instant_polls):
+    """Missing branch details still fail cleanly and never suggest an unguarded force push."""
+    # Arrange
+    routes = serve_writes(router)
     reads = router.get(MR).mock(return_value=httpx.Response(200, json=mr_state(has_conflicts=True)))
 
     # Act / Assert
-    with pytest.raises(ToolError, match=r"cannot rebase this MR because it has conflicts\. Rebase locally and push\."):
+    with pytest.raises(ToolError) as error:
         await call_tool(rebase=True)
+
+    # Assert
+    message = str(error.value)
+    assert "Rebase locally" in message
+    assert "--force-with-lease" in message
+    assert "push --force " not in message
     assert routes["rebase"].call_count == 0
-    assert reads.call_count == 1  # Only the preflight, no polls.
+    assert reads.call_count == 1
 
 
 async def test_rebase_rejected_by_gitlab_reports_its_merge_error(gitlab_env, router, instant_polls):
