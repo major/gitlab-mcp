@@ -70,13 +70,16 @@ replacements cannot contain pipes, line breaks, backslashes, or backticks.
 
 ### CI pipelines, jobs, and logs 🚦
 
-Start with `list_pipelines` to find a pipeline, then `get_pipeline` for its jobs. Use `get_job` for one runner job and
-`get_job_log` for a bounded log slice. `list_pipeline_schedules` shows a project's schedules.
+For CI triage, start with `list_pipelines` to find a pipeline, then `get_pipeline` for its jobs, and `get_job_log` for a
+bounded log slice. Use `get_job` for runner-job metadata. `list_pipeline_schedules` shows a project's schedules.
+
+Pipeline job summaries expose GitLab's human-readable `failure_message`, which can be empty for common failures.
+Use `get_job` for machine-readable `failure_reason` codes. Pipeline jobs retain GitLab's newest-first order across pages.
 
 | Tool | Description |
 | --- | --- |
-| `list_pipelines` | List one page of pipelines for a merge request, a pipeline schedule, or a project, newest first. |
-| `get_pipeline` | Read one pipeline and one page of its jobs. Only the latest attempt of each job is shown unless asked. |
+| `list_pipelines` | List one page of pipelines for a merge request, a pipeline schedule, or a project, newest first, with pipeline names and second-resolution timestamps. |
+| `get_pipeline` | Read one pipeline and one page of its jobs, with an optional linked merge request IID. Only the latest attempt of each job is shown unless asked. |
 | `get_job` | Read one runner job's status, timing, failure reason, and runner. Trigger and external jobs are not found. |
 | `list_pipeline_schedules` | List one page of a project's pipeline schedules and the last pipeline each one started. |
 | `get_job_log` | Read the last lines (`tail`) or first lines (`head`) of a job log, capped by `max_chars`. |

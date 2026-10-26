@@ -29,7 +29,7 @@ JOB_TYPES = {
     "GenericCommitStatus": "external",
     "CommitStatus": "external",
 }
-LIST_COLUMNS = ("pipeline_id", "status", "source", "ref", "sha", "created", "updated")
+LIST_COLUMNS = ("pipeline_id", "name", "status", "source", "ref", "sha", "created", "updated")
 JOB_COLUMNS = (
     "job_id",
     "type",
@@ -54,6 +54,7 @@ query(
   project(fullPath: $fullPath) {
     pipeline(id: $pipelineId) {
       id status source ref sha createdAt startedAt finishedAt duration
+      mergeRequest { iid }
       jobs(first: $first, after: $after, retried: $retried, statuses: $statuses) {
         nodes {
           id name status allowFailure duration scheduledAt failureMessage
@@ -74,8 +75,8 @@ class PipelineList(BaseModel):
     web_url_prefix: str = Field(description="Append a pipeline_id to get the pipeline link.")
     pipelines: str = Field(
         description=(
-            "TSV with a header row. Columns: pipeline_id, status, source, ref, sha, created, updated. "
-            "Dates are YYYY-MM-DD. An empty cell means unknown."
+            "TSV with a header row. Columns: pipeline_id, name, status, source, ref, sha, created, updated. "
+            "Timestamps have second precision. An empty cell means unknown."
         ),
     )
     next_cursor: str = Field(default="", exclude_if=lambda value: not value)  # Empty when there are no more pages.
@@ -85,6 +86,7 @@ class PipelineDetail(BaseModel):
     """One pipeline's metadata and one page of its jobs."""
 
     pipeline_id: int
+    mr_iid: int | None = Field(default=None, exclude_if=lambda value: value is None)
     status: str
     source: str = Field(default="", exclude_if=lambda value: not value)
     ref: str
@@ -158,17 +160,24 @@ def _list_request(
 
 
 def _list_row(pipeline: dict[str, Any]) -> str:
-    """Render one REST pipeline as a TSV row. Dates keep only the YYYY-MM-DD part."""
+    """Render one REST pipeline as a TSV row with timestamps at second precision."""
     values = (
         pipeline["id"],
+        pipeline.get("name"),
         pipeline["status"],
         pipeline.get("source"),
         pipeline["ref"],
         pipeline["sha"],
-        pipeline["created_at"][:10],
-        pipeline["updated_at"][:10],
+        _iso_seconds(pipeline["created_at"]),
+        _iso_seconds(pipeline["updated_at"]),
     )
     return "\t".join(cell(value) for value in values)
+
+
+def _iso_seconds(value: str) -> str:
+    """Format an ISO 8601 timestamp to seconds without changing its timezone."""
+    formatted = datetime.fromisoformat(value).isoformat(timespec="seconds")
+    return formatted[:-6] + "Z" if value.endswith("Z") else formatted
 
 
 async def list_pipelines(  # noqa: PLR0913 - each argument is one filter or paging input.
@@ -339,8 +348,10 @@ async def get_pipeline(  # noqa: PLR0913 - each argument is one filter or paging
     if page_info["hasNextPage"] and not page_info["endCursor"]:
         raise_tool_error("GitLab reported more jobs but did not return a cursor.")
     job_rows = [_job_row(node) for node in jobs["nodes"]]
+    merge_request = pipeline.get("mergeRequest")
     return PipelineDetail(
         pipeline_id=numeric_gid(pipeline["id"], PIPELINE_MODELS),
+        mr_iid=int(merge_request["iid"]) if merge_request is not None else None,  # GraphQL sends IIDs as strings.
         status=pipeline["status"].lower(),
         source=(pipeline["source"] or "").lower(),
         ref=pipeline["ref"],
