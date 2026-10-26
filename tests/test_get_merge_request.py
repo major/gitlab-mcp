@@ -22,6 +22,7 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
 AUTHOR_ID = 314
+PIPELINE_ID = 123
 BLOCKER_IIDS = [2100, 2101]
 HIDDEN_BLOCKERS = 3
 PIPELINE_JOBS = "https://gitlab.example.com/api/v4/projects/group%2Fproject/pipelines/123/jobs"
@@ -135,7 +136,6 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "fullPath": PROJECT,
         "iid": str(IID),
         "includeDescription": True,
-        "includeJobs": False,
         "includeLabels": False,
     }
     assert data == {
@@ -401,14 +401,9 @@ async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
     data = await call_tool(include_jobs=True)
 
     # Assert
-    assert sent_variables(graphql)["includeJobs"] is True
     assert dict(jobs.calls.last.request.url.params) == {"scope[]": "failed", "per_page": "100", "page": "1"}
-    assert (
-        "headPipeline { status id @include(if: $includeJobs) }"
-        in json.loads(
-            graphql.calls.last.request.content,
-        )["query"]
-    )
+    assert "headPipeline { status id }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert data["latest_pipeline_id"] == PIPELINE_ID
     assert data["failed_jobs"] == "id\tname\n456\tunit tests"
     assert "jobs_complete" not in data
 
@@ -417,15 +412,17 @@ async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
 async def test_default_does_not_request_pipeline_jobs(gitlab_env):
     """The default lookup keeps the existing response and makes no REST jobs request."""
     # Arrange
-    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+    node = make_mr(headPipeline={"status": "SUCCESS", "id": "gid://gitlab/Ci::Pipeline/123"})
+    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
     jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
 
     # Act
     data = await call_tool()
 
     # Assert
-    assert sent_variables(graphql)["includeJobs"] is False
+    assert "headPipeline { status id }" in json.loads(graphql.calls.last.request.content)["query"]
     assert jobs.call_count == 0
+    assert data["latest_pipeline_id"] == PIPELINE_ID
     assert "failed_jobs" not in data
     assert "jobs_complete" not in data
 
@@ -434,16 +431,16 @@ async def test_default_does_not_request_pipeline_jobs(gitlab_env):
 async def test_include_jobs_without_pipeline_makes_no_rest_request(gitlab_env):
     """An explicitly requested job lookup skips REST when the merge request has no pipeline."""
     # Arrange
-    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(headPipeline=None)))
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(headPipeline=None)))
     jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
 
     # Act
     data = await call_tool(include_jobs=True)
 
     # Assert
-    assert sent_variables(graphql)["includeJobs"] is True
     assert jobs.call_count == 0
     assert "pipeline_status" not in data
+    assert "latest_pipeline_id" not in data
     assert "failed_jobs" not in data
     assert "jobs_complete" not in data
 
@@ -529,7 +526,11 @@ async def test_include_jobs_reports_incomplete_at_page_cap(gitlab_env):
     assert data["failed_jobs"].splitlines()[0] == "id\tname"
 
 
-@pytest.mark.parametrize("pipeline_id", ["123", "gid://gitlab/Ci::Pipeline/not-a-number", "gid://gitlab/Other/123"])
+@pytest.mark.parametrize(
+    "pipeline_id",
+    [None, "123", "gid://gitlab/Ci::Pipeline/not-a-number", "gid://gitlab/Other/123"],
+    ids=["missing", "not-a-gid", "not-numeric", "wrong-model"],
+)
 @respx.mock
 async def test_include_jobs_rejects_malformed_pipeline_id(gitlab_env, pipeline_id):
     """A malformed pipeline GID raises an error instead of hiding failed jobs."""
@@ -540,7 +541,7 @@ async def test_include_jobs_rejects_malformed_pipeline_id(gitlab_env, pipeline_i
     jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
 
     # Act / Assert
-    with pytest.raises(ToolError, match="pipeline ID format"):
+    with pytest.raises(ToolError):
         await call_tool(include_jobs=True)
     assert jobs.call_count == 0
 
@@ -653,7 +654,6 @@ async def test_description_obeys_requested_limit(
         "fullPath": PROJECT,
         "iid": str(IID),
         "includeDescription": True,
-        "includeJobs": False,
         "includeLabels": False,
     }
     assert len(data["description"]) == expected_length
@@ -708,7 +708,6 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
         "fullPath": PROJECT,
         "iid": str(IID),
         "includeDescription": False,
-        "includeJobs": False,
         "includeLabels": False,
     }
     assert {"description", "description_truncated"}.isdisjoint(data)
