@@ -8,6 +8,7 @@ lazy from fastmcp import Context
 from gitlab_mcp import ci_logs as _ci_logs
 from gitlab_mcp import ci_metadata as _ci_metadata
 from gitlab_mcp import ci_pipelines as _ci_pipelines
+from gitlab_mcp import ci_test_reports as _ci_test_reports
 from gitlab_mcp.app import get_client, mcp
 lazy from gitlab_mcp.common import Project
 
@@ -133,6 +134,42 @@ async def get_pipeline(  # noqa: PLR0913, PLR0917 - each argument is one filter 
         # A new list, because list[CiStatus] is not a list[str] for the type checker.
         statuses=None if statuses is None else [*statuses],
         include_retried=include_retried,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def get_pipeline_test_report(  # noqa: PLR0913, PLR0917 - each argument is one paging input.
+    ctx: Context,
+    project: Project,
+    pipeline_id: PipelineId,
+    build_ids: Annotated[
+        list[JobId] | None,
+        Field(
+            min_length=1,
+            max_length=20,
+            description="Optional 1 to 20 positive numeric build IDs. Leave unset for totals and suite summaries.",
+        ),
+    ] = None,
+    limit: Annotated[int, Field(strict=True, ge=1, le=100, description="Rows per page, from 1 to 100.")] = 20,
+    cursor: Annotated[
+        str | None,
+        Field(description="next_cursor from an earlier call with the same project, pipeline, build IDs, and limit."),
+    ] = None,
+) -> _ci_test_reports.PipelineTestReport:
+    """Read a pipeline test report, like `glab api projects/:id/pipelines/:pipeline_id/test_report`.
+
+    Leave `build_ids` unset to read totals and one page of suite summaries. Pass selected build IDs to scan one
+    page of test cases and return only failed or errored cases. Use the summary to select build IDs, then page
+    through cases with `next_cursor`. A page can have no failures while more cases remain. `cases_scanned` reports
+    how many cases were checked. Test output text and traces are never returned.
+    """
+    return await _ci_test_reports.get_pipeline_test_report(
+        client=get_client(ctx),
+        project=project,
+        pipeline_id=pipeline_id,
+        build_ids=build_ids,
         limit=limit,
         cursor=cursor,
     )
