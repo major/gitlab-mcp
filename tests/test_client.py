@@ -583,6 +583,232 @@ async def test_trace_prefix_rejects_a_limit_that_is_not_positive(client, max_byt
     assert not route.called
 
 
+@pytest.mark.parametrize("content_range", ["bytes 10-14/100", "bytes 10-14/*"])
+@respx.mock
+async def test_trace_window_sends_range_and_identity_headers_and_returns_later_window(client, content_range):
+    """A valid window response supports known or unknown totals and keeps its lookahead byte."""
+    # Arrange
+    route = respx.get(TRACE_URL).mock(
+        return_value=httpx.Response(
+            206,
+            headers={"Content-Range": content_range},
+            stream=SpyStream([b"ab", b"cde"]),
+        ),
+    )
+
+    # Act
+    result = await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+
+    # Assert
+    sent = route.calls.last.request
+    assert result == (b"abcd", True)
+    assert sent.headers["Range"] == "bytes=10-14"
+    assert sent.headers["Accept"] == "text/plain"
+    assert sent.headers["Accept-Encoding"] == "identity"
+    assert sent.headers["PRIVATE-TOKEN"] == "glpat-test"
+
+
+@respx.mock
+async def test_trace_window_accepts_a_short_range_at_known_eof(client):
+    """A shorter range is valid when its end is exactly the final byte in the trace."""
+    # Arrange
+    respx.get(TRACE_URL).mock(
+        return_value=httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 10-12/13"},
+            stream=SpyStream([b"abc"]),
+        ),
+    )
+
+    # Act
+    result = await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+
+    # Assert
+    assert result == (b"abc", False)
+
+
+@respx.mock
+async def test_trace_window_accepts_origin_200_fallback(client):
+    """A server may return the full trace for the origin window when it ignores Range."""
+    # Arrange
+    route = respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=SpyStream([b"abcdef"])))
+
+    # Act
+    result = await client.get_trace_window(TRACE_PATH, offset=0, max_bytes=4)
+
+    # Assert
+    assert result == (b"abcd", True)
+    assert route.calls.last.request.headers["Range"] == "bytes=0-4"
+
+
+@respx.mock
+async def test_trace_window_rejects_ignored_nonzero_range_before_reading(client):
+    """A server that ignores a later range gets a bounded-continuation error before body reading."""
+    # Arrange
+    stream = SpyStream([b"secret trace"])
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="does not support bounded trace continuation"):
+        await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+    assert stream.pulled == 0
+    assert stream.closed == 1
+
+
+async def test_trace_window_does_not_follow_redirect_before_reading(client):
+    """A redirect is rejected without reading its body or sending the token to its target."""
+    # Arrange
+    stream = SpyStream([b"redirect body"])
+    with respx.mock(assert_all_called=False) as router:
+        router.get(TRACE_URL).mock(
+            return_value=httpx.Response(
+                302,
+                headers={"Location": "https://attacker.example.net/trace"},
+                stream=stream,
+            ),
+        )
+        elsewhere = router.get("https://attacker.example.net/trace").mock(
+            return_value=httpx.Response(200, text="secret"),
+        )
+
+        # Act / Assert
+        with pytest.raises(GitLabRedirectError, match="redirect"):
+            await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+        assert not elsewhere.called
+        assert stream.pulled == 0
+        assert stream.closed == 1
+
+
+@pytest.mark.parametrize(
+    "content_range",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("invalid", id="malformed"),
+        pytest.param("bytes 11-14/100", id="wrong-start"),
+        pytest.param("bytes 10-9/100", id="end-before-start"),
+        pytest.param("bytes 10-15/100", id="end-after-request"),
+        pytest.param("bytes 10-12/100", id="premature-known-total-end"),
+        pytest.param("bytes 10-12/*", id="premature-unknown-total-end"),
+        pytest.param("bytes 10-14/14", id="total-not-after-end"),
+        pytest.param("bytes 10-14/not-a-number", id="invalid-total"),
+    ],
+)
+@respx.mock
+async def test_trace_window_rejects_invalid_content_range_before_reading(client, content_range):
+    """A malformed or mismatched range header is rejected without reading the trace body."""
+    # Arrange
+    stream = SpyStream([b"secret trace"])
+    headers = {} if content_range is None else {"Content-Range": content_range}
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(206, headers=headers, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="invalid Content-Range"):
+        await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+    assert stream.pulled == 0
+    assert stream.closed == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [pytest.param(b"abcd", id="short-body"), pytest.param(b"x" * 100_000, id="oversized-body")],
+)
+@respx.mock
+async def test_trace_window_rejects_body_length_mismatch_with_bounded_read(client, body):
+    """A 206 body must match Content-Range exactly, with oversized input read only to the cap."""
+    # Arrange
+    stream = SpyStream([body])
+    respx.get(TRACE_URL).mock(
+        return_value=httpx.Response(206, headers={"Content-Range": "bytes 10-14/100"}, stream=stream),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="invalid trace window body length"):
+        await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+    assert stream.pulled == 1
+    assert stream.closed == 1
+
+
+@respx.mock
+async def test_trace_window_rejects_encoded_response_before_reading(client):
+    """A compressed response is refused before httpx can decompress its body."""
+    # Arrange
+    stream = SpyStream([b"compressed data"])
+    respx.get(TRACE_URL).mock(
+        return_value=httpx.Response(
+            206,
+            headers={"Content-Range": "bytes 10-14/100", "Content-Encoding": "gzip"},
+            stream=stream,
+        ),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="unsupported Content-Encoding"):
+        await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+    assert stream.pulled == 0
+    assert stream.closed == 1
+
+
+@pytest.mark.parametrize(
+    ("offset", "max_bytes", "message"),
+    [
+        pytest.param(-1, 4, "offset must be nonnegative", id="negative-offset"),
+        pytest.param(0, 0, "max_bytes must be positive", id="zero-limit"),
+        pytest.param(0, -1, "max_bytes must be positive", id="negative-limit"),
+    ],
+)
+@respx.mock
+async def test_trace_window_rejects_invalid_arguments_without_request(client, offset, max_bytes, message):
+    """An invalid offset or byte limit is a programming error and sends no request."""
+    # Arrange
+    route = respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=SpyStream([b"log"])))
+
+    # Act / Assert
+    with pytest.raises(ValueError, match=message):
+        await client.get_trace_window(TRACE_PATH, offset=offset, max_bytes=max_bytes)
+    assert not route.called
+
+
+@respx.mock
+async def test_trace_window_preserves_api_error_details(client):
+    """HTTP errors from the trace endpoint keep the normal GitLab detail and hint."""
+    # Arrange
+    respx.get(TRACE_URL).mock(return_value=httpx.Response(404, json={"message": "Trace not found"}))
+
+    # Act / Assert
+    with pytest.raises(GitLabAPIError) as info:
+        await client.get_trace_window(TRACE_PATH, offset=0, max_bytes=4)
+    assert str(info.value) == (
+        f"GitLab returned HTTP 404 for {TRACE_PATH}: Trace not found. Not found, or the token cannot see it."
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        pytest.param(httpx.ReadError("reset"), "Could not reach https://gitlab.example.com: reset", id="read-error"),
+        pytest.param(
+            TimeoutError(),
+            "Could not reach https://gitlab.example.com: timed out after 30.0 seconds",
+            id="deadline-timeout",
+        ),
+    ],
+)
+@respx.mock
+async def test_trace_window_read_failure_is_connection_error_and_closes(client, error, expected_message):
+    """A read failure or whole-operation timeout becomes a connection error and closes the stream."""
+    # Arrange
+    stream = SpyStream([b"abc"], error=error)
+    respx.get(TRACE_URL).mock(
+        return_value=httpx.Response(206, headers={"Content-Range": "bytes 10-14/100"}, stream=stream),
+    )
+
+    # Act / Assert
+    with pytest.raises(GitLabConnectionError) as info:
+        await client.get_trace_window(TRACE_PATH, offset=10, max_bytes=4)
+    assert str(info.value) == expected_message
+    assert stream.closed == 1
+
+
 @respx.mock
 async def test_get_bounded_json_sends_params_and_identity_headers_and_returns_next_page(client):
     """The streamed JSON GET sends its parameters and returns a valid next-page number."""

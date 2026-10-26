@@ -59,6 +59,20 @@ def mock_head(body: str | bytes) -> respx.Route:
     return respx.get(TRACE_URL).mock(return_value=httpx.Response(200, content=content))
 
 
+def mock_trace_window(body: str | bytes, *, offset: int, total: int, max_bytes: int = 262144) -> respx.Route:
+    """Mock one bounded trace range starting at `offset`."""
+    content = body.encode() if isinstance(body, str) else body
+    end = offset + len(content) - 1
+    requested_end = offset + max_bytes
+    return respx.get(TRACE_URL, headers={"Range": f"bytes={offset}-{requested_end}"}).mock(
+        return_value=httpx.Response(
+            206,
+            headers={"Content-Range": f"bytes {offset}-{end}/{total}"},
+            content=content,
+        ),
+    )
+
+
 def mock_log(view: str, body: str | bytes, *, status: str = "success") -> respx.Route:
     """Mock the log read for `view`. Head gets the raw body, tail gets it as a GraphQL summary."""
     if view == "head":
@@ -367,14 +381,18 @@ async def test_invalid_arguments_fail_before_any_request(arguments):
         {"view": "search", "pattern": "match", "section": "build"},
         {"view": "search", "pattern": "match", "context": -1},
         {"view": "search", "pattern": "match", "context": 6},
+        {"view": "search", "pattern": "match", "byte_offset": -1},
         {"view": "section"},
         {"view": "section", "section": "bad name"},
         {"view": "section", "section": "build", "pattern": "x"},
         {"view": "section", "section": "build", "context": 0},
+        {"view": "section", "section": "build", "byte_offset": 0},
         {"view": "search", "pattern": "x", "scan_bytes": 0},
         {"view": "section", "section": "build", "scan_bytes": 1048577},
         {"view": "head", "pattern": "x"},
+        {"view": "head", "byte_offset": 0},
         {"view": "tail", "section": "build"},
+        {"view": "tail", "byte_offset": 0},
         {"view": "head", "context": 0},
         {"view": "tail", "scan_bytes": 10},
     ],
@@ -494,6 +512,119 @@ async def test_search_finds_output_beyond_the_old_32_kib_head_limit():
     assert data["complete"] is True
     assert data["source"] == "rest_trace_prefix"
     assert len(respx.calls) == TWO_CALLS
+
+
+@respx.mock
+async def test_search_continues_from_raw_offset_and_finds_a_later_match():
+    """Search resumes after complete raw lines and finds a match beyond the initial prefix."""
+    # Arrange
+    body = b"first\nhit\n"
+    job_route = mock_job()
+    range_route = mock_trace_window(b"hit\n", offset=6, total=len(body), max_bytes=6)
+    prefix_route = mock_head(body)
+
+    # Act
+    first = await call_log(view="search", pattern="hit", context=0, scan_bytes=6, byte_offset=0)
+    second = await call_log(view="search", pattern="hit", context=0, scan_bytes=6, byte_offset=first["next_offset"])
+
+    # Assert
+    assert first["found"] is False
+    assert first["next_offset"] == len(b"first\n")
+    assert first["scan_truncated"] is True
+    assert prefix_route.call_count == 1
+    assert range_route.call_count == 1
+    assert range_route.calls.last.request.headers["Range"] == "bytes=6-12"
+    assert second["text"] == "hit\n"
+    assert second["found"] is True
+    assert second["scan_truncated"] is False
+    assert "next_offset" not in second
+    assert second["complete"] is False
+    assert job_route.call_count == TWO_CALLS
+
+
+@respx.mock
+async def test_search_next_offset_uses_raw_bytes_before_cleaning_and_drops_partial_line():
+    """A continuation offset counts raw bytes, including removed controls, not cleaned text characters."""
+    # Arrange
+    body = b"\x1b[31mone\n\xc3\xa9more\nhit\n"
+    scan_bytes = len(b"\x1b[31mone\n\xc3")
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="search", pattern="missing", context=0, scan_bytes=scan_bytes)
+
+    # Assert
+    assert data["text"] == ""
+    assert data["found"] is False
+    assert data["scanned_bytes"] == scan_bytes
+    assert data["next_offset"] == len(b"\x1b[31mone\n")
+    assert data["next_offset"] != len("one\n")
+    assert data["scan_truncated"] is True
+
+
+@respx.mock
+async def test_search_rejects_cut_window_without_a_complete_line():
+    """A cut window with no complete line fails instead of returning a stuck continuation cursor."""
+    # Arrange
+    mock_job()
+    mock_head(b"partial line with more bytes")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"(?i)increase scan_bytes"):
+        await call_log(view="search", pattern="partial", context=0, scan_bytes=7)
+
+
+@respx.mock
+async def test_search_nonzero_offset_errors_when_gitlab_ignores_range():
+    """A server that ignores a nonzero Range request cannot silently return prefix search results."""
+    # Arrange
+    mock_job()
+    ignored_range_response = mock_head("matching prefix\n")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="does not support bounded trace continuation"):
+        await call_log(view="search", pattern="matching", byte_offset=10)
+    assert ignored_range_response.call_count == 1
+    assert len(respx.calls) == TWO_CALLS
+    assert respx.calls.last.request.headers["Range"] == "bytes=10-262154"
+
+
+@respx.mock
+async def test_search_at_nonzero_offset_masks_credentials_before_matching():
+    """A resumed search matches masked text and never returns the raw credential."""
+    # Arrange
+    mock_job()
+    range_route = mock_trace_window("token=secret\n", offset=12, total=25)
+
+    # Act
+    data = await call_log(view="search", pattern="[REDACTED]", context=0, byte_offset=12)
+
+    # Assert
+    assert range_route.call_count == 1
+    assert data["text"] == "token=[REDACTED]\n"
+    assert "secret" not in data["text"]
+    assert data["found"] is True
+    assert data["complete"] is False
+
+
+@respx.mock
+async def test_search_at_nonzero_offset_at_eof_has_no_next_offset():
+    """An uncut nonzero range at EOF has no continuation cursor but is not whole-trace complete."""
+    # Arrange
+    mock_job()
+    range_route = mock_trace_window("last line\n", offset=12, total=22)
+
+    # Act
+    data = await call_log(view="search", pattern="last", context=0, byte_offset=12)
+
+    # Assert
+    assert range_route.call_count == 1
+    assert data["text"] == "last line\n"
+    assert data["found"] is True
+    assert data["scan_truncated"] is False
+    assert data["complete"] is False
+    assert "next_offset" not in data
 
 
 @pytest.mark.parametrize(
@@ -647,13 +778,6 @@ async def test_missing_and_unclosed_selection_results(body, arguments, expected_
             False,
         ),
         (
-            b"partial target beyond prefix",
-            len(b"partial target"),
-            {"view": "search", "pattern": "partial", "context": 0},
-            "",
-            False,
-        ),
-        (
             b"complete line\nsection_start:1:build",
             len(b"complete line\nsection_start:1:bu"),
             {"view": "section", "section": "build"},
@@ -670,7 +794,6 @@ async def test_missing_and_unclosed_selection_results(body, arguments, expected_
     ],
     ids=[
         "partial-search-line",
-        "partial-search-no-newline",
         "partial-section-marker",
         "partial-utf8-line",
     ],
