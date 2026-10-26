@@ -207,13 +207,13 @@ async def test_log_views_omit_source_and_note_and_keep_masking_and_progress(
     assert {key: data[key] for key in expected_progress} == expected_progress
 
 
-@pytest.mark.parametrize("view", ["tail", "head"])
+@pytest.mark.parametrize("view", ["tail", "summary", "head"])
 @pytest.mark.parametrize("status", ["running", "pending"])
 @respx.mock
 async def test_unfinished_job_still_reads_its_log(view, status):
     """A running or pending job is not cut short, because partial output is still useful."""
     # Arrange
-    if view == "tail":
+    if view in {"tail", "summary"}:
         log_route = mock_log(view, "partial output", status=status)
     else:
         mock_job(status=status)
@@ -225,13 +225,16 @@ async def test_unfinished_job_still_reads_its_log(view, status):
     # Assert
     assert log_route.call_count == 1
     assert data["status"] == status
-    assert data["text"] == "partial output"
+    assert data["text"] == ("" if view == "summary" else "partial output")
+    if view == "summary":
+        assert data["found"] is False
 
 
 @pytest.mark.parametrize(
     ("view", "arguments"),
     [
         ("tail", {}),
+        ("summary", {}),
         ("head", {}),
         ("search", {"pattern": "output"}),
         ("section", {"section": "build"}),
@@ -241,7 +244,7 @@ async def test_unfinished_job_still_reads_its_log(view, status):
 async def test_skipped_job_stops_before_any_log_read(view, arguments):
     """A skipped job never ran, so no log view makes a trace request."""
     # Arrange
-    if view == "tail":
+    if view in {"tail", "summary"}:
         job_route = None
         tail_route = mock_tail(None, status="skipped")
     else:
@@ -252,21 +255,21 @@ async def test_skipped_job_stops_before_any_log_read(view, arguments):
     # Act / Assert
     with pytest.raises(ToolError, match=r"skipped.*never ran.*no log"):
         await call_log(view=view, **arguments)
-    assert (job_route.call_count if job_route is not None else 0) == (0 if view == "tail" else 1)
+    assert (job_route.call_count if job_route is not None else 0) == (0 if view in {"tail", "summary"} else 1)
     assert trace_route.call_count == 0
-    assert tail_route.call_count == (1 if view == "tail" else 0)
+    assert tail_route.call_count == (1 if view in {"tail", "summary"} else 0)
     assert len(respx.calls) == ONE_CALL
 
 
 # ---------- missing job, missing log, and empty log ----------
 
 
-@pytest.mark.parametrize("view", ["tail", "head"])
+@pytest.mark.parametrize("view", ["tail", "summary", "head"])
 @respx.mock
 async def test_missing_job_stops_before_any_log_read(view):
     """A missing job raises a clear error without requesting its log."""
     # Arrange
-    if view == "tail":
+    if view in {"tail", "summary"}:
         log_route = respx.post(GRAPHQL).mock(
             return_value=httpx.Response(200, json={"data": {"project": {"job": None}}}),
         )
@@ -277,7 +280,7 @@ async def test_missing_job_stops_before_any_log_read(view):
     # Act / Assert
     with pytest.raises(ToolError, match="was not found") as exc_info:
         await call_log(view=view)
-    if view == "tail":
+    if view in {"tail", "summary"}:
         message = str(exc_info.value).lower()
         assert "trigger jobs" in message
         assert "external status checks" in message
@@ -300,27 +303,40 @@ async def test_head_trace_404_is_reported_as_api_error():
 
 
 @pytest.mark.parametrize(
-    ("payload", "message"),
+    ("view", "payload", "message"),
     [
-        ({"project": None}, "not found"),
-        ({"project": {"job": None}}, "was not found"),
-        ({"project": {"job": {"trace": None}}}, "did not return a trace"),
-        ({"project": {"job": {"trace": {"htmlSummary": None}}}}, "did not return a trace"),
+        ("tail", {"project": None}, "not found"),
+        ("summary", {"project": None}, "not found"),
+        ("tail", {"project": {"job": None}}, "was not found"),
+        ("summary", {"project": {"job": None}}, "was not found"),
+        ("tail", {"project": {"job": {"trace": None}}}, "did not return a trace"),
+        ("summary", {"project": {"job": {"trace": None}}}, "did not return a trace"),
+        ("tail", {"project": {"job": {"trace": {"htmlSummary": None}}}}, "did not return a trace"),
+        ("summary", {"project": {"job": {"trace": {"htmlSummary": None}}}}, "did not return a trace"),
     ],
-    ids=["null-project", "null-job", "null-trace", "null-summary"],
+    ids=[
+        "tail-null-project",
+        "summary-null-project",
+        "tail-null-job",
+        "summary-null-job",
+        "tail-null-trace",
+        "summary-null-trace",
+        "tail-null-summary",
+        "summary-null-summary",
+    ],
 )
 @respx.mock
-async def test_null_graphql_fields_are_unavailable_not_empty(payload, message):
+async def test_null_graphql_fields_are_unavailable_not_empty(view, payload, message):
     """A null project, job, trace, or summary is an error, so it never looks like an empty log."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": payload}))
 
     # Act / Assert
     with pytest.raises(ToolError, match=message):
-        await call_log()
+        await call_log(view=view)
 
 
-@pytest.mark.parametrize("view", ["tail", "head"])
+@pytest.mark.parametrize("view", ["tail", "summary", "head"])
 @respx.mock
 async def test_empty_log_is_empty_text_not_an_error(view):
     """An empty log gives empty text. Tail cannot prove completeness, so it stays null."""
@@ -337,6 +353,8 @@ async def test_empty_log_is_empty_text_not_an_error(view):
     assert data["chars"] == 0
     assert data["truncated"] is False
     assert data["complete"] is (True if view == "head" else None)
+    if view == "summary":
+        assert data["found"] is False
 
 
 # ---------- GraphQL errors ----------
@@ -441,6 +459,11 @@ async def test_invalid_arguments_fail_before_any_request(arguments):
         {"view": "tail", "byte_offset": 0},
         {"view": "head", "context": 0},
         {"view": "tail", "scan_bytes": 10},
+        {"view": "summary", "pattern": "failure"},
+        {"view": "summary", "section": "build"},
+        {"view": "summary", "context": 0},
+        {"view": "summary", "scan_bytes": 10},
+        {"view": "summary", "byte_offset": 0},
     ],
 )
 @respx.mock
@@ -1168,6 +1191,112 @@ async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
     assert data["scan_truncated"] is True
     assert data["next_offset"] == complete_lines * len(line)
     assert data["found"] is False
+
+
+# ---------- summary selection ----------
+
+
+@respx.mock
+async def test_summary_selects_make_pytest_block_and_terminal_failure_in_one_tail_request():
+    """Summary keeps recognized failure evidence from the last 100 lines in one GraphQL call."""
+    # Arrange
+    header = "=========================== short test summary info ============================"
+    body = (
+        "starting checks\n"
+        "make: *** [lint] Error 2.\n"
+        "unrelated output\n"
+        f"{header}\n"
+        "FAILED tests/test_sample.py::test_bad - AssertionError\n"
+        "error: detailed pytest failure\n"
+        "========================= 2 failed in 0.10s =========================\n"
+        "runner cleanup\n"
+        "ERROR: Job failed: exit code 1\n"
+    )
+    tail_route = mock_tail(body)
+    raw_trace_route = mock_head("not used")
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    expected = (
+        "make: *** [lint] Error 2.\n"
+        f"{header}\n"
+        "FAILED tests/test_sample.py::test_bad - AssertionError\n"
+        "error: detailed pytest failure\n"
+        "ERROR: Job failed: exit code 1\n"
+    )
+    assert data["text"] == expected
+    assert data["found"] is True
+    assert data["truncated"] is False
+    assert data["complete"] is None
+    assert "scanned_bytes" not in data
+    assert "scan_truncated" not in data
+    assert "next_offset" not in data
+    assert len(respx.calls) == ONE_CALL
+    assert tail_route.call_count == ONE_CALL
+    assert raw_trace_route.call_count == 0
+    request = json.loads(tail_route.calls.last.request.content)
+    assert "htmlSummary(lastLines: 100)" in request["query"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["", "starting build\nerror occurred\nError without a code\nFAILED outside pytest summary\n"],
+    ids=["empty", "no-recognized-markers"],
+)
+@respx.mock
+async def test_summary_returns_no_marker_for_empty_or_unrecognized_text(body):
+    """No recognized marker means no selected text, not a successful job or a complete trace."""
+    # Arrange
+    mock_tail(body)
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    assert data["text"] == ""
+    assert data["found"] is False
+    assert data["truncated"] is False
+    assert data["complete"] is None
+    assert len(respx.calls) == ONE_CALL
+
+
+@respx.mock
+async def test_summary_character_cap_keeps_recent_terminal_failure():
+    """When selected output is clipped, summary keeps its newest evidence at the end."""
+    # Arrange
+    terminal_failure = "ERROR: Job failed: exit code 1\n"
+    mock_tail("make: *** [lint] Error 2.\n" + "x" * 100 + "\n" + terminal_failure)
+
+    # Act
+    data = await call_log(view="summary", max_chars=len(terminal_failure))
+
+    # Assert
+    assert data["text"] == terminal_failure
+    assert data["chars"] == len(terminal_failure)
+    assert data["truncated"] is True
+    assert data["complete"] is None
+    assert data["found"] is True
+    assert len(respx.calls) == ONE_CALL
+
+
+@respx.mock
+async def test_summary_cleans_terminal_codes_runner_prefixes_and_credentials():
+    """Summary selects after display cleanup and does not return common credential values."""
+    # Arrange
+    line = "ERROR: Job failed: token=secret-value"
+    body = f"2026-10-23T21:41:17.313023Z 01O \x1b[31m{line}\x1b[0m\n"
+    mock_tail(body)
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    assert data["text"] == "ERROR: Job failed: token=[REDACTED]\n"
+    assert "secret-value" not in data["text"]
+    assert "\x1b" not in data["text"]
+    assert data["found"] is True
 
 
 # ---------- cleaning ----------

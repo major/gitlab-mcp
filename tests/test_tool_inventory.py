@@ -412,7 +412,7 @@ async def test_get_job_log_views_default_to_tail(tools):
     view = tools["get_job_log"].input_schema["properties"]["view"]
 
     # Act / Assert
-    assert enum_values(view) == ["tail", "head", "search", "section", "failures"]
+    assert enum_values(view) == ["tail", "summary", "head", "search", "section", "failures"]
     assert view["default"] == "tail"
 
 
