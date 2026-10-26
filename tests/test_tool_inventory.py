@@ -22,6 +22,7 @@ READ_ONLY_TOOLS = {
     "get_merge_request_threads",
     "get_merge_requests",
     "get_pipeline",
+    "get_pipeline_failures",
     "get_pipeline_test_report",
     "get_work_item",
     "list_labels",
@@ -269,6 +270,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"project", "pipeline_id"},
             {"build_ids", "limit", "cursor"},
         ),
+        (
+            "get_pipeline_failures",
+            {"project", "pipeline_id"},
+            {"limit", "include_logs", "log_chars", "include_retried", "cursor"},
+        ),
         ("get_job", {"project", "job_id"}, set()),
         ("list_pipeline_schedules", {"project"}, {"active", "limit", "cursor"}),
         ("get_job_log", {"project", "job_id"}, {"view", "max_chars"}),
@@ -328,6 +334,9 @@ def enum_values(prop: dict[str, Any]) -> list[str]:
         ("get_pipeline", "limit", 1, 100),
         ("get_pipeline_test_report", "pipeline_id", 1, None),
         ("get_pipeline_test_report", "limit", 1, 100),
+        ("get_pipeline_failures", "pipeline_id", 1, None),
+        ("get_pipeline_failures", "limit", 1, 10),
+        ("get_pipeline_failures", "log_chars", 1, 1000),
         ("get_job", "job_id", 1, None),
         ("list_pipeline_schedules", "limit", 1, 100),
         ("get_job_log", "job_id", 1, None),
@@ -345,6 +354,18 @@ async def test_ci_ids_are_positive_and_paging_or_output_sizes_are_bounded(tools,
     # Assert
     assert bounds["minimum"] == minimum
     assert bounds.get("maximum") == maximum
+
+
+async def test_get_pipeline_failures_schema_defaults_and_required_fields(tools):
+    """Pipeline failure diagnosis requires its target and keeps log output bounded by default."""
+    # Arrange
+    schema = tools["get_pipeline_failures"].input_schema
+    properties = schema["properties"]
+    expected_defaults = {"limit": 5, "include_logs": True, "log_chars": 1000, "include_retried": False}
+
+    # Act / Assert
+    assert set(schema["required"]) == {"project", "pipeline_id"}
+    assert {name: properties[name]["default"] for name in expected_defaults} == expected_defaults
 
 
 async def test_status_and_source_are_separate_enums(tools):
@@ -397,6 +418,7 @@ async def test_pipeline_test_report_schema_bounds_build_ids_and_defaults_limit(t
 CI_TOOLS = {
     "list_pipelines",
     "get_pipeline",
+    "get_pipeline_failures",
     "get_pipeline_test_report",
     "get_job",
     "list_pipeline_schedules",
