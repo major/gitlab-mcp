@@ -12,6 +12,7 @@ lazy from mcp.types import CallToolRequestParams
 
 from gitlab_mcp.client import GitLabClient
 from gitlab_mcp.config import ConfigError, Settings
+from gitlab_mcp.review_batches import ReviewBatchCache
 
 CREATE_PIPELINE_VALIDATION_ERROR = (
     "Invalid create_pipeline arguments. Provide project, ref, expected_sha, and valid variables; see the tool schema."
@@ -31,7 +32,7 @@ async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         yield {"client": None, "config_error": str(exc)}
         return
     try:
-        yield {"client": client, "config_error": None}
+        yield {"client": client, "config_error": None, "review_batches": ReviewBatchCache()}
     finally:
         await client.aclose()
 
@@ -69,10 +70,10 @@ mcp = FastMCP(
         "and get_merge_request_diff for patches. "
         "For CI triage, use list_pipelines to find a pipeline, get_pipeline to inspect its jobs, then get_job_log "
         "to read a job's log; use get_job for runner-job metadata. "
-        "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
-        "Get the user's explicit APPROVE before posting notes with post_review_notes. "
-        "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "
-        "Do not call validate_only again. "
+        "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval, then keep the "
+        "returned batch_id. Get the user's explicit APPROVE before posting notes with "
+        "post_review_notes. After APPROVE, submit notes or batch_id; the call revalidates "
+        "the request before the first write. Do not call validate_only again. "
         "Use update_merge_request for reviewer, assignee, and approval changes. "
         "If a merge request has conflicts, do not call the rebase API; rebase locally and "
         "push with --force-with-lease. "
@@ -81,7 +82,7 @@ mcp = FastMCP(
         "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, view=full|headings|finding, "
         "count_only, cursor); "
         "post_review_notes(project, iid, head_sha, notes=[{file, line or old_line (neither for a file-level note), "
-        "body or body_path}], add_reviewers, add_assignees, validate_only); "
+        "body or body_path}] or batch_id, add_reviewers, add_assignees, validate_only); "
         "update_merge_request(project, iid, add_reviewers, remove_reviewers, add_assignees, remove_assignees, "
         "add_labels, remove_labels, add_blocked_by, remove_blocked_by, approve with sha, rebase)."
     ),
@@ -96,3 +97,11 @@ def get_client(ctx: Context) -> GitLabClient:
     if state.get("client") is None:
         raise ToolError(state.get("config_error") or "GitLab client is not configured.")
     return state["client"]
+
+
+def get_review_batch_cache(ctx: Context) -> ReviewBatchCache:
+    """Return the lifespan's review batch cache or raise a helpful ToolError."""
+    cache = ctx.lifespan_context.get("review_batches")
+    if not isinstance(cache, ReviewBatchCache):
+        raise ToolError("Review note batch cache is not configured. Send the notes again.")  # noqa: TRY003
+    return cache

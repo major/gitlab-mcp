@@ -8,7 +8,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, model_validator
 lazy from fastmcp import Context
 
-from gitlab_mcp.app import get_client, mcp
+from gitlab_mcp.app import get_client, get_review_batch_cache, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import (
     MAX_PAGES,
@@ -25,6 +25,7 @@ from gitlab_mcp.mr_common import (
     mr_rest_path,
     set_people,
 )
+from gitlab_mcp.review_batches import CachedReviewNote
 
 REVIEW_NOTE_REASON_CAP = 200
 REVIEW_NOTE_HINT_CAP = 120
@@ -129,6 +130,7 @@ class PostReviewNotesResult(BaseModel):
     warning: str = Field(default="", exclude_if=lambda value: not value)
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
+    batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def _unattempted_review_notes(
@@ -844,8 +846,22 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     if warning:
         current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
         return _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
-    if validate_only or any(check.reason for check in checks):
-        return _review_preflight_result(checks)
+    has_failed_checks = any(check.reason for check in checks)
+    if validate_only or has_failed_checks:
+        result = _review_preflight_result(checks)
+        if validate_only and not has_failed_checks:
+            cached_notes = tuple(
+                CachedReviewNote(
+                    file=note.file,
+                    line=note.line,
+                    old_line=note.old_line,
+                    body=check.body,
+                )
+                for note, check in zip(notes, checks, strict=True)
+            )
+            batch_id = get_review_batch_cache(ctx).put(project, iid, refs["head_sha"], cached_notes)
+            result = result.model_copy(update={"batch_id": batch_id})
+        return result
     return await _post_review_note_batch(client, project, iid, checks, refs)
 
 
@@ -864,7 +880,7 @@ async def _add_people_after_posts(  # noqa: PLR0913, PLR0917 - each argument is 
     """
     if not (add_reviewers or add_assignees):
         return result
-    if not all(row.status == "posted" for row in result.results):
+    if not result.results or not all(row.status == "posted" for row in result.results):
         warning = " ".join(filter(None, (result.warning, PEOPLE_SKIPPED_WARNING)))
         return result.model_copy(update={"warning": warning[:500]})
     jobs = [
@@ -892,7 +908,7 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         str,
         Field(description="Full 40-character head SHA from get_merge_request or get_merge_request_diff."),
     ],
-    notes: Annotated[list[ReviewNote], Field(min_length=1, max_length=20)],
+    notes: Annotated[list[ReviewNote] | None, Field(min_length=1, max_length=20)] = None,
     add_reviewers: Annotated[
         list[str] | None,
         Field(description="Reviewer usernames to add after every note posts."),
@@ -905,15 +921,27 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         bool,
         Field(description="Run all preflight checks and return positions without posting any notes."),
     ] = False,
+    batch_id: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=200,
+            description="Single-use handle from a successful validate_only call. Provide this instead of notes.",
+        ),
+    ] = None,
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
     Like `glab mr note create`. Omit `file`, `line`, and `old_line` for a general merge-request discussion. Set only
-    `file` for a file-level diff discussion, or set `file` and one line coordinate for an inline diff discussion. Set
+    `file` for a file-level diff discussion, or set `file` and one line coordinate for an inline diff discussion.
+    Provide exactly one of `notes` or `batch_id`. `validate_only` cannot be combined with `batch_id`. Set
     `validate_only` to true to run all body, path, line, and SHA checks without writing; validation does not need the
-    user's `APPROVE`. Actual posting still requires the user's explicit `APPROVE`. After APPROVE, call this tool
-    directly; it reruns the same checks before the first write. Do not call `validate_only` again. `head_sha` must be
-    the full SHA from `get_merge_request` or `get_merge_request_diff`.
+    user's `APPROVE`. A successful validation returns a single-use `batch_id` with the resolved note bodies and
+    locations. After the user's explicit `APPROVE`, call this tool with that `batch_id` instead of `notes`; the tool
+    reruns preflight checks before the first write. The handle is opaque, is not approval, expires after 30 minutes,
+    may be evicted earlier when the bounded cache is full, and is invalidated by a server restart. It is consumed on
+    any posting attempt, including failed preflight or writes. If it is unavailable, send the notes again. `head_sha`
+    must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
     Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
     for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
     `head_sha`, returns `unattempted` for every note and a `warning`.
@@ -922,10 +950,32 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
     computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
-    and never retried. Check every result before deciding what to do next.
+    and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check every result
+    before deciding what to do next.
     `add_reviewers` and `add_assignees` add people only after every note posts, in the same call. They are ignored
     when `validate_only` is true.
     """
+    if (notes is None) == (batch_id is None):
+        raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
+    if batch_id is not None and not batch_id.strip():
+        raise ToolError("batch_id must not be blank.")  # noqa: TRY003
+    if validate_only and batch_id is not None:
+        raise ToolError("validate_only cannot be combined with batch_id.")  # noqa: TRY003
+
+    if batch_id is not None:
+        cached_batch = get_review_batch_cache(ctx).claim(batch_id, project, iid, head_sha)
+        notes = [
+            ReviewNote(
+                body=cached_note.body,
+                file=cached_note.file,
+                line=cached_note.line,
+                old_line=cached_note.old_line,
+            )
+            for cached_note in cached_batch.notes
+        ]
+    if notes is None:
+        raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
+
     result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only)
     if validate_only:
         return result

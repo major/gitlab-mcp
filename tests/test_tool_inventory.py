@@ -11,6 +11,7 @@ from gitlab_mcp import mcp
 PIPELINE_TEST_REPORT_MAX_BUILDS = 20
 PIPELINE_TEST_REPORT_DEFAULT_LIMIT = 20
 PIPELINE_TEST_REPORT_MAX_LIMIT = 100
+REVIEW_NOTE_MAX_NOTES = 20
 
 # One name per line, alphabetical, so a new tool is a one-line change.
 READ_ONLY_TOOLS = {
@@ -110,7 +111,16 @@ async def test_server_instructions_list_real_main_arguments(gitlab_env):
     # Arrange
     summary_args = {
         "get_merge_request_threads": {"project", "iid", "iids", "state", "view", "count_only", "cursor"},
-        "post_review_notes": {"project", "iid", "head_sha", "notes", "add_reviewers", "add_assignees", "validate_only"},
+        "post_review_notes": {
+            "project",
+            "iid",
+            "head_sha",
+            "notes",
+            "batch_id",
+            "add_reviewers",
+            "add_assignees",
+            "validate_only",
+        },
         "update_merge_request": {
             "project",
             "iid",
@@ -423,6 +433,24 @@ async def test_pipeline_test_report_schema_bounds_build_ids_and_defaults_limit(t
     assert limit["maximum"] == PIPELINE_TEST_REPORT_MAX_LIMIT
     assert properties["limit"]["default"] == PIPELINE_TEST_REPORT_DEFAULT_LIMIT
     assert properties["cursor"]["anyOf"]
+
+
+async def test_review_note_batch_schema_keeps_notes_optional_and_bounded(tools):
+    """Review posting accepts either notes or a token while preserving the note-array bounds."""
+    # Arrange
+    schema = tools["post_review_notes"].input_schema
+    properties = schema["properties"]
+
+    # Act
+    notes = next(branch for branch in properties["notes"]["anyOf"] if branch.get("type") == "array")
+    required = set(schema.get("required", []))
+
+    # Assert
+    assert "notes" not in required
+    assert "batch_id" not in required
+    assert notes["minItems"] == 1
+    assert notes["maxItems"] == REVIEW_NOTE_MAX_NOTES
+    assert "batch_id" in properties
 
 
 CI_TOOLS = {
