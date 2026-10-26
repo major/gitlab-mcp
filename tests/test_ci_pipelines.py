@@ -18,7 +18,7 @@ PROJECT = "group/project"
 ENCODED_PROJECT = "group%2Fproject"
 PIPELINES_URL = f"{API}/projects/{ENCODED_PROJECT}/pipelines"
 TEXT_LIMIT = 200  # Matches the cap for names, stages, and failure messages in ci_pipelines.
-LIST_HEADER = "pipeline_id\tstatus\tsource\tref\tsha\tcreated\tupdated"
+LIST_HEADER = "pipeline_id\tname\tstatus\tsource\tref\tsha\tcreated\tupdated"
 JOB_HEADER = (
     "job_id\ttype\tname\tstage\tstatus\tallow_failure\tduration_s\tscheduled_at"
     "\tdownstream_project\tdownstream_pipeline_id\tfailure_message"
@@ -44,6 +44,7 @@ def rest_pipeline(pipeline_id: int = 901, **overrides: Any) -> dict[str, Any]:
         "id": pipeline_id,
         "iid": 5,
         "project_id": 1,
+        "name": "test",
         "status": "failed",
         "source": "push",
         "ref": "main",
@@ -133,8 +134,8 @@ def forged_cursor(cursor: str, **changes: Any) -> str:
 
 
 @respx.mock
-async def test_project_scope_lists_newest_first_and_trims_dates(gitlab_env):
-    """A project list asks for the newest pipelines first and keeps only the date part of each timestamp."""
+async def test_project_scope_lists_newest_first_and_formats_timestamps(gitlab_env):
+    """A project list asks for the newest pipelines first and keeps second-resolution timestamps."""
     # Arrange
     route = respx.get(PIPELINES_URL).mock(return_value=rest_page(rest_pipeline(901)))
 
@@ -145,8 +146,41 @@ async def test_project_scope_lists_newest_first_and_trims_dates(gitlab_env):
     assert sent_params(route) == {"order_by": "id", "sort": "desc", "per_page": "20", "page": "1"}
     assert data == {
         "web_url_prefix": "https://gitlab.example.com/group/project/-/pipelines/",
-        "pipelines": f"{LIST_HEADER}\n901\tfailed\tpush\tmain\tabc123\t2026-10-01\t2026-10-02",
+        "pipelines": (
+            f"{LIST_HEADER}\n901\ttest\tfailed\tpush\tmain\tabc123\t2026-10-01T12:00:00Z\t2026-10-02T08:30:00Z"
+        ),
     }
+
+
+@respx.mock
+async def test_list_includes_pipeline_name_and_preserves_timestamp_timezones(gitlab_env):
+    """A list includes names when present and preserves each timestamp's timezone."""
+    # Arrange
+    named = rest_pipeline(
+        901,
+        name="build",
+        created_at="2026-10-01T12:00:00.987Z",
+        updated_at="2026-10-02T08:30:00.456+02:00",
+    )
+    unnamed = rest_pipeline(
+        900,
+        created_at="2026-10-01T12:00:00.987-04:00",
+        updated_at="2026-10-02T08:30:00.456Z",
+    )
+    del unnamed["name"]
+    respx.get(PIPELINES_URL).mock(return_value=rest_page(named, unnamed))
+
+    # Act
+    data = await call_tool("list_pipelines")
+
+    # Assert
+    assert data["pipelines"] == (
+        f"{LIST_HEADER}\n"
+        "901\tbuild\tfailed\tpush\tmain\tabc123\t"
+        "2026-10-01T12:00:00Z\t2026-10-02T08:30:00+02:00\n"
+        "900\t\tfailed\tpush\tmain\tabc123\t"
+        "2026-10-01T12:00:00-04:00\t2026-10-02T08:30:00Z"
+    )
 
 
 @pytest.mark.parametrize(
@@ -308,7 +342,9 @@ async def test_next_cursor_resumes_the_same_call_on_the_next_page(gitlab_env):
     }
     assert second == {
         "web_url_prefix": "https://gitlab.example.com/group/project/-/pipelines/",
-        "pipelines": f"{LIST_HEADER}\n900\tfailed\tpush\tmain\tabc123\t2026-10-01\t2026-10-02",
+        "pipelines": (
+            f"{LIST_HEADER}\n900\ttest\tfailed\tpush\tmain\tabc123\t2026-10-01T12:00:00Z\t2026-10-02T08:30:00Z"
+        ),
     }
 
 
@@ -434,6 +470,41 @@ async def test_maps_pipeline_metadata_and_job_types(gitlab_env):
         "web_url": "https://gitlab.example.com/group/project/-/pipelines/901",
         "jobs": expected_jobs,
     }
+
+
+@respx.mock
+async def test_pipeline_merge_request_iid_is_returned_as_an_integer(gitlab_env):
+    """A linked merge request IID is converted from GraphQL's string to an integer."""
+    # Arrange
+    expected_mr_iid = 7
+    pipeline = pipeline_node(mergeRequest={"iid": "7"})
+    route = respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline))
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901})
+
+    # Assert
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "mergeRequest { iid }" in query
+    assert data["mr_iid"] == expected_mr_iid
+
+
+@pytest.mark.parametrize(
+    "pipeline_fields",
+    [{}, {"mergeRequest": None}],
+    ids=["absent", "null"],
+)
+@respx.mock
+async def test_pipeline_without_merge_request_omits_mr_iid(gitlab_env, pipeline_fields):
+    """An absent or null merge request does not add an `mr_iid` result field."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node(**pipeline_fields)))
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901})
+
+    # Assert
+    assert "mr_iid" not in data
 
 
 @pytest.mark.parametrize(

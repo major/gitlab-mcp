@@ -42,6 +42,8 @@ mcp = FastMCP(
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
         "Use get_merge_request for approvals and jobs (add include_description=true for the description), "
         "and get_merge_request_diff for patches. "
+        "For CI triage, use list_pipelines to find a pipeline, get_pipeline to inspect its jobs, then get_job_log "
+        "to read a job's log; use get_job for runner-job metadata. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval. "
         "Get the user's explicit APPROVE before posting notes with post_review_notes. "
         "After APPROVE, call post_review_notes directly; it reruns the same checks before the first write. "

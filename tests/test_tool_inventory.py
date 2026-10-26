@@ -80,6 +80,21 @@ async def test_server_instructions_describe_the_review_workflow(gitlab_env):
     assert "explicit APPROVE before posting" in instructions
 
 
+async def test_server_instructions_describe_the_ci_triage_workflow(gitlab_env):
+    """CI guidance leads from pipeline discovery through job inspection to logs and metadata."""
+    # Arrange / Act
+    async with Client(mcp) as client:
+        await client.list_tools()
+        instructions = client.instructions or ""
+
+    # Assert
+    pipeline_list_position = instructions.index("list_pipelines to find a pipeline")
+    pipeline_detail_position = instructions.index("get_pipeline to inspect its jobs")
+    job_log_position = instructions.index("get_job_log to read a job's log")
+    assert pipeline_list_position < pipeline_detail_position < job_log_position
+    assert "get_job for runner-job metadata" in instructions
+
+
 async def test_server_instructions_list_real_main_arguments(gitlab_env):
     """Every argument named in the instructions' main-argument summary exists on its tool."""
     # Arrange
