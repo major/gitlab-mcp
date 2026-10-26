@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import ssl
 from typing import Any, Literal
 
@@ -30,6 +31,10 @@ _ERROR_BODY_CAP = 1024
 
 # Size of each piece read from a streamed body. Small enough to stop early on big traces.
 _STREAM_CHUNK_SIZE = 4096
+
+# Status codes used to distinguish a full trace from a ranged response.
+_HTTP_OK = 200
+_HTTP_PARTIAL_CONTENT = 206
 
 # GitLab pagination headers should stay small and point to a usable page.
 _MAX_NEXT_PAGE = 1_000_000
@@ -130,6 +135,28 @@ def _parse_next_page(value: str | None) -> int | None:
     if page < 1 or page > _MAX_NEXT_PAGE:
         raise ToolError("GitLab returned an invalid next-page header.")  # noqa: TRY003 - explain invalid response.
     return page
+
+
+def _trace_window_length(content_range: str | None, offset: int, requested_end: int, path: str) -> int:
+    """Validate a partial trace range and return its exact expected body length."""
+    match = (
+        re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", content_range.strip(), re.IGNORECASE)
+        if content_range is not None
+        else None
+    )
+    if match is None:
+        raise ToolError(f"GitLab returned an invalid Content-Range for {path}.")  # noqa: TRY003
+    try:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        total_text = match.group(3)
+        total = None if total_text == "*" else int(total_text)
+    except ValueError as exc:
+        raise ToolError(f"GitLab returned an invalid Content-Range for {path}.") from exc  # noqa: TRY003
+    expected_end = requested_end if total is None else min(requested_end, total - 1)
+    if start != offset or end < start or end != expected_end:
+        raise ToolError(f"GitLab returned an invalid Content-Range for {path}.")  # noqa: TRY003
+    return end - start + 1
 
 
 class GitLabConnectionError(ToolError):
@@ -350,6 +377,79 @@ class GitLabClient:
                 raw = await _read_capped(response, _ERROR_BODY_CAP)
                 raise GitLabAPIError(response.status_code, path, _detail_from_bytes(raw))
             data = await _read_capped(response, max_bytes)
+        return data[:max_bytes], len(data) > max_bytes
+
+    async def get_trace_window(self, path: str, *, offset: int, max_bytes: int) -> tuple[bytes, bool]:
+        """Stream a bounded plain-text window from `path`, starting at byte `offset` 🪵.
+
+        Requests one byte past `max_bytes` so the caller can tell if more trace
+        data follows. The response stays as raw bytes, without decoding.
+
+        Returns `(window, truncated)`. `window` contains at most `max_bytes`
+        bytes, and `truncated` is True only when the response has more.
+
+        Redirects are not followed. A nonzero offset requires a valid partial
+        response because falling back to the full trace would not be bounded.
+
+        Raises:
+            ValueError: When `offset` is negative or `max_bytes` is not positive.
+            GitLabConnectionError: When the instance cannot be reached, or the read takes longer than the timeout.
+            GitLabAPIError: When GitLab returns an HTTP error status.
+            GitLabRedirectError: When GitLab answers with a redirect.
+            ToolError: When range continuation is unsupported or response headers are invalid.
+        """
+        if offset < 0:
+            raise ValueError("offset must be nonnegative")  # noqa: TRY003 - explain invalid input.
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")  # noqa: TRY003 - explain invalid input.
+        try:
+            # The overall deadline covers the whole stream. httpx's own timeouts cover each network step.
+            async with asyncio.timeout(self.settings.timeout):
+                return await self._read_trace_window(path, offset, max_bytes)
+        except httpx.HTTPError as exc:
+            raise GitLabConnectionError(self.settings.url, exc) from exc
+        except TimeoutError as exc:
+            cause = TimeoutError(f"timed out after {self.settings.timeout} seconds")
+            raise GitLabConnectionError(self.settings.url, cause) from exc
+
+    async def _read_trace_window(self, path: str, offset: int, max_bytes: int) -> tuple[bytes, bool]:
+        """Open and validate a ranged trace GET, then read no more than one extra byte."""
+        requested_end = offset + max_bytes
+        expected_length: int | None = None
+        async with self._http.stream(
+            "GET",
+            path,
+            headers={
+                "Accept": "text/plain",
+                "Accept-Encoding": "identity",
+                "Range": f"bytes={offset}-{requested_end}",
+            },
+            follow_redirects=False,
+        ) as response:
+            if response.status_code in _REDIRECT_STATUSES:
+                raise GitLabRedirectError(path, response.status_code)
+            content_encoding = response.headers.get("Content-Encoding")
+            if content_encoding is not None and content_encoding.strip().casefold() != "identity":
+                raise ToolError(f"GitLab returned an unsupported Content-Encoding for {path}.")  # noqa: TRY003
+            if response.is_error:
+                raw = await _read_capped(response, _ERROR_BODY_CAP)
+                raise GitLabAPIError(response.status_code, path, _detail_from_bytes(raw))
+            if response.status_code == _HTTP_OK:
+                if offset != 0:
+                    raise ToolError(  # noqa: TRY003 - explain unsupported range behavior.
+                        f"GitLab server does not support bounded trace continuation for {path}."
+                    )
+            elif response.status_code == _HTTP_PARTIAL_CONTENT:
+                expected_length = _trace_window_length(
+                    response.headers.get("Content-Range"), offset, requested_end, path
+                )
+            else:
+                raise ToolError(  # noqa: TRY003 - explain the unexpected response.
+                    f"GitLab returned unexpected HTTP {response.status_code} for {path} while reading a trace window."
+                )
+            data = await _read_capped(response, expected_length if expected_length is not None else max_bytes)
+            if expected_length is not None and len(data) != expected_length:
+                raise ToolError(f"GitLab returned an invalid trace window body length for {path}.")  # noqa: TRY003
         return data[:max_bytes], len(data) > max_bytes
 
     async def request(
