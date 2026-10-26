@@ -35,6 +35,7 @@ READ_ONLY_TOOLS = {
 }
 WRITE_TOOLS = {
     "create_merge_request",
+    "create_pipeline",
     "edit_merge_request_description",
     "edit_work_item_description",
     "land_merge_request",
@@ -43,6 +44,7 @@ WRITE_TOOLS = {
     "reply_to_thread",
     "reply_to_threads",
     "resolve_open_threads",
+    "retry_ci",
     "update_merge_request",
 }
 

@@ -4,11 +4,18 @@ from typing import Any
 lazy from collections.abc import AsyncIterator
 
 from fastmcp import Context, FastMCP
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError, ValidationError
 from fastmcp.server.lifespan import lifespan
+from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
+lazy from fastmcp.tools.base import ToolResult
+lazy from mcp.types import CallToolRequestParams
 
 from gitlab_mcp.client import GitLabClient
 from gitlab_mcp.config import ConfigError, Settings
+
+CREATE_PIPELINE_VALIDATION_ERROR = (
+    "Invalid create_pipeline arguments. Provide project, ref, expected_sha, and valid variables; see the tool schema."
+)
 
 
 @lifespan
@@ -27,6 +34,24 @@ async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         yield {"client": client, "config_error": None}
     finally:
         await client.aclose()
+
+
+class _CreatePipelineValidationMiddleware(Middleware):
+    """Hide argument validation details for create_pipeline calls."""
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        """Replace only create_pipeline argument validation errors with a safe hint."""
+        if context.message.name != "create_pipeline":
+            return await call_next(context)
+
+        try:
+            return await call_next(context)
+        except ValidationError:
+            raise ToolError(CREATE_PIPELINE_VALIDATION_ERROR) from None
 
 
 mcp = FastMCP(
@@ -62,6 +87,7 @@ mcp = FastMCP(
     ),
     lifespan=gitlab_lifespan,
 )
+mcp.add_middleware(_CreatePipelineValidationMiddleware())
 
 
 def get_client(ctx: Context) -> GitLabClient:
