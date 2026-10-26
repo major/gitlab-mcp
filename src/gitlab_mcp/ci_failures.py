@@ -132,6 +132,35 @@ def _summary_log(job_id: int, summary: str | None, log_chars: int) -> FailureLog
     return FailureLog(job_id=job_id, text=text, chars=len(text), truncated=truncated, available=True)
 
 
+async def get_failure_logs(
+    client: GitLabClient,
+    project: str,
+    jobs: list[dict[str, Any]],
+    log_chars: int,
+) -> tuple[list[FailureLog], str | None]:
+    """Fetch and clean bounded log tails for failed jobs, returning a warning if the batch is unavailable."""
+    if not jobs:
+        return [], None
+
+    batch = jobs[:LOG_BATCH_SIZE]
+    try:
+        data = await client.graphql(_log_query(len(batch)), _log_variables(project, batch))
+    except ToolError as exc:
+        return _unavailable_logs(jobs), cap(cell(str(exc)), TEXT_CAP)
+
+    project_data = data.get("project") or {}
+    logs = [
+        _summary_log(
+            job["id"],
+            ((project_data.get(f"job_{index}") or {}).get("trace") or {}).get("htmlSummary"),
+            log_chars,
+        )
+        for index, job in enumerate(batch)
+    ]
+    logs.extend(_unavailable_logs(jobs[len(batch) :]))
+    return logs, None
+
+
 async def get_pipeline_failures(  # noqa: PLR0913 - each argument bounds or resumes this read-only view.
     client: GitLabClient,
     project: str,
@@ -176,24 +205,8 @@ async def get_pipeline_failures(  # noqa: PLR0913 - each argument bounds or resu
     job_rows = [_job_row(job) for job in failed_jobs]
     logs: list[FailureLog] = []
     warning = None
-    if include_logs and failed_jobs:
-        batch = failed_jobs[:LOG_BATCH_SIZE]
-        try:
-            data = await client.graphql(_log_query(len(batch)), _log_variables(project, batch))
-        except ToolError as exc:
-            logs = _unavailable_logs(failed_jobs)
-            warning = cap(cell(str(exc)), TEXT_CAP)
-        else:
-            project_data = data.get("project") or {}
-            logs = [
-                _summary_log(
-                    job["id"],
-                    ((project_data.get(f"job_{index}") or {}).get("trace") or {}).get("htmlSummary"),
-                    log_chars,
-                )
-                for index, job in enumerate(batch)
-            ]
-            logs.extend(_unavailable_logs(failed_jobs[len(batch) :]))
+    if include_logs:
+        logs, warning = await get_failure_logs(client, project, failed_jobs, log_chars)
 
     return PipelineFailures(
         pipeline_id=pipeline_id,
