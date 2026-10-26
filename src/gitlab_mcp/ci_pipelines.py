@@ -18,7 +18,7 @@ from gitlab_mcp.ci_common import (
 )
 lazy from gitlab_mcp.client import GitLabClient
 
-# Names, stages, and failure messages are cut so one long value cannot dominate a page.
+# Names and stages are cut so one long value cannot dominate a page.
 # Project paths are never cut, because an agent needs the exact path to act on a downstream pipeline.
 TEXT_CAP = 200
 PIPELINE_MODELS = ("Ci::Pipeline",)
@@ -41,7 +41,6 @@ JOB_COLUMNS = (
     "scheduled_at",
     "downstream_project",
     "downstream_pipeline_id",
-    "failure_message",
 )
 TIMESTAMP_MESSAGE = "updated_after must be a timezone-aware ISO 8601 datetime, such as 2026-10-01T12:30:00Z."
 
@@ -57,7 +56,7 @@ query(
       mergeRequest { iid }
       jobs(first: $first, after: $after, retried: $retried, statuses: $statuses) {
         nodes {
-          id name status allowFailure duration scheduledAt failureMessage
+          id name status allowFailure duration scheduledAt
           stage { name }
           downstreamPipeline { id project { fullPath } }
         }
@@ -99,7 +98,7 @@ class PipelineDetail(BaseModel):
     jobs: str = Field(
         description=(
             "TSV with a header row. Columns: job_id, type, name, stage, status, allow_failure, duration_s, "
-            "scheduled_at, downstream_project, downstream_pipeline_id, failure_message. type is build, bridge, "
+            "scheduled_at, downstream_project, downstream_pipeline_id. type is build, bridge, "
             "or external. Empty downstream cells mean there is no downstream pipeline or GitLab did not return it."
         ),
     )
@@ -276,7 +275,6 @@ def _job_row(node: dict[str, Any]) -> str:
         node["scheduledAt"],
         downstream_project,
         downstream_id,
-        cap(node["failureMessage"], TEXT_CAP),
     )
     return "\t".join(cell(value) for value in values)
 

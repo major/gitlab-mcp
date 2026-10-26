@@ -17,11 +17,11 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 ENCODED_PROJECT = "group%2Fproject"
 PIPELINES_URL = f"{API}/projects/{ENCODED_PROJECT}/pipelines"
-TEXT_LIMIT = 200  # Matches the cap for names, stages, and failure messages in ci_pipelines.
+TEXT_LIMIT = 200  # Matches the cap for names and stages in ci_pipelines.
 LIST_HEADER = "pipeline_id\tname\tstatus\tsource\tref\tsha\tcreated\tupdated"
 JOB_HEADER = (
     "job_id\ttype\tname\tstage\tstatus\tallow_failure\tduration_s\tscheduled_at"
-    "\tdownstream_project\tdownstream_pipeline_id\tfailure_message"
+    "\tdownstream_project\tdownstream_pipeline_id"
 )
 
 
@@ -70,7 +70,6 @@ def job_node(model: str, number: int, **overrides: Any) -> dict[str, Any]:
         "allowFailure": False,
         "duration": 12,
         "scheduledAt": "2026-10-01T12:00:00Z",
-        "failureMessage": None,
         "stage": {"name": "test"},
         "downstreamPipeline": None,
     }
@@ -429,7 +428,6 @@ async def test_maps_pipeline_metadata_and_job_types(gitlab_env):
             allowFailure=True,
             duration=None,
             stage={"name": "deploy"},
-            failureMessage="Downstream failed",
             downstreamPipeline={"id": "gid://gitlab/Ci::Pipeline/902", "project": {"fullPath": "group/child"}},
         ),
         job_node("GenericCommitStatus", 13, name="lint", stage=None),
@@ -441,7 +439,10 @@ async def test_maps_pipeline_metadata_and_job_types(gitlab_env):
     data = await call_tool("get_pipeline", {"pipeline_id": 901})
 
     # Assert
-    assert "$pipelineId: CiPipelineID!" in json.loads(route.calls.last.request.content)["query"]
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "$pipelineId: CiPipelineID!" in query
+    assert "failureMessage" not in query
+    assert route.call_count == 1
     assert sent_variables(route) == {
         "fullPath": PROJECT,
         "pipelineId": "gid://gitlab/Ci::Pipeline/901",
@@ -452,12 +453,13 @@ async def test_maps_pipeline_metadata_and_job_types(gitlab_env):
     }
     expected_lines = [
         JOB_HEADER,
-        "11\tbuild\tunit\ttest\tsuccess\tfalse\t12\t2026-10-01T12:00:00Z\t\t\t",
-        "12\tbridge\tdeploy\tdeploy\tfailed\ttrue\t\t2026-10-01T12:00:00Z\tgroup/child\t902\tDownstream failed",
-        "13\texternal\tlint\t\tsuccess\tfalse\t12\t2026-10-01T12:00:00Z\t\t\t",
-        "14\texternal\tscan\ttest\tcanceled\tfalse\t12\t2026-10-01T12:00:00Z\t\t\t",
+        "11\tbuild\tunit\ttest\tsuccess\tfalse\t12\t2026-10-01T12:00:00Z\t\t",
+        "12\tbridge\tdeploy\tdeploy\tfailed\ttrue\t\t2026-10-01T12:00:00Z\tgroup/child\t902",
+        "13\texternal\tlint\t\tsuccess\tfalse\t12\t2026-10-01T12:00:00Z\t\t",
+        "14\texternal\tscan\ttest\tcanceled\tfalse\t12\t2026-10-01T12:00:00Z\t\t",
     ]
     expected_jobs = "\n".join(expected_lines)
+    assert all(len(line.split("\t")) == len(JOB_HEADER.split("\t")) for line in data["jobs"].splitlines())
     assert data == {
         "pipeline_id": 901,
         "status": "failed",
@@ -593,12 +595,11 @@ async def test_job_filters_map_to_graphql_variables(gitlab_env, arguments, expec
 
 
 @respx.mock
-async def test_long_text_is_capped_and_newlines_are_flattened(gitlab_env):
-    """Names and failure messages are capped at 200 characters with "...", and line breaks become spaces."""
+async def test_long_job_name_is_capped_and_name_and_stage_controls_are_flattened(gitlab_env):
+    """Long names are capped, and tabs and line breaks in names and stages stay inside their TSV cells."""
     # Arrange
-    long_name = "n" * 250
-    failure = "boom\nline two\t" + "x" * 250
-    job = job_node("Ci::Build", 11, name=long_name, failureMessage=failure)
+    long_name = "n\nx\t" + "x" * 250
+    job = job_node("Ci::Build", 11, name=long_name, stage={"name": "test\nstage\tname"})
     respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node(job)))
 
     # Act
@@ -606,10 +607,9 @@ async def test_long_text_is_capped_and_newlines_are_flattened(gitlab_env):
 
     # Assert
     (row,) = rows(data["jobs"])
-    assert row["name"] == "n" * (TEXT_LIMIT - 3) + "..."
-    assert row["failure_message"].startswith("boom line two ")
-    assert len(row["failure_message"]) == TEXT_LIMIT
-    assert row["failure_message"].endswith("...")
+    assert row["name"] == "n x " + "x" * (TEXT_LIMIT - 7) + "..."
+    assert len(row["name"]) == TEXT_LIMIT
+    assert row["stage"] == "test stage name"
 
 
 @respx.mock
