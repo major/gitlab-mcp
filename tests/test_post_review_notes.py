@@ -2,6 +2,7 @@
 
 import json
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -23,6 +24,7 @@ MISMATCHED_LINE = 99
 TWO_POSTS = 2
 THREE_PAGES = 3
 REASON_CAP = 200
+BLOB_CAP = 131_072
 OLD_CONTEXT_LINE = 8
 NEW_CONTEXT_LINE = 11
 MIXED_INLINE_LINE = 2
@@ -33,6 +35,7 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 KNOWN_USERS = ("alice", "bob")
 # GraphQL operations that change people, plus the username lookup. write_order() looks for these names.
 PEOPLE_OPERATIONS = ("users(", "mergeRequestSetReviewers", "mergeRequestSetAssignees")
+RAW_FILES_URL = f"{BASE}/projects/{ENCODED_PROJECT}/repository/files"
 
 
 def response(body: Any, *, status: int = 200, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -70,7 +73,7 @@ def diff_file(
 
 
 def add_preflight(
-    pages: list[tuple[list[dict[str, Any]], int | None]],
+    pages: list[tuple[list[Any], int | None]],
     *,
     merge_requests: list[dict[str, Any]] | None = None,
 ) -> tuple[respx.Route, respx.Route]:
@@ -83,6 +86,21 @@ def add_preflight(
     ]
     diff_route = respx.get(DIFF_URL).mock(side_effect=page_responses)
     return mr_route, diff_route
+
+
+def add_blobs(*files: tuple[str, str, bytes], status: int = 200) -> list[respx.Route]:
+    """Register immutable raw-file responses and return their routes."""
+    return [
+        respx.get(f"{RAW_FILES_URL}/{quote(path, safe='')}/raw?ref={sha}").mock(
+            return_value=httpx.Response(status, content=content)
+        )
+        for path, sha, content in files
+    ]
+
+
+def raw_blob_calls() -> list[Any]:
+    """Return the raw repository-file requests made by the current test."""
+    return [call for call in respx.calls if "/repository/files/" in str(call.request.url)]
 
 
 def create_response(
@@ -191,6 +209,7 @@ async def test_validate_only_checks_new_and_old_side_positions_without_posting(g
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
     assert not post_route.called
+    assert not raw_blob_calls()
 
 
 @respx.mock
@@ -217,6 +236,7 @@ async def test_every_bad_note_is_reported_and_no_note_is_posted(gitlab_env, vali
     """A bad line and a missing path each fail their own row, and the valid note is not posted either."""
     # Arrange
     mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
+    add_blobs(("src.py", BASE_SHA, b"old\n"), ("src.py", HEAD, b"new\n"), status=404)
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     notes = [
         review_note("src.py", 1, "Good note."),
@@ -233,12 +253,18 @@ async def test_every_bad_note_is_reported_and_no_note_is_posted(gitlab_env, vali
         {
             "index": 1,
             "status": "failed",
-            "reason": "line 99 on the new side is not a usable diff line in 'src.py'",
+            "reason": (
+                "line 99 on the new side in 'src.py'; fallback rejected: old file content could not be read safely: "
+                "GitLab returned HTTP 404. Nearest new-side diff lines: 1."
+            ),
         },
         {
             "index": 2,
             "status": "failed",
-            "reason": f"Diff preflight could not find 'absent.py' within {MAX_PAGES} pages",
+            "reason": (
+                f"Diff preflight could not find 'absent.py' within {MAX_PAGES} pages. "
+                "Nearest line hints are unavailable; use a file-level note."
+            ),
         },
     ]
     assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
@@ -252,6 +278,7 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
     """A bad body does not hide a bad diff line on another note, and each failed row explains itself."""
     # Arrange
     mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
+    add_blobs(("src.py", BASE_SHA, b"old\n"), ("src.py", HEAD, b"new\n"), status=404)
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     notes = [
         {"file": "src.py", "line": 1, "body_path": "relative-body.txt"},
@@ -268,7 +295,10 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
         {
             "index": 1,
             "status": "failed",
-            "reason": "line 99 on the new side is not a usable diff line in 'src.py'",
+            "reason": (
+                "line 99 on the new side in 'src.py'; fallback rejected: old file content could not be read safely: "
+                "GitLab returned HTTP 404. Nearest new-side diff lines: 1."
+            ),
         },
         {"index": 2, "status": "validated", "position": {"path": "src.py", "line": 1}},
     ]
@@ -456,6 +486,7 @@ async def test_validates_lines_and_derives_positions_from_added_context_removed_
     assert data["results"][4]["position"] == {"path": "gone.py", "old_line": 2}
     assert data["results"][0]["note_id"] == POSTED_NOTE_ID
     assert data["results"][0]["discussion_id"] == "discussion-1"
+    assert not raw_blob_calls()
 
 
 @respx.mock
@@ -631,7 +662,14 @@ async def test_same_path_on_later_page_fails_its_note_as_ambiguous(gitlab_env):
 
     # Assert
     assert data["results"] == [
-        {"index": 0, "status": "failed", "reason": "Diff preflight found ambiguous path 'wanted.py'"},
+        {
+            "index": 0,
+            "status": "failed",
+            "reason": (
+                "Diff preflight found ambiguous path 'wanted.py'. "
+                "Nearest line hints are unavailable; use a file-level note."
+            ),
+        },
     ]
     assert data["warning"] == "1 of 1 notes failed preflight. No notes were posted."
     assert len(diff_route.calls) == TWO_POSTS
@@ -675,7 +713,10 @@ async def test_line_on_wrong_diff_side_fails_its_note_before_any_post(gitlab_env
         {
             "index": 0,
             "status": "failed",
-            "reason": "line 1 on the old side is not a usable diff line in 'added.py'",
+            "reason": (
+                "line 1 on the old side in 'added.py'; fallback rejected: unchanged lines cannot be verified for a "
+                "new or deleted file. Nearest line hints are unavailable; use a file-level note."
+            ),
         },
     ]
     assert not post_route.called
@@ -808,7 +849,14 @@ async def test_ambiguous_path_fails_its_note_before_any_post(gitlab_env):
 
     # Assert
     assert data["results"] == [
-        {"index": 0, "status": "failed", "reason": "Diff preflight found ambiguous path 'src.py'"},
+        {
+            "index": 0,
+            "status": "failed",
+            "reason": (
+                "Diff preflight found ambiguous path 'src.py'. "
+                "Nearest line hints are unavailable; use a file-level note."
+            ),
+        },
     ]
     assert not post_route.called
 
@@ -953,7 +1001,7 @@ async def test_missing_refs_or_malformed_merge_request_stops_preflight(gitlab_en
 
 @respx.mock
 async def test_line_repeated_in_two_hunks_fails_its_note_as_ambiguous(gitlab_env):
-    """The same new-side line in two hunks has two possible coordinates, so the note is not guessed."""
+    """Overlapping hunks are malformed, so the note is not guessed."""
     # Arrange
     patch = "@@ -0,0 +1 @@\n+first\n@@ -0,0 +1 @@\n+second"
     add_preflight([([diff_file("src.py", patch=patch)], None)])
@@ -964,7 +1012,13 @@ async def test_line_repeated_in_two_hunks_fails_its_note_as_ambiguous(gitlab_env
 
     # Assert
     assert data["results"] == [
-        {"index": 0, "status": "failed", "reason": "line 1 on the new side is ambiguous in 'src.py'"},
+        {
+            "index": 0,
+            "status": "failed",
+            "reason": (
+                "diff hunks overlap or are out of order. Nearest line hints are unavailable; use a file-level note."
+            ),
+        },
     ]
     assert not post_route.called
 
@@ -972,8 +1026,8 @@ async def test_line_repeated_in_two_hunks_fails_its_note_as_ambiguous(gitlab_env
 @pytest.mark.parametrize(
     ("file_diff", "expected_reason"),
     [
-        (diff_file("src.py", collapsed=True), "collapsed"),
-        (diff_file("src.py", too_large=True), "too large"),
+        (diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", collapsed=True), "collapsed"),
+        (diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", too_large=True), "too large"),
         (diff_file("src.py", patch=""), "no usable patch"),
     ],
     ids=["collapsed", "too-large", "empty-patch"],
@@ -1038,7 +1092,11 @@ async def test_malformed_unified_hunk_fails_its_note_before_post(gitlab_env, pat
 async def test_old_side_context_position_contains_both_coordinates(gitlab_env):
     """An old-side context line is a valid position and returns both coordinates."""
     # Arrange
-    add_preflight([([diff_file("src.py", patch=f"@@ -{OLD_CONTEXT_LINE} +{NEW_CONTEXT_LINE} @@\n unchanged")], None)])
+    patch = (
+        "@@ -0,0 +1,3 @@\n+added one\n+added two\n+added three\n"
+        f"@@ -{OLD_CONTEXT_LINE} +{NEW_CONTEXT_LINE} @@\n unchanged"
+    )
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
 
     # Act
@@ -1283,6 +1341,8 @@ async def test_people_are_skipped_when_a_note_does_not_post(gitlab_env, notes, p
     """If any note fails to post, nobody is added, and the warning says why."""
     # Arrange
     add_preflight([([diff_file("src.py", patch="@@ -1,2 +1,2 @@\n one\n two")], None)])
+    if any(note.get("line") == MISMATCHED_LINE for note in notes):
+        add_blobs(("src.py", BASE_SHA, b"old\n"), ("src.py", HEAD, b"new\n"), status=404)
     respx.post(DISCUSSIONS_URL).mock(side_effect=post_reply)
     graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
 
@@ -1515,6 +1575,7 @@ async def test_invalid_file_note_in_mixed_batch_prevents_general_note_post(gitla
     """An invalid diff note makes the whole mixed batch atomic and skips people changes."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)])
+    add_blobs(("src.py", BASE_SHA, b"old\n"), ("src.py", HEAD, b"new\n"), status=404)
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
 
@@ -1545,6 +1606,556 @@ async def test_line_without_file_is_rejected_before_requests(gitlab_env):
     assert result.is_error
     assert not mr_route.called
     assert not post_route.called
+
+
+EXPANSION_PATCH = "@@ -2 +2,2 @@\n-old\n+new one\n+new two\n@@ -5 +6 @@\n context"
+OLD_SNAPSHOT = b"before\nold\nmiddle one\nmiddle two\ncontext\ntrailing\n"
+NEW_SNAPSHOT = b"before\nnew one\nnew two\nmiddle one\nmiddle two\ncontext\ntrailing\n"
+
+
+@pytest.mark.parametrize(
+    ("side", "target", "expected_old", "expected_new"),
+    [
+        ("new", 1, 1, 1),
+        ("new", 4, 3, 4),
+        ("new", 7, 6, 7),
+        ("old", 1, 1, 1),
+        ("old", 3, 3, 4),
+        ("old", 6, 6, 7),
+    ],
+    ids=["new-before", "new-between", "new-after", "old-before", "old-between", "old-after"],
+)
+@respx.mock
+async def test_unchanged_lines_map_before_between_and_after_hunks_on_both_sides(
+    gitlab_env,
+    side,
+    target,
+    expected_old,
+    expected_new,
+):
+    """Verified gaps map by offset despite the earlier replacement's line-count change."""
+    # Arrange
+    add_preflight([([diff_file("src.py", patch=EXPANSION_PATCH)], None)])
+    old_route, new_route = add_blobs(
+        ("src.py", BASE_SHA, OLD_SNAPSHOT),
+        ("src.py", HEAD, NEW_SNAPSHOT),
+    )
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    note = {"file": "src.py", "body": "Review unchanged code."}
+    note["line" if side == "new" else "old_line"] = target
+
+    # Act
+    data = await call_tool(notes=[note], validate_only=True)
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": expected_new}}
+    ]
+    assert len(old_route.calls) == 1
+    assert len(new_route.calls) == 1
+    assert old_route.calls[0].request.url.params["ref"] == BASE_SHA
+    assert new_route.calls[0].request.url.params["ref"] == HEAD
+    assert not post_route.called
+
+
+@respx.mock
+async def test_posted_unchanged_line_uses_resolved_coordinates_and_immutable_refs(gitlab_env):
+    """A real note request uses the verified old and new positions with base and head SHAs."""
+    # Arrange
+    add_preflight([([diff_file("src.py", patch=EXPANSION_PATCH)], None)])
+    add_blobs(("src.py", BASE_SHA, OLD_SNAPSHOT), ("src.py", HEAD, NEW_SNAPSHOT))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 4)])
+
+    # Assert
+    position = json.loads(post_route.calls[0].request.content)["position"]
+    assert position == {
+        "position_type": "text",
+        "old_path": "src.py",
+        "new_path": "src.py",
+        "old_line": 3,
+        "new_line": 4,
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+    }
+    assert data["results"][0]["status"] == "posted"
+    assert data["results"][0]["position"] == {"path": "src.py", "line": 4}
+
+
+@pytest.mark.parametrize(
+    ("side", "target", "expected_old", "expected_new"),
+    [("new", 4, 3, 4), ("old", 4, 4, 5), ("new", 6, 6, 6)],
+    ids=["after-insertion", "before-deletion", "after-deletion"],
+)
+@respx.mock
+async def test_zero_count_hunks_preserve_insertion_and_deletion_boundaries(
+    gitlab_env,
+    side,
+    target,
+    expected_old,
+    expected_new,
+):
+    """Zero-count hunk ranges create boundaries without consuming a line on that side."""
+    # Arrange
+    patch = "@@ -2,0 +3 @@\n+inserted\n@@ -5 +5,0 @@\n-removed"
+    old_blob = b"one\ntwo\nthree\nfour\nremoved\nsix\n"
+    new_blob = b"one\ntwo\ninserted\nthree\nfour\nsix\n"
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
+    add_blobs(("src.py", BASE_SHA, old_blob), ("src.py", HEAD, new_blob))
+    note = {"file": "src.py", "body": "Review unchanged code."}
+    note["line" if side == "new" else "old_line"] = target
+
+    # Act
+    data = await call_tool(notes=[note], validate_only=True)
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": expected_new}}
+    ]
+    assert len(raw_blob_calls()) == TWO_POSTS
+
+
+@pytest.mark.parametrize(
+    ("old_blob", "new_blob", "hunk_line", "target"),
+    [
+        (b"first\r\nbefore\r\nold\r\nlast\r\n", b"first\r\nbefore\r\nnew\r\nlast\r\n", 3, 4),
+        (b"first\rbefore\nold\nlast\r", b"first\rbefore\nnew\nlast\r", 2, 3),
+        (b"first\nold\nlast", b"first\nnew\nlast", 2, 3),
+        (b"first\nold\nlast\n\n", b"first\nnew\nlast\n\n", 2, 4),
+    ],
+    ids=["crlf", "bare-cr-is-not-a-separator", "no-final-lf", "final-blank-line"],
+)
+@respx.mock
+async def test_unchanged_gap_comparison_preserves_git_blob_line_terminators(
+    gitlab_env,
+    old_blob,
+    new_blob,
+    hunk_line,
+    target,
+):
+    """LF alone separates blob lines, and complete terminators participate in byte equality."""
+    # Arrange
+    patch = f"@@ -{hunk_line} +{hunk_line} @@\n-old\n+new"
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
+    add_blobs(("src.py", BASE_SHA, old_blob), ("src.py", HEAD, new_blob))
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", target)], validate_only=True)
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": target}}]
+
+
+@pytest.mark.parametrize(
+    ("old_blob", "new_blob"),
+    [
+        (b"first\nold\nlast", b"first\nnew\nlast\n"),
+        (b"repeat\nold\nrepeat\n", b"changed\nnew\nrepeat\n"),
+    ],
+    ids=["final-newline-differs", "omitted-balanced-edit-and-repeated-text"],
+)
+@respx.mock
+async def test_unchanged_gap_must_match_exact_bytes_even_with_balanced_changes(gitlab_env, old_blob, new_blob):
+    """A balanced edit omitted from a patch or a newline-only change blocks mapping."""
+    # Arrange
+    patch = "@@ -2 +2 @@\n-old\n+new"
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
+    add_blobs(("src.py", BASE_SHA, old_blob), ("src.py", HEAD, new_blob))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 3)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert "unchanged file content differs" in data["results"][0]["reason"]
+    assert "Nearest new-side diff lines: 2." in data["results"][0]["reason"]
+    assert not post_route.called
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", new_file=True),
+        diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", deleted_file=True),
+    ],
+    ids=["new-file", "deleted-file"],
+)
+@respx.mock
+async def test_new_or_deleted_files_reject_only_out_of_hunk_fallback(gitlab_env, raw):
+    """New and deleted files reject blob expansion, while in-hunk support remains available."""
+    # Arrange
+    add_preflight([([raw], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert "new or deleted file" in data["results"][0]["reason"]
+    assert "Nearest new-side diff lines: 2." in data["results"][0]["reason"]
+    assert not raw_blob_calls()
+    assert not post_route.called
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        (diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", collapsed=True), "collapsed"),
+        (diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", too_large=True), "too large"),
+        (diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", binary=True), "binary"),
+    ],
+    ids=["collapsed", "too-large", "binary-flag"],
+)
+@respx.mock
+async def test_unsafe_diff_flags_reject_expansion_with_nearest_hints(gitlab_env, raw, reason):
+    """Collapsed, large, and flagged binary diffs do not offer hints from unsafe patches."""
+    # Arrange
+    add_preflight([([raw], None)])
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert reason in data["results"][0]["reason"]
+    assert "Nearest line hints are unavailable" in data["results"][0]["reason"]
+    assert not raw_blob_calls()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", collapsed=True),
+        diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", too_large=True),
+        diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new", binary=True),
+    ],
+    ids=["collapsed-in-hunk", "too-large-in-hunk", "binary-in-hunk"],
+)
+@respx.mock
+async def test_unsafe_diff_flags_reject_in_hunk_notes_before_blob_read_or_post(gitlab_env, raw):
+    """Even a matching patch line is rejected when GitLab marks the inline diff unsafe."""
+    # Arrange
+    add_preflight([([raw], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 2)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert any(flag in data["results"][0]["reason"] for flag in ("collapsed", "too large", "binary"))
+    assert "Nearest line hints are unavailable" in data["results"][0]["reason"]
+    assert not raw_blob_calls()
+    assert not post_route.called
+
+
+@respx.mock
+async def test_binary_blob_and_hunk_bounds_reject_expansion(gitlab_env):
+    """A NUL byte or a hunk endpoint beyond either snapshot makes expansion unsafe."""
+    # Arrange binary snapshot
+    add_preflight([([diff_file("src.py", patch="@@ -2 +2 @@\n-old\n+new")], None)])
+    old_route, new_route = add_blobs(
+        ("src.py", BASE_SHA, b"first\n\x00old\nlast"), ("src.py", HEAD, b"first\nnew\nlast")
+    )
+
+    # Act binary snapshot
+    binary = await call_tool(notes=[review_note("src.py", 3)], validate_only=True)
+
+    # Assert binary snapshot
+    assert binary["results"][0]["status"] == "failed"
+    assert "file content is binary" in binary["results"][0]["reason"]
+    assert len(old_route.calls) == 1
+    assert not new_route.called
+
+    # Arrange hunk beyond snapshot
+    add_preflight([([diff_file("src.py", patch="@@ -5 +5 @@\n-old\n+new")], None)])
+    add_blobs(("src.py", BASE_SHA, b"first\n"), ("src.py", HEAD, b"first\n"))
+
+    # Act hunk beyond snapshot
+    bounds = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+
+    # Assert hunk beyond snapshot
+    assert bounds["results"][0]["status"] == "failed"
+    assert "hunk bounds exceed the file content" in bounds["results"][0]["reason"]
+
+
+@respx.mock
+async def test_rename_uses_old_and_new_paths_and_base_head_refs(gitlab_env):
+    """A rename reads each path at its immutable blob SHA, not at start_sha."""
+    # Arrange
+    old_path, new_path = "old dir/src.py", "new dir/src.py"
+    patch = "@@ -2 +2 @@\n-old\n+new"
+    add_preflight([([diff_file(old_path, new_path, patch)], None)])
+    old_route, new_route = add_blobs(
+        (old_path, BASE_SHA, b"before\nold\nafter\n"),
+        (new_path, HEAD, b"before\nnew\nafter\n"),
+    )
+
+    # Act
+    data = await call_tool(notes=[review_note(new_path, 3)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["position"] == {"path": new_path, "old_path": old_path, "line": 3}
+    assert str(old_route.calls[0].request.url).endswith("/old%20dir%2Fsrc.py/raw?ref=" + BASE_SHA)
+    assert str(new_route.calls[0].request.url).endswith("/new%20dir%2Fsrc.py/raw?ref=" + HEAD)
+    assert old_route.calls[0].request.url.params["ref"] == BASE_SHA
+    assert new_route.calls[0].request.url.params["ref"] == HEAD
+
+
+@respx.mock
+async def test_raw_blobs_are_cached_for_successful_and_failed_fallbacks(gitlab_env):
+    """Each path and SHA pair is fetched once, including when its first read fails."""
+    # Arrange successful reads
+    add_preflight([([diff_file("src.py", patch=EXPANSION_PATCH)], None)])
+    old_route, new_route = add_blobs(
+        ("src.py", BASE_SHA, OLD_SNAPSHOT),
+        ("src.py", HEAD, NEW_SNAPSHOT),
+    )
+
+    # Act successful reads
+    valid = await call_tool(
+        notes=[review_note("src.py", 1), {"file": "src.py", "old_line": 6, "body": "Another note."}],
+        validate_only=True,
+    )
+
+    # Assert successful reads
+    assert [item["status"] for item in valid["results"]] == ["validated", "validated"]
+    assert len(old_route.calls) == 1
+    assert len(new_route.calls) == 1
+
+    # Arrange failed reads
+    add_preflight([([diff_file("src.py")], None)])
+    calls_before = len(raw_blob_calls())
+    _, failed_new = add_blobs(
+        ("src.py", BASE_SHA, b"unavailable"),
+        ("src.py", HEAD, b"unavailable"),
+        status=404,
+    )
+    new_calls_before = len(failed_new.calls)
+
+    # Act failed reads
+    invalid = await call_tool(notes=[review_note("src.py", 99), review_note("src.py", 100)], validate_only=True)
+
+    # Assert failed reads
+    assert [item["status"] for item in invalid["results"]] == ["failed", "failed"]
+    assert len(raw_blob_calls()) - calls_before == 1
+    assert len(failed_new.calls) == new_calls_before
+
+
+@respx.mock
+async def test_truncated_blob_is_rejected_and_final_ref_change_stops_batch(gitlab_env):
+    """Oversized snapshots fail locally, and refs are rechecked after blob reads before any write."""
+    # Arrange truncated snapshot
+    add_preflight([([diff_file("src.py", patch=EXPANSION_PATCH)], None)])
+    truncated, _ = add_blobs(
+        ("src.py", BASE_SHA, b"x" * (BLOB_CAP + 1)),
+        ("src.py", HEAD, NEW_SNAPSHOT),
+    )
+
+    # Act truncated snapshot
+    too_large = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+
+    # Assert truncated snapshot
+    assert too_large["results"][0]["status"] == "failed"
+    assert "exceeds the 131072-byte limit" in too_large["results"][0]["reason"]
+    assert len(truncated.calls) == 1
+
+    # Arrange changed refs after blob reads
+    changed = merge_request(sha="d" * 40, head_sha="d" * 40)
+    mr_route, _ = add_preflight(
+        [([diff_file("src.py", patch=EXPANSION_PATCH)], None)],
+        merge_requests=[merge_request(), changed],
+    )
+    calls_before = len(mr_route.calls)
+    add_blobs(("src.py", BASE_SHA, OLD_SNAPSHOT), ("src.py", HEAD, NEW_SNAPSHOT))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act changed refs after blob reads
+    changed_refs = await call_tool(notes=[review_note("src.py", 1)])
+
+    # Assert changed refs after blob reads
+    assert changed_refs["results"] == [{"index": 0, "status": "unattempted"}]
+    assert "changed during preflight" in changed_refs["warning"]
+    assert len(mr_route.calls) - calls_before == TWO_POSTS
+    assert not post_route.called
+
+
+@respx.mock
+async def test_nearest_hint_selection_ranges_and_reason_cap(gitlab_env):
+    """Hints choose the five nearest side-specific lines, compress ranges, and survive the reason cap."""
+    # Arrange
+    hunks = [f"@@ -{line} +{line} @@\n context {line}" for line in (1, 2, 3, 6, 10, 11, 12)]
+    patch = "\n".join(hunks)
+    raw = diff_file("src.py", patch=patch, new_file=True)
+    add_preflight([([raw], None)])
+
+    # Act nearest hint
+    nearest = await call_tool(notes=[review_note("src.py", 8)], validate_only=True)
+
+    # Assert nearest hint
+    assert "Nearest new-side diff lines: 3, 6, 10-12." in nearest["results"][0]["reason"]
+    assert len(nearest["results"][0]["reason"]) <= REASON_CAP
+
+    # Arrange capped hint
+    long_file = "x" * 180 + ".py"
+    long_raw = diff_file(long_file, patch="@@ -1,5 +1,5 @@\n a\n b\n c\n d\n e", new_file=True)
+    add_preflight([([long_raw], None)])
+
+    # Act capped hint
+    capped = await call_tool(notes=[review_note(long_file, 99)], validate_only=True)
+
+    # Assert capped hint
+    reason = capped["results"][0]["reason"]
+    assert len(reason) == REASON_CAP
+    assert reason.endswith("Nearest new-side diff lines: 1-5.")
+
+    # Arrange oversized coordinates
+    huge_line = 10**200
+    huge_patch = f"@@ -{huge_line} +{huge_line} @@\n unchanged"
+    huge_raw = diff_file("src.py", patch=huge_patch, new_file=True)
+    add_preflight([([huge_raw], None)])
+
+    # Act oversized coordinates
+    huge_hint = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+
+    # Assert oversized coordinates
+    huge_reason = huge_hint["results"][0]["reason"]
+    assert len(huge_reason) <= REASON_CAP
+    assert "Nearest line hints are unavailable" in huge_reason
+
+
+@pytest.mark.parametrize(
+    ("patch", "reason"),
+    [
+        ("@@ -0 +1 @@\n-old\n+new", "invalid old unified hunk range"),
+        ("@@ -1 +0 @@\n-old\n+new", "invalid new unified hunk range"),
+        ("@@ -1,0 +1,0 @@", "empty unified hunk"),
+        ("@@ -2 +3 @@\n context", "unequal unchanged gaps"),
+        ("@@ -1 +1 @@\n first\n@@ -3 +4 @@\n second", "unequal unchanged gaps"),
+        ("@@ -1 +1 @@\n first\n@@ -1 +1 @@\n second", "overlap or are out of order"),
+    ],
+    ids=["old-start-zero", "new-start-zero", "empty-range", "unequal-leading-gap", "unequal-middle-gap", "overlap"],
+)
+@respx.mock
+async def test_invalid_hunk_ranges_and_gaps_are_rejected_without_blob_reads(gitlab_env, patch, reason):
+    """Invalid interval bounds are not treated as candidates for unchanged-line mapping."""
+    # Arrange
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert reason in data["results"][0]["reason"]
+    assert "Nearest line hints are unavailable" in data["results"][0]["reason"]
+    assert not raw_blob_calls()
+
+
+@respx.mock
+async def test_empty_old_blob_and_out_of_file_line_are_rejected(gitlab_env):
+    """An empty old snapshot has zero lines and cannot map a coordinate beyond the new EOF."""
+    # Arrange
+    patch = "@@ -0,0 +1 @@\n+added"
+    add_preflight([([diff_file("src.py", patch=patch)], None)])
+    old_route, new_route = add_blobs(("src.py", BASE_SHA, b""), ("src.py", HEAD, b"added\n"))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 2)], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert "outside the file" in data["results"][0]["reason"]
+    assert len(old_route.calls) == 1
+    assert len(new_route.calls) == 1
+    assert not post_route.called
+
+
+@pytest.mark.parametrize("failure", ["connection", "redirect"], ids=["connection-error", "redirect"])
+@respx.mock
+async def test_raw_blob_read_failures_are_cached_per_note(gitlab_env, failure):
+    """A connection or redirect failure stays on affected notes and does not repeat the same blob read."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    old_url = f"{RAW_FILES_URL}/src.py/raw?ref={BASE_SHA}"
+    new_url = f"{RAW_FILES_URL}/src.py/raw?ref={HEAD}"
+    if failure == "connection":
+
+        def disconnect(request: httpx.Request) -> httpx.Response:
+            """Raise a transport error while opening the immutable old blob."""
+            raise httpx.ConnectError("connection closed", request=request)  # noqa: TRY003 - simulate a transport failure.
+
+        old_route = respx.get(old_url).mock(side_effect=disconnect)
+    else:
+        old_route = respx.get(old_url).mock(
+            return_value=httpx.Response(302, headers={"Location": "https://elsewhere.example/raw"})
+        )
+    new_route = respx.get(new_url).mock(return_value=httpx.Response(200, content=b"new\n"))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(
+        notes=[review_note("src.py", 99), review_note("src.py", 100), review_note("src.py", 1)],
+        validate_only=True,
+    )
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["failed", "failed", "validated"]
+    assert len(old_route.calls) == 1
+    assert not new_route.called
+    assert "could not be read safely" in data["results"][0]["reason"]
+    assert not post_route.called
+
+
+@respx.mock
+async def test_new_blob_http_error_is_cached_without_hiding_in_hunk_note(gitlab_env):
+    """A new-snapshot error rejects outside lines but leaves a matching in-hunk note validated."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    old_route = add_blobs(("src.py", BASE_SHA, b"old\n"))[0]
+    new_url = f"{RAW_FILES_URL}/src.py/raw?ref={HEAD}"
+    new_route = respx.get(new_url).mock(return_value=response({"message": "not found"}, status=404))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(
+        notes=[review_note("src.py", 99), review_note("src.py", 100), review_note("src.py", 1)],
+        validate_only=True,
+    )
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["failed", "failed", "validated"]
+    assert len(old_route.calls) == 1
+    assert len(new_route.calls) == 1
+    assert "new file content could not be read safely" in data["results"][0]["reason"]
+    assert "HTTP 404" in data["results"][0]["reason"]
+    assert not post_route.called
+
+
+@respx.mock
+async def test_invalid_diff_records_do_not_make_a_valid_expansion_ambiguous(gitlab_env):
+    """Malformed diff records are ignored while a valid entry still maps its verified gap."""
+    # Arrange
+    raw = diff_file("src.py")
+    add_preflight([([None, "not a diff record", raw], None)])
+    old_route, new_route = add_blobs(
+        ("src.py", BASE_SHA, b"old\nsame\n"),
+        ("src.py", HEAD, b"new\nsame\n"),
+    )
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 2)], validate_only=True)
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": 2}}]
+    assert len(old_route.calls) == 1
+    assert len(new_route.calls) == 1
 
 
 @respx.mock

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, model_validator
@@ -26,6 +27,8 @@ from gitlab_mcp.mr_common import (
 )
 
 REVIEW_NOTE_REASON_CAP = 200
+REVIEW_NOTE_HINT_CAP = 120
+REVIEW_NOTE_BLOB_CAP = 131_072
 PEOPLE_SKIPPED_WARNING = "Reviewers and assignees were not changed because not every note posted."
 
 
@@ -91,6 +94,24 @@ class _CheckedNote:
     body: str = ""
     position: dict[str, str | int | None] = field(default_factory=dict)
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class _DiffHunk:
+    """One validated unified hunk with zero-based, half-open old and new intervals."""
+
+    old_begin: int
+    old_end: int
+    new_begin: int
+    new_end: int
+
+
+@dataclass(frozen=True)
+class _ParsedDiff:
+    """Parsed line positions and hunk bounds used to map notes safely."""
+
+    positions: tuple[tuple[str, int | None, int | None], ...]
+    hunks: tuple[_DiffHunk, ...]
 
 
 class PeopleResult(BaseModel):
@@ -179,9 +200,10 @@ async def _get_review_diff_refs(client: GitLabClient, project: str, iid: int) ->
     return {key: str(value).lower() for key, value in state.items()}
 
 
-def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:  # noqa: C901, PLR0912 - unified diff parsing has distinct line cases.
-    """Parse unified diff hunks into line kinds and their old/new coordinates."""
+def _parse_unified_diff(diff: str) -> _ParsedDiff:  # noqa: C901, PLR0912, PLR0915 - distinct hunk cases stay explicit.
+    """Parse unified hunks, their positions, and unchanged gap bounds."""
     positions: list[tuple[str, int | None, int | None]] = []
+    hunks: list[_DiffHunk] = []
     old_line = new_line = old_remaining = new_remaining = 0
     in_hunk = False
     saw_hunk = False
@@ -193,10 +215,33 @@ def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:
             match = DIFF_HUNK_PATTERN.match(content)
             if match is None:
                 raise_review_preflight_error("diff contains an invalid unified hunk header")
-            old_line = int(match.group(1))
+            old_start = int(match.group(1))
             old_remaining = int(match.group(2) or 1)
-            new_line = int(match.group(3))
+            new_start = int(match.group(3))
             new_remaining = int(match.group(4) or 1)
+            if (old_remaining and old_start < 1) or (not old_remaining and old_start < 0):
+                raise_review_preflight_error("diff contains an invalid old unified hunk range")
+            if (new_remaining and new_start < 1) or (not new_remaining and new_start < 0):
+                raise_review_preflight_error("diff contains an invalid new unified hunk range")
+            if not old_remaining and not new_remaining:
+                raise_review_preflight_error("diff contains an empty unified hunk")
+            old_begin = old_start - 1 if old_remaining else old_start
+            new_begin = new_start - 1 if new_remaining else new_start
+            hunk = _DiffHunk(
+                old_begin=old_begin,
+                old_end=old_begin + old_remaining,
+                new_begin=new_begin,
+                new_end=new_begin + new_remaining,
+            )
+            previous_old_end = hunks[-1].old_end if hunks else 0
+            previous_new_end = hunks[-1].new_end if hunks else 0
+            if hunk.old_begin < previous_old_end or hunk.new_begin < previous_new_end:
+                raise_review_preflight_error("diff hunks overlap or are out of order")
+            if hunk.old_begin - previous_old_end != hunk.new_begin - previous_new_end:
+                raise_review_preflight_error("diff hunks have unequal unchanged gaps")
+            hunks.append(hunk)
+            old_line = old_start
+            new_line = new_start
             in_hunk = saw_hunk = True
             continue
         if not in_hunk or content.startswith("\\"):
@@ -228,7 +273,7 @@ def _diff_line_positions(diff: str) -> list[tuple[str, int | None, int | None]]:
         raise_review_preflight_error("diff has an incomplete unified hunk")
     if not saw_hunk or not positions:
         raise_review_preflight_error("diff has no usable unified patch")
-    return positions
+    return _ParsedDiff(positions=tuple(positions), hunks=tuple(hunks))
 
 
 def _diff_paths(raw: dict[str, Any], file: str) -> tuple[str, str]:
@@ -239,54 +284,197 @@ def _diff_paths(raw: dict[str, Any], file: str) -> tuple[str, str]:
     return old_path, new_path
 
 
-def _matching_line(raw: dict[str, Any], note: ReviewNote) -> tuple[int | None, int | None]:
-    """Find the one diff line that matches a line note's side and number, or say why it cannot be used."""
+def _parsed_diff_for_note(
+    raw: dict[str, Any],
+    note: ReviewNote,
+    cache: dict[int, tuple[_ParsedDiff | None, str]],
+) -> _ParsedDiff:
+    """Return one cached patch parse, or preserve the established unusable-patch errors."""
     if raw.get("collapsed") or raw.get("too_large"):
         raise_review_preflight_error(f"diff for {note.file!r} is collapsed or too large to position safely")
-    diff = raw.get("diff")
-    if not isinstance(diff, str) or not diff:
+    if raw.get("binary"):
+        raise_review_preflight_error(f"diff for {note.file!r} is binary and cannot be positioned safely")
+    patch = raw.get("diff")
+    if not isinstance(patch, str) or not patch:
         raise_review_preflight_error(f"diff for {note.file!r} has no usable patch")
-    matches: list[tuple[int | None, int | None]] = []
-    for kind, old_line, new_line in _diff_line_positions(diff):
+
+    key = id(raw)
+    if key not in cache:
+        try:
+            cache[key] = (_parse_unified_diff(patch), "")
+        except ValueError as exc:
+            cache[key] = (None, str(exc))
+    parsed, error = cache[key]
+    if parsed is None:
+        raise_review_preflight_error(error)
+    return parsed
+
+
+def _matching_lines(parsed: _ParsedDiff, note: ReviewNote) -> list[tuple[int | None, int | None]]:
+    """Return the in-hunk diff positions matching the requested side and line number."""
+    matches = []
+    for kind, old_line, new_line in parsed.positions:
         if note.line is not None and new_line == note.line and kind in ("added", "context"):
             matches.append((old_line, new_line))
         if note.old_line is not None and old_line == note.old_line and kind in ("removed", "context"):
             matches.append((old_line, new_line))
-    if len(matches) != 1:
-        side = "new" if note.line is not None else "old"
-        line = note.line if note.line is not None else note.old_line
-        if matches:
-            raise_review_preflight_error(f"line {line} on the {side} side is ambiguous in {note.file!r}")
-        raise_review_preflight_error(f"line {line} on the {side} side is not a usable diff line in {note.file!r}")
-    return matches[0]
+    return matches
 
 
-def _note_position(matches: list[dict[str, Any]], note: ReviewNote) -> dict[str, str | int | None]:
-    """Return the GitLab position for one note, or raise why GitLab would not accept it.
+def _line_in_hunk(parsed: _ParsedDiff, side: str, line: int) -> bool:
+    """Check whether a one-based line coordinate falls inside a hunk on the requested side."""
+    coordinate = line - 1
+    return any(
+        begin <= coordinate < end
+        for begin, end in (
+            (hunk.new_begin, hunk.new_end) if side == "new" else (hunk.old_begin, hunk.old_end) for hunk in parsed.hunks
+        )
+    )
 
-    A file-level note (no line) needs only its path to appear once in the diff. A line note also needs a usable
-    hunk, so collapsed or too-large patches fail only that note.
-    """
-    if note.file is None:
-        raise_review_preflight_error("file is required for a diff position")
-    file = note.file
-    if not matches:
-        raise_review_preflight_error(f"Diff preflight could not find {file!r} within {MAX_PAGES} pages")
-    if len(matches) != 1:
-        raise_review_preflight_error(f"Diff preflight found ambiguous path {file!r}")
-    raw = matches[0]
-    old_path, new_path = _diff_paths(raw, file)
-    if note.line is None and note.old_line is None:
-        # Omit the line keys entirely: _review_response_matches treats a missing key and a null key the same way.
-        return {"position_type": "file", "old_path": old_path, "new_path": new_path}
-    old_line, new_line = _matching_line(raw, note)
-    return {
-        "position_type": "text",
-        "old_path": old_path,
-        "new_path": new_path,
-        "old_line": old_line,
-        "new_line": new_line,
-    }
+
+def _nearest_line_hint(parsed: _ParsedDiff, side: str, target: int) -> str:
+    """Format up to five nearby validated hunk line numbers for the requested side."""
+    if side == "new":
+        coordinates = {new_line for _, _, new_line in parsed.positions if new_line is not None}
+    else:
+        coordinates = {old_line for _, old_line, _ in parsed.positions if old_line is not None}
+    if not coordinates:
+        return "Nearest line hints are unavailable; use a file-level note."
+    closest = sorted(coordinates, key=lambda line: (abs(line - target), line))[:5]
+    ordered = sorted(closest)
+    ranges: list[str] = []
+    start = previous = ordered[0]
+    for line in ordered[1:]:
+        if line == previous + 1:
+            previous = line
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = line
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    hint = f"Nearest {side}-side diff lines: {', '.join(ranges)}."
+    if len(hint) > REVIEW_NOTE_HINT_CAP:
+        return "Nearest line hints are unavailable; use a file-level note."
+    return hint
+
+
+def _line_failure_reason(message: str, hint: str) -> str:
+    """Cap a line-note reason while preserving the nearest-line hint."""
+    if len(hint) > REVIEW_NOTE_HINT_CAP:
+        hint = "Nearest line hints are unavailable; use a file-level note."
+    suffix = f". {hint}"
+    available = max(0, REVIEW_NOTE_REASON_CAP - len(suffix))
+    return f"{message[:available]}{suffix}"
+
+
+def _git_blob_lines(content: bytes) -> list[bytes]:
+    """Split a Git blob on LF only, retaining each line terminator and a final unterminated line."""
+    if not content:
+        return []
+    pieces = content.split(b"\n")
+    lines = [piece + b"\n" for piece in pieces[:-1]]
+    if pieces[-1]:
+        lines.append(pieces[-1])
+    return lines
+
+
+def _verified_unchanged_gaps(
+    parsed: _ParsedDiff,
+    old_lines: list[bytes],
+    new_lines: list[bytes],
+) -> tuple[list[tuple[int, int, int, int]] | None, str]:
+    """Check hunk bounds and return the byte-identical unchanged line intervals."""
+    gaps = []
+    old_cursor = new_cursor = 0
+    for hunk in parsed.hunks:
+        if hunk.old_end > len(old_lines) or hunk.new_end > len(new_lines):
+            return None, "hunk bounds exceed the file content"
+        old_gap = old_lines[old_cursor : hunk.old_begin]
+        new_gap = new_lines[new_cursor : hunk.new_begin]
+        if len(old_gap) != len(new_gap) or old_gap != new_gap:
+            return None, "unchanged file content differs outside the reported hunks"
+        gaps.append((old_cursor, hunk.old_begin, new_cursor, hunk.new_begin))
+        old_cursor, new_cursor = hunk.old_end, hunk.new_end
+
+    old_tail = old_lines[old_cursor:]
+    new_tail = new_lines[new_cursor:]
+    if len(old_tail) != len(new_tail) or old_tail != new_tail:
+        return None, "unchanged file content differs outside the reported hunks"
+    gaps.append((old_cursor, len(old_lines), new_cursor, len(new_lines)))
+    return gaps, ""
+
+
+async def _read_review_blob(
+    client: GitLabClient,
+    project: str,
+    path: str,
+    sha: str,
+    cache: dict[tuple[str, str], tuple[bytes | None, str]],
+) -> tuple[bytes | None, str]:
+    """Read and cache one bounded immutable Git blob, including failed reads."""
+    key = (path, sha)
+    if key in cache:
+        return cache[key]
+    encoded_project = quote(project, safe="")
+    encoded_path = quote(path, safe="")
+    endpoint = f"/projects/{encoded_project}/repository/files/{encoded_path}/raw?ref={sha}"
+    try:
+        content, truncated = await client.get_trace_prefix(endpoint, max_bytes=REVIEW_NOTE_BLOB_CAP)
+        if truncated or len(content) > REVIEW_NOTE_BLOB_CAP:
+            result = (None, f"file content exceeds the {REVIEW_NOTE_BLOB_CAP}-byte limit")
+        elif b"\x00" in content:
+            result = (None, "file content is binary")
+        else:
+            result = (content, "")
+    except GitLabAPIError as exc:
+        result = (None, f"GitLab returned HTTP {exc.status}")
+    except GitLabConnectionError:
+        result = (None, "GitLab connection failed")
+    except ToolError:
+        result = (None, "GitLab could not read raw file content")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        result = (None, str(exc))
+    cache[key] = result
+    return result
+
+
+async def _unchanged_line_position(  # noqa: PLR0911, PLR0913, PLR0917 - every value defines the mapping proof.
+    client: GitLabClient,
+    project: str,
+    raw: dict[str, Any],
+    old_path: str,
+    new_path: str,
+    note: ReviewNote,
+    parsed: _ParsedDiff,
+    refs: dict[str, str],
+    blob_cache: dict[tuple[str, str], tuple[bytes | None, str]],
+) -> tuple[int | None, int | None, str]:
+    """Map an out-of-hunk coordinate only when both immutable blobs prove it is unchanged."""
+    if raw.get("new_file") or raw.get("deleted_file"):
+        return None, None, "unchanged lines cannot be verified for a new or deleted file"
+
+    old_content, error = await _read_review_blob(client, project, old_path, refs["base_sha"], blob_cache)
+    if old_content is None:
+        return None, None, f"old file content could not be read safely: {error}"
+    new_content, error = await _read_review_blob(client, project, new_path, refs["head_sha"], blob_cache)
+    if new_content is None:
+        return None, None, f"new file content could not be read safely: {error}"
+
+    gaps, error = _verified_unchanged_gaps(parsed, _git_blob_lines(old_content), _git_blob_lines(new_content))
+    if gaps is None:
+        return None, None, error
+
+    target = note.line if note.line is not None else note.old_line
+    if target is None:
+        return None, None, "line coordinate is missing"
+    coordinate = target - 1
+    for old_begin, old_end, new_begin, new_end in gaps:
+        if note.line is not None and new_begin <= coordinate < new_end:
+            mapped = old_begin + coordinate - new_begin
+            return mapped + 1, target, ""
+        if note.old_line is not None and old_begin <= coordinate < old_end:
+            mapped = new_begin + coordinate - old_begin
+            return target, mapped + 1, ""
+    return None, None, "line coordinate is outside the file or is not in a verified unchanged gap"
 
 
 async def _scan_review_paths(
@@ -319,19 +507,102 @@ async def _scan_review_paths(
     return path_matches
 
 
-def _check_note_position(
+async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0917 - preflight outcomes stay explicit.
+    client: GitLabClient,
+    project: str,
+    refs: dict[str, str],
     matches: list[dict[str, Any]],
     note: ReviewNote,
     check: _CheckedNote,
+    parsed_cache: dict[int, tuple[_ParsedDiff | None, str]],
+    blob_cache: dict[tuple[str, str], tuple[bytes | None, str]],
 ) -> _CheckedNote:
     """Add a GitLab position to a note whose body is usable, or record why its diff position fails."""
     if check.reason:
         return check
+    if note.file is None:
+        return _CheckedNote(reason=_note_reason("file is required for a diff position"))
+    file = note.file
+    line_note = note.line is not None or note.old_line is not None
     try:
-        position = _note_position(matches, note)
+        if not matches:
+            message = f"Diff preflight could not find {file!r} within {MAX_PAGES} pages"
+            if line_note:
+                message = _line_failure_reason(message, "Nearest line hints are unavailable; use a file-level note.")
+            return _CheckedNote(reason=_note_reason(message))
+        if len(matches) != 1:
+            message = f"Diff preflight found ambiguous path {file!r}"
+            if line_note:
+                message = _line_failure_reason(message, "Nearest line hints are unavailable; use a file-level note.")
+            return _CheckedNote(reason=_note_reason(message))
+
+        raw = matches[0]
+        old_path, new_path = _diff_paths(raw, file)
+        if not line_note:
+            # Omit line keys entirely: response verification accepts omitted and null line keys.
+            position: dict[str, str | int | None] = {
+                "position_type": "file",
+                "old_path": old_path,
+                "new_path": new_path,
+            }
+            return _CheckedNote(body=check.body, position=position)
+
+        parsed = _parsed_diff_for_note(raw, note, parsed_cache)
+        matched = _matching_lines(parsed, note)
+        if len(matched) == 1:
+            old_line, new_line = matched[0]
+            position = {
+                "position_type": "text",
+                "old_path": old_path,
+                "new_path": new_path,
+                "old_line": old_line,
+                "new_line": new_line,
+            }
+            return _CheckedNote(body=check.body, position=position)
+
+        side = "new" if note.line is not None else "old"
+        target = note.line if note.line is not None else note.old_line
+        if target is None:
+            reason = _line_failure_reason(
+                "line coordinate is missing", "Nearest line hints are unavailable; use a file-level note."
+            )
+            return _CheckedNote(reason=_note_reason(reason))
+        if matched:
+            message = f"line {target} on the {side} side is ambiguous in {file!r}"
+            return _CheckedNote(reason=_line_failure_reason(message, _nearest_line_hint(parsed, side, target)))
+
+        base_reason = f"line {target} on the {side} side is not a usable diff line in {file!r}"
+        if _line_in_hunk(parsed, side, target):
+            return _CheckedNote(reason=_line_failure_reason(base_reason, _nearest_line_hint(parsed, side, target)))
+
+        hint = _nearest_line_hint(parsed, side, target)
+        old_line, new_line, fallback_error = await _unchanged_line_position(
+            client,
+            project,
+            raw,
+            old_path,
+            new_path,
+            note,
+            parsed,
+            refs,
+            blob_cache,
+        )
+        if fallback_error:
+            message = f"line {target} on the {side} side in {file!r}; fallback rejected: {fallback_error}"
+            return _CheckedNote(reason=_line_failure_reason(message, hint))
+        position = {
+            "position_type": "text",
+            "old_path": old_path,
+            "new_path": new_path,
+            "old_line": old_line,
+            "new_line": new_line,
+        }
+        return _CheckedNote(body=check.body, position=position)
     except ValueError as exc:
-        return _CheckedNote(reason=_note_reason(str(exc)))
-    return _CheckedNote(body=check.body, position=position)
+        message = str(exc)
+        if line_note:
+            message = _line_failure_reason(message, "Nearest line hints are unavailable; use a file-level note.")
+        return _CheckedNote(reason=_note_reason(message))
 
 
 async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the preflight contract.
@@ -353,11 +624,24 @@ async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is pa
         requested_paths = {note.file for note in notes if note.file is not None}
         paths = await _scan_review_paths(client, project, iid, requested_paths) if requested_paths else {}
         checked = []
+        parsed_cache: dict[int, tuple[_ParsedDiff | None, str]] = {}
+        blob_cache: dict[tuple[str, str], tuple[bytes | None, str]] = {}
         for note, check in zip(notes, checks, strict=True):
             if note.file is None:
                 checked.append(check)
             else:
-                checked.append(_check_note_position(paths[note.file], note, check))
+                checked.append(
+                    await _check_note_position(
+                        client,
+                        project,
+                        refs,
+                        paths[note.file],
+                        note,
+                        check,
+                        parsed_cache,
+                        blob_cache,
+                    )
+                )
         current_refs = await _get_review_diff_refs(client, project, iid)
         if current_refs != refs:
             return [], {}, "The merge request or its diff refs changed during preflight. No notes were posted."
