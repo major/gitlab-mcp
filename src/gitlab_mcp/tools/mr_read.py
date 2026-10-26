@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
+from gitlab_mcp.ci_common import numeric_gid
 from gitlab_mcp.common import (
     GRAPHQL_MR_CHUNK,
     MAX_BATCH_MERGE_REQUESTS,
@@ -70,11 +71,18 @@ query(
 
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
-query($fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeJobs: Boolean! = false) {
+query(
+  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeJobs: Boolean! = false,
+  $includeLabels: Boolean!
+) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
       iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
-      author { username }
+      labels(first: 100) @include(if: $includeLabels) {
+        nodes { title }
+        pageInfo { hasNextPage }
+      }
+      author { id username }
       mergedAt mergeUser { username }
       diffRefs { headSha }
       detailedMergeStatus shouldBeRebased conflicts
@@ -140,6 +148,10 @@ BLOCKED_STATUS = "blocked_status"
 
 # Long descriptions are cut to keep one tool result small. The flag tells the agent it was cut.
 DESCRIPTION_CAP = 4000
+# Issue-key parsing is deliberately fixed and bounded; callers can only supply literal prefixes.
+ISSUE_KEY_CAP = 100
+ISSUE_KEY_PREFIX_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
+ISSUE_KEY_PATTERN = re.compile(r"\b([A-Z][A-Z0-9_]{0,31}-[0-9]+)\b")
 # The open-thread list is capped. Counts stay exact, and `index_complete` says whether the list is whole.
 THREAD_INDEX_CAP = 20
 
@@ -226,6 +238,9 @@ class MergeRequestDetail(BaseModel):
     state: str
     draft: bool = Field(default=False, exclude_if=lambda v: not v)
     author: str = Field(default="", exclude_if=lambda v: not v)
+    author_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    labels: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    labels_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
     merged_at: str | None = Field(default=None, exclude_if=lambda value: value is None)
     merged_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
     source_branch: str
@@ -233,6 +248,8 @@ class MergeRequestDetail(BaseModel):
     head_sha: str = Field(default="", exclude_if=lambda v: not v)
     description: str = Field(default="", exclude_if=lambda v: not v)
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
+    issue_keys: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    issue_keys_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
     merge_status: str = Field(default="", exclude_if=lambda v: not v)  # GitLab's detailed status.
     should_be_rebased: bool = Field(default=False, exclude_if=lambda v: not v)
     conflicts: bool = Field(default=False, exclude_if=lambda v: not v)
@@ -601,6 +618,28 @@ def _cap_description(description: str | None, limit: int = DESCRIPTION_CAP) -> t
     return description[:limit], len(description) > limit
 
 
+def _extract_issue_keys(
+    title: str,
+    description: str | None,
+    prefixes: list[str] | None,
+) -> tuple[list[str], bool]:
+    """Return unique issue keys in first-seen order, with a fixed cap and optional literal prefixes."""
+    text = f"{title}\n{description or ''}"
+    keys: list[str] = []
+    seen: set[str] = set()
+    for match in ISSUE_KEY_PATTERN.finditer(text):
+        key = match[1]
+        if prefixes is not None and not any(key.startswith(f"{prefix}-") for prefix in prefixes):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(keys) == ISSUE_KEY_CAP:
+            return keys, True
+        keys.append(key)
+    return keys, False
+
+
 def _to_reviewer(node: dict[str, Any]) -> Reviewer:
     """Convert one reviewer node. A null interaction means GitLab has no review state for them."""
     interaction = node["mergeRequestInteraction"]
@@ -670,6 +709,8 @@ def _to_detail(
     node: dict[str, Any],
     *,
     include_description: bool,
+    include_labels: bool,
+    issue_key_prefixes: list[str] | None,
     description_limit: int,
 ) -> MergeRequestDetail:
     """Convert one GraphQL merge request node into the detail shape.
@@ -685,6 +726,12 @@ def _to_detail(
         node.get("description") if include_description else None,
         description_limit,
     )
+    label_connection = node.get("labels") if include_labels else None
+    issue_keys, issue_keys_truncated = _extract_issue_keys(
+        node["title"],
+        node.get("description") if include_description else None,
+        issue_key_prefixes,
+    )
     return MergeRequestDetail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
@@ -693,11 +740,16 @@ def _to_detail(
         merged_by=merged_by,
         draft=node["draft"],
         author=author["username"] if author else "",
+        author_id=numeric_gid(author["id"], {"User"}) if author else None,
+        labels=[label["title"] for label in label_connection["nodes"]] if label_connection else None,
+        labels_truncated=label_connection["pageInfo"]["hasNextPage"] if label_connection else None,
         source_branch=node["sourceBranch"],
         target_branch=node["targetBranch"],
         head_sha=diff_refs_head_sha(node["diffRefs"]),
         description=description,
         description_truncated=description_truncated,
+        issue_keys=issue_keys or None,
+        issue_keys_truncated=issue_keys_truncated or None,
         merge_status=lower_or_empty(node["detailedMergeStatus"]),
         should_be_rebased=node["shouldBeRebased"],
         conflicts=node["conflicts"],
@@ -806,6 +858,20 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         bool,
         Field(description="True includes the description. Defaults to false to save tokens."),
     ] = False,
+    include_labels: Annotated[
+        bool,
+        Field(description="Include the first 100 labels. Defaults to false to keep output compact."),
+    ] = False,
+    issue_key_prefixes: Annotated[
+        list[str] | None,
+        Field(
+            max_length=20,
+            description=(
+                "Optional literal prefixes for issue keys. Each prefix must start with an uppercase ASCII letter, "
+                "followed by up to 31 uppercase letters, digits, or underscores."
+            ),
+        ),
+    ] = None,
     description_limit: Annotated[
         int,
         Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
@@ -829,6 +895,9 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
     - The description is skipped by default. Set `include_description=true` to read it when you need it.
+    - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
+    - `issue_keys` lists unique uppercase-prefix-number keys from the title on every call and from the raw description
+      when included, up to 100. `issue_key_prefixes` filters by literal prefixes, not regular expressions.
     - `description_limit` controls description length when the description is included. Zero skips it; the default is
       4000 characters.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
@@ -838,6 +907,14 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
     """
     include_description = include_description and description_limit > 0
+    if issue_key_prefixes is not None and any(
+        not ISSUE_KEY_PREFIX_PATTERN.fullmatch(prefix) for prefix in issue_key_prefixes
+    ):
+        message = (
+            "Each issue_key_prefixes item must start with an uppercase ASCII letter and contain only "
+            "uppercase letters, digits, or underscores, up to 32 characters."
+        )
+        raise ToolError(message)
     client = get_client(ctx)
     node = await fetch_merge_request(
         client,
@@ -846,8 +923,15 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         iid,
         includeDescription=include_description,
         includeJobs=include_jobs,
+        includeLabels=include_labels,
     )
-    detail = _to_detail(node, include_description=include_description, description_limit=description_limit)
+    detail = _to_detail(
+        node,
+        include_description=include_description,
+        include_labels=include_labels,
+        issue_key_prefixes=issue_key_prefixes,
+        description_limit=description_limit,
+    )
     await _add_blockers(client, project, [detail])
     if include_commits_behind:
         await _add_commits_behind(client, project, [detail])
