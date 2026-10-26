@@ -275,11 +275,11 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     project: Project,
     job_id: JobId,
     view: Annotated[
-        Literal["tail", "head", "search", "section"],
+        Literal["tail", "head", "search", "section", "failures"],
         Field(
             description=(
-                "tail keeps the last lines; head keeps the first; section scans a bounded prefix; search scans a "
-                "bounded raw trace window."
+                "tail keeps the last lines; head keeps the first; section scans a bounded prefix; search finds a "
+                "literal in a bounded raw trace window; failures finds common error markers in a bounded window."
             ),
         ),
     ] = "tail",
@@ -299,14 +299,20 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     ] = None,
     context: Annotated[
         int | None,
-        Field(ge=0, le=5, description="Search context lines before and after each match, from 0 to 5. Defaults to 2."),
+        Field(
+            ge=0,
+            le=5,
+            description="Search or failures context lines before and after each match, from 0 to 5. Defaults to 2.",
+        ),
     ] = None,
     scan_bytes: Annotated[
         int | None,
         Field(
             ge=1,
             le=1048576,
-            description="Maximum raw trace bytes for search or section, from 1 to 1048576. Defaults to 262144.",
+            description=(
+                "Maximum raw trace bytes for search, failures, or section, from 1 to 1048576. Defaults to 262144."
+            ),
         ),
     ] = None,
     byte_offset: Annotated[
@@ -315,8 +321,8 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
             strict=True,
             ge=0,
             description=(
-                "Search only: start at this raw trace byte offset. Defaults to 0. Nonzero offsets require GitLab "
-                "to honor HTTP Range; unsupported continuation returns an error."
+                "Search and failures only: start at this raw trace byte offset. Defaults to 0. Nonzero offsets require "
+                "GitLab to honor HTTP Range; unsupported continuation returns an error."
             ),
         ),
     ] = None,
@@ -324,12 +330,15 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     """Read a bounded slice of one job's log, like `glab api projects/:id/jobs/:job_id/trace` for `head`.
 
     `tail` makes one GraphQL request for the last 100 summary lines, not the whole log. A skipped tail has no
-    summary and ends after that one request. `head`, `search`, and `section` each make two REST requests: one job
-    check and one bounded trace read. A skipped job in those views stops after the job check. `head` reads the
-    first 32 KiB of the raw trace. `search` uses a case-insensitive literal pattern and keeps two context lines by
-    default, while `section` selects the first exact runner section. Both advanced views scan at most `scan_bytes`
-    (default 256 KiB, maximum 1 MiB). Search can resume with `byte_offset`; when a scan is cut, `next_offset` gives
-    raw scan progress after complete lines. It is not pagination of `max_chars`-truncated results, and context only
+    summary and ends after that one request. `head`, `search`, `section`, and `failures` each make two REST requests:
+    one job check and one bounded trace read. A skipped job in those views stops after the job check. `head` reads
+    the first 32 KiB of the raw trace. `search` uses a case-insensitive literal pattern. `failures` matches common
+    make errors, pytest `FAILED` lines, `error:` text, Python traceback headers, and `Error` followed by a numeric
+    code. This conservative heuristic can miss other failure formats and can match error text that is not a failure.
+    Both search views keep two context lines by default; pass `context` from 0 to 5 to change it. `section` selects
+    the first exact runner section. Search, failures, and section scan at most `scan_bytes` (default 256 KiB,
+    maximum 1 MiB). Search and failures can resume with `byte_offset`; when a scan is cut, `next_offset` gives raw
+    scan progress after complete lines. It is not pagination of `max_chars`-truncated results, and context only
     comes from the current scan window. Nonzero offsets require GitLab to honor HTTP Range, or the call returns an
     error. Section always reads a prefix. A missing result means it was not found in that scan window when
     `scan_truncated` is true. Cleanup and credential masking happen before matching; `max_chars` keeps the oldest
