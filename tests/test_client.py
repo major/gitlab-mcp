@@ -6,6 +6,7 @@ The HTTP layer is still mocked with respx, so no real request leaves the test.
 
 import itertools
 import json
+import ssl
 lazy from collections.abc import AsyncIterator, Iterable
 
 import httpx
@@ -99,6 +100,110 @@ async def test_request_reports_a_connection_error(client):
     # Act / Assert
     with pytest.raises(GitLabConnectionError, match=r"Could not reach https://gitlab\.example\.com: boom"):
         await client.request("POST", NOTES_PATH, json={"body": "hi"})
+
+
+@pytest.mark.parametrize(
+    ("chain", "nested_error"),
+    [
+        pytest.param("cause", ssl.SSLCertVerificationError("untrusted certificate"), id="typed-cause"),
+        pytest.param("context", ssl.SSLCertVerificationError("untrusted certificate"), id="typed-context"),
+        pytest.param("cause", RuntimeError("certificate_verify_failed from proxy"), id="nested-text"),
+    ],
+)
+def test_connection_error_adds_tls_guidance_for_nested_certificate_errors(chain, nested_error):
+    """A certificate error anywhere in the exception chain adds actionable CA guidance."""
+    # Arrange
+    cause = RuntimeError("connection failed")
+    setattr(cause, f"__{chain}__", nested_error)
+
+    # Act
+    error = GitLabConnectionError("https://gitlab.example.com", cause)
+
+    # Assert
+    assert isinstance(error, ToolError)
+    assert "Could not reach https://gitlab.example.com: connection failed" in str(error)
+    assert "certificate verification failed" in str(error).lower()
+    assert "SSL_CERT_FILE" in str(error)
+    assert "PEM CA bundle" in str(error)
+    assert "trusts the GitLab instance certificate chain" in str(error)
+    assert "restart MCP server" in str(error)
+
+
+def test_connection_error_handles_cycles_in_exception_chain():
+    """A certificate error in an exception chain with a cycle still adds guidance."""
+    # Arrange
+    cause = RuntimeError("connection failed")
+    nested = ssl.SSLCertVerificationError("untrusted certificate")
+    cause.__cause__ = nested
+    nested.__context__ = cause
+
+    # Act
+    error = GitLabConnectionError("https://gitlab.example.com", cause)
+
+    # Assert
+    assert "SSL_CERT_FILE" in str(error)
+
+
+def test_connection_error_ignores_noncertificate_cycles_in_exception_chain():
+    """A non-certificate cause and context cycle terminates without adding TLS guidance."""
+    # Arrange
+    cause = RuntimeError("connection reset")
+    context = RuntimeError("intermediate failure")
+    cause.__cause__ = context
+    context.__context__ = cause
+
+    # Act
+    error = GitLabConnectionError("https://gitlab.example.com", cause)
+
+    # Assert
+    assert str(error) == "Could not reach https://gitlab.example.com: connection reset"
+    assert "SSL_CERT_FILE" not in str(error)
+
+
+def test_connection_error_preserves_generic_network_error_text():
+    """A non-certificate failure keeps the original connection error message unchanged."""
+    # Arrange
+    cause = RuntimeError("connection reset")
+
+    # Act
+    error = GitLabConnectionError("https://gitlab.example.com", cause)
+
+    # Assert
+    assert str(error) == "Could not reach https://gitlab.example.com: connection reset"
+
+
+@pytest.mark.parametrize("path", ["rest", "graphql", "post", "trace-open", "trace-read"])
+@respx.mock
+async def test_tls_connection_errors_share_guidance_across_request_paths(client, path):
+    """REST, GraphQL, write, and trace failures all report the TLS guidance as a connection error."""
+    # Arrange
+    network_error = httpx.ConnectError("CERTIFICATE_VERIFY_FAILED: untrusted certificate")
+    if path == "rest":
+        respx.get(f"{API}/x").mock(side_effect=network_error)
+    elif path == "graphql":
+        respx.post(GRAPHQL).mock(side_effect=network_error)
+    elif path == "post":
+        respx.post(NOTES_URL).mock(side_effect=network_error)
+    elif path == "trace-open":
+        respx.get(TRACE_URL).mock(side_effect=network_error)
+    else:
+        stream_error = httpx.ReadError("CERTIFICATE_VERIFY_FAILED: untrusted certificate")
+        respx.get(TRACE_URL).mock(return_value=httpx.Response(200, stream=SpyStream([b"abc"], error=stream_error)))
+
+    # Act / Assert
+    if path == "rest":
+        request = client.get("/x")
+    elif path == "graphql":
+        request = client.graphql("query { x }", {})
+    elif path == "post":
+        request = client.request("POST", NOTES_PATH, json={"body": "hi"})
+    else:
+        request = client.get_trace_prefix(TRACE_PATH, max_bytes=100)
+    with pytest.raises(GitLabConnectionError) as info:
+        await request
+    assert "Could not reach https://gitlab.example.com:" in str(info.value)
+    assert "certificate verification failed" in str(info.value).lower()
+    assert "SSL_CERT_FILE" in str(info.value)
 
 
 @pytest.mark.parametrize(
