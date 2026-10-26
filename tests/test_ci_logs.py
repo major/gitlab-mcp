@@ -428,6 +428,13 @@ async def test_invalid_arguments_fail_before_any_request(arguments):
         {"view": "section", "section": "build", "byte_offset": 0},
         {"view": "search", "pattern": "x", "scan_bytes": 0},
         {"view": "section", "section": "build", "scan_bytes": 1048577},
+        {"view": "failures", "pattern": "error"},
+        {"view": "failures", "section": "build"},
+        {"view": "failures", "context": -1},
+        {"view": "failures", "context": 6},
+        {"view": "failures", "scan_bytes": 0},
+        {"view": "failures", "scan_bytes": 1048577},
+        {"view": "failures", "byte_offset": -1},
         {"view": "head", "pattern": "x"},
         {"view": "head", "byte_offset": 0},
         {"view": "tail", "section": "build"},
@@ -871,6 +878,202 @@ async def test_search_matches_redacted_display_text_before_keeping_earliest_max_
     assert data["found"] is True
     assert data["truncated"] is True
     assert data["complete"] is False
+
+
+# ---------- failure selection ----------
+
+
+@respx.mock
+async def test_failures_view_selects_early_make_failure_instead_of_long_successful_tail():
+    """Failure view keeps early lint and format errors, not the long successful tail."""
+    # Arrange
+    body = (
+        "Preparing build\n"
+        "Running checks\n"
+        "make: *** [lint] Error 2.\n"
+        "make: *** [format-check] Error 2.\n"
+        "compiler stopped at source.c:12\n"
+        "retrying build\n" + "successful output continues\n" * 400 + "job ultimately succeeded\n"
+    )
+    default_max_chars = 8000
+    assert len(body) > default_max_chars
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="failures")
+
+    # Assert
+    assert data["view"] == "failures"
+    assert data["text"] == (
+        "Preparing build\n"
+        "Running checks\n"
+        "make: *** [lint] Error 2.\n"
+        "make: *** [format-check] Error 2.\n"
+        "compiler stopped at source.c:12\n"
+        "retrying build\n"
+    )
+    assert data["found"] is True
+    assert "make: *** [lint] Error 2." in data["text"]
+    assert "make: *** [format-check] Error 2." in data["text"]
+    assert data["scan_truncated"] is False
+    assert data["complete"] is True
+    assert "job ultimately succeeded" not in data["text"]
+    assert len(respx.calls) == TWO_CALLS
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "make: *** [compile] Error 2.",
+        "make[1]: *** [all] Error 2.",
+        "FAILED tests/test_example.py::test_example - AssertionError",
+        "ERROR: could not resolve dependency",
+        "Traceback (most recent call last):",
+        "Error 17.",
+    ],
+    ids=["make", "recursive-make", "pytest", "error-colon", "traceback", "numeric-error"],
+)
+@respx.mock
+async def test_failures_view_recognizes_fixed_failure_markers(marker):
+    """Failure view recognizes the supported build, pytest, traceback, and error markers."""
+    # Arrange
+    mock_job()
+    mock_head(f"before\n{marker}\nafter\n")
+
+    # Act
+    data = await call_log(view="failures", context=0)
+
+    # Assert
+    assert data["text"] == f"{marker}\n"
+    assert data["found"] is True
+    assert data["complete"] is True
+
+
+@respx.mock
+async def test_failures_view_merges_overlapping_context_windows_in_chronological_order():
+    """Nearby failure markers share context lines without duplication or reordering."""
+    # Arrange
+    body = "before\nmake: *** [compile] Error 2.\nbetween\nerror: missing file\nafter\n"
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="failures", context=1)
+
+    # Assert
+    assert data["text"] == body
+    assert data["found"] is True
+
+
+@respx.mock
+async def test_failures_view_returns_empty_text_when_no_marker_matches():
+    """Ordinary log output is not returned when the bounded scan has no failure marker."""
+    # Arrange
+    mock_job()
+    mock_head("build started\nall checks passed\n")
+
+    # Act
+    data = await call_log(view="failures")
+
+    # Assert
+    assert data["text"] == ""
+    assert data["found"] is False
+    assert data["scan_truncated"] is False
+    assert data["complete"] is True
+
+
+@respx.mock
+async def test_failures_view_cleans_terminal_codes_and_masks_credentials():
+    """Selected failure context is cleaned and secret values are masked before it is returned."""
+    # Arrange
+    mock_job()
+    mock_head("token=secret-value\n\x1b[31mERROR: denied\x1b[0m\nnext line\n")
+
+    # Act
+    data = await call_log(view="failures", context=1)
+
+    # Assert
+    assert data["text"] == "token=[REDACTED]\nERROR: denied\nnext line\n"
+    assert "secret-value" not in data["text"]
+    assert "\x1b" not in data["text"]
+
+
+@respx.mock
+async def test_failures_view_applies_max_chars_to_the_oldest_selected_text():
+    """Failure windows obey max_chars and report when selected output is cut."""
+    # Arrange
+    body = (
+        "first context line\nsecond context line\n"
+        "FAILED tests/test_example.py::test_example - AssertionError\nlast context line\n"
+    )
+    max_chars = 12
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="failures", context=2, max_chars=max_chars)
+
+    # Assert
+    assert data["text"] == body[:12]
+    assert data["chars"] == max_chars
+    assert data["truncated"] is True
+    assert data["complete"] is False
+    assert data["found"] is True
+
+
+@respx.mock
+async def test_failures_view_drops_a_cut_raw_line_then_continues_from_its_byte_offset():
+    """A partial marker line is excluded, and continuation resumes at the next complete raw line."""
+    # Arrange
+    first_window = b"setup\nmake: *** [compile]"
+    body = first_window + b" Error 2.\ncompiler stopped\n"
+    scan_bytes = len(first_window)
+    offset = len(b"setup\n")
+    job_route = mock_job()
+    range_route = mock_trace_window(body[offset:], offset=offset, total=len(body), max_bytes=64)
+    prefix_route = mock_head(body)
+
+    # Act
+    first = await call_log(view="failures", context=0, scan_bytes=scan_bytes)
+    second = await call_log(view="failures", context=0, scan_bytes=64, byte_offset=first["next_offset"])
+
+    # Assert
+    assert first["text"] == ""
+    assert first["found"] is False
+    assert first["scanned_bytes"] == scan_bytes
+    assert first["scan_truncated"] is True
+    assert first["next_offset"] == offset
+    assert second["text"] == "make: *** [compile] Error 2.\n"
+    assert second["found"] is True
+    assert second["scan_truncated"] is False
+    assert second["complete"] is False
+    assert "next_offset" not in second
+    assert prefix_route.call_count == 1
+    assert range_route.call_count == 1
+    assert range_route.calls.last.request.headers["Range"] == f"bytes={offset}-{offset + 64}"
+    assert job_route.call_count == TWO_CALLS
+
+
+@respx.mock
+async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
+    """The default failure scan reads at most 256 KiB of raw trace bytes."""
+    # Arrange
+    default_scan_bytes = 256 * 1024
+    line = b"line\n"
+    complete_lines = default_scan_bytes // len(line)
+    body = line * (complete_lines + 100)
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="failures")
+
+    # Assert
+    assert data["scanned_bytes"] == default_scan_bytes
+    assert data["scan_truncated"] is True
+    assert data["next_offset"] == complete_lines * len(line)
+    assert data["found"] is False
 
 
 # ---------- cleaning ----------

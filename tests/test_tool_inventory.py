@@ -281,7 +281,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         ),
         ("get_job", {"project", "job_id"}, set()),
         ("list_pipeline_schedules", {"project"}, {"active", "limit", "cursor"}),
-        ("get_job_log", {"project", "job_id"}, {"view", "max_chars"}),
+        (
+            "get_job_log",
+            {"project", "job_id"},
+            {"view", "max_chars", "pattern", "section", "context", "scan_bytes", "byte_offset"},
+        ),
     ],
 )
 async def test_new_and_extended_options_are_in_the_schema(tools, name, required, optional):
@@ -345,6 +349,8 @@ def enum_values(prop: dict[str, Any]) -> list[str]:
         ("list_pipeline_schedules", "limit", 1, 100),
         ("get_job_log", "job_id", 1, None),
         ("get_job_log", "max_chars", 1, 16000),
+        ("get_job_log", "scan_bytes", 1, 1048576),
+        ("get_job_log", "context", 0, 5),
     ],
 )
 async def test_ci_ids_are_positive_and_paging_or_output_sizes_are_bounded(tools, name, field, minimum, maximum):
@@ -389,12 +395,12 @@ async def test_status_and_source_are_separate_enums(tools):
 
 
 async def test_get_job_log_views_default_to_tail(tools):
-    """The log tool offers four bounded views, and tail remains the default."""
+    """The log tool offers five bounded views, and tail remains the default."""
     # Arrange
     view = tools["get_job_log"].input_schema["properties"]["view"]
 
     # Act / Assert
-    assert enum_values(view) == ["tail", "head", "search", "section"]
+    assert enum_values(view) == ["tail", "head", "search", "section", "failures"]
     assert view["default"] == "tail"
 
 
