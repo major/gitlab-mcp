@@ -8,6 +8,10 @@ from fastmcp import Client
 
 from gitlab_mcp import mcp
 
+PIPELINE_TEST_REPORT_MAX_BUILDS = 20
+PIPELINE_TEST_REPORT_DEFAULT_LIMIT = 20
+PIPELINE_TEST_REPORT_MAX_LIMIT = 100
+
 # One name per line, alphabetical, so a new tool is a one-line change.
 READ_ONLY_TOOLS = {
     "get_current_user",
@@ -18,6 +22,7 @@ READ_ONLY_TOOLS = {
     "get_merge_request_threads",
     "get_merge_requests",
     "get_pipeline",
+    "get_pipeline_test_report",
     "get_work_item",
     "list_labels",
     "list_merge_requests",
@@ -259,6 +264,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"mr_iid", "schedule_id", "ref", "status", "source", "updated_after", "limit", "cursor"},
         ),
         ("get_pipeline", {"project", "pipeline_id"}, {"statuses", "include_retried", "limit", "cursor"}),
+        (
+            "get_pipeline_test_report",
+            {"project", "pipeline_id"},
+            {"build_ids", "limit", "cursor"},
+        ),
         ("get_job", {"project", "job_id"}, set()),
         ("list_pipeline_schedules", {"project"}, {"active", "limit", "cursor"}),
         ("get_job_log", {"project", "job_id"}, {"view", "max_chars"}),
@@ -316,6 +326,8 @@ def enum_values(prop: dict[str, Any]) -> list[str]:
         ("list_pipelines", "limit", 1, 100),
         ("get_pipeline", "pipeline_id", 1, None),
         ("get_pipeline", "limit", 1, 100),
+        ("get_pipeline_test_report", "pipeline_id", 1, None),
+        ("get_pipeline_test_report", "limit", 1, 100),
         ("get_job", "job_id", 1, None),
         ("list_pipeline_schedules", "limit", 1, 100),
         ("get_job_log", "job_id", 1, None),
@@ -361,7 +373,35 @@ async def test_get_job_log_views_default_to_tail(tools):
     assert view["default"] == "tail"
 
 
-CI_TOOLS = {"list_pipelines", "get_pipeline", "get_job", "list_pipeline_schedules", "get_job_log"}
+async def test_pipeline_test_report_schema_bounds_build_ids_and_defaults_limit(tools):
+    """The test report schema uses strict positive build IDs, bounded arrays, and standard paging inputs."""
+    # Arrange
+    properties = tools["get_pipeline_test_report"].input_schema["properties"]
+    required = set(tools["get_pipeline_test_report"].input_schema.get("required", []))
+
+    # Act
+    build_ids = next(branch for branch in properties["build_ids"]["anyOf"] if branch.get("type") == "array")
+    limit = integer_schema(properties["limit"])
+
+    # Assert
+    assert "build_ids" not in required
+    assert "cursor" not in required
+    assert build_ids["maxItems"] == PIPELINE_TEST_REPORT_MAX_BUILDS
+    assert build_ids["items"]["type"] == "integer"
+    assert build_ids["items"]["minimum"] == 1
+    assert limit["maximum"] == PIPELINE_TEST_REPORT_MAX_LIMIT
+    assert properties["limit"]["default"] == PIPELINE_TEST_REPORT_DEFAULT_LIMIT
+    assert properties["cursor"]["anyOf"]
+
+
+CI_TOOLS = {
+    "list_pipelines",
+    "get_pipeline",
+    "get_pipeline_test_report",
+    "get_job",
+    "list_pipeline_schedules",
+    "get_job_log",
+}
 
 
 @pytest.mark.parametrize("name", sorted(CI_TOOLS))
