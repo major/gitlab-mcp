@@ -1,5 +1,6 @@
 """Job and pipeline schedule metadata readers for the CI tools 🧰."""
 
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -79,8 +80,8 @@ class JobDetail(BaseModel):
     started_at: str | None
     finished_at: str | None
     erased_at: str | None
-    duration_s: float | None = Field(description="Seconds the job ran.")
-    queued_duration_s: float | None = Field(description="Seconds the job waited for a runner.")
+    duration_s: int | None = Field(description="Seconds the job ran, rounded to a whole second.")
+    queued_duration_s: int | None = Field(description="Seconds the job waited for a runner, rounded to a whole second.")
     runner: JobRunner | None
     web_url: str | None
 
@@ -114,6 +115,14 @@ def _job_path(project: str, job_id: int) -> str:
     """Return the REST path of one job, with the project path encoded as one segment."""
     quoted = quote(project, safe="")
     return f"/projects/{quoted}/jobs/{job_id}"
+
+
+def _compact_timestamp(value: str | None) -> str | None:
+    """Trim fractional seconds from a timestamp while preserving its timezone notation."""
+    if value is None:
+        return None
+    timestamp = datetime.fromisoformat(value).isoformat(timespec="seconds")
+    return timestamp.removesuffix("+00:00") + "Z" if value.endswith("Z") else timestamp
 
 
 def _runner(body: dict[str, Any]) -> JobRunner | None:
@@ -150,12 +159,12 @@ async def get_job(client: GitLabClient, project: str, job_id: int) -> JobDetail:
         status=body["status"].lower(),
         allow_failure=body.get("allow_failure"),
         failure_reason=_short_text(body.get("failure_reason")),
-        created_at=body.get("created_at"),
-        started_at=body.get("started_at"),
-        finished_at=body.get("finished_at"),
-        erased_at=body.get("erased_at"),
-        duration_s=body.get("duration"),
-        queued_duration_s=body.get("queued_duration"),
+        created_at=_compact_timestamp(body.get("created_at")),
+        started_at=_compact_timestamp(body.get("started_at")),
+        finished_at=_compact_timestamp(body.get("finished_at")),
+        erased_at=_compact_timestamp(body.get("erased_at")),
+        duration_s=round(body["duration"]) if body.get("duration") is not None else None,
+        queued_duration_s=round(body["queued_duration"]) if body.get("queued_duration") is not None else None,
         runner=_runner(body),
         web_url=body.get("web_url"),
     )

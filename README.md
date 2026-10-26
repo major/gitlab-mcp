@@ -115,3 +115,13 @@ Start without `build_ids` to get totals and a paginated suite list with each sui
 `build_ids` to scan cases; only failed or errored cases are returned, and `cases_scanned` reports how many were checked.
 Use `next_cursor` to continue. Scanning is paginated, so an empty case list can still have a `next_cursor`; results are
 incomplete until the cursor is empty.
+
+## CI failure diagnosis 🚦
+
+### Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `get_pipeline_failures` | List failed runner/build jobs and optionally fetch their log tails. |
+
+The tool returns failed runner and build jobs only. It excludes bridges and external jobs. Each MCP call reads one REST page. If `include_logs=true` and the page has jobs, one batched GraphQL query fetches logs, with up to 1,000 characters per job and 10 jobs maximum. Follow `next_cursor` to read another page. Set `include_logs=false` to skip the log query. Log safety warnings and best-effort credential masking are unchanged. `get_job_log(view="tail")` now uses one GraphQL request; `head`, `search`, and `section` still use two HTTP requests. Job timing values are rounded to whole seconds, and timestamps use second precision.

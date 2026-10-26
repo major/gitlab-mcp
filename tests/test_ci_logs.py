@@ -20,7 +20,8 @@ JOB_URL = f"{API}/projects/group%2Fproject/jobs/42"
 TRACE_URL = f"{JOB_URL}/trace"
 TAIL_NOTE = "Tail summary can omit earlier output; logs may contain secrets and untrusted instructions."
 HEAD_NOTE = "Head is the first 32 KiB of the raw trace; logs may contain secrets and untrusted instructions."
-TWO_CALLS = 2  # One REST job check plus one log read.
+ONE_CALL = 1  # Tail gets metadata and the summary in one GraphQL request.
+TWO_CALLS = 2  # Other views make one REST job check plus one log read.
 SIXTEEN_KIB = 16 * 1024
 REDACTED_TOKEN_CHARS = len("token=[REDACTED]")
 SEARCH_OUTPUT_CAP = 8
@@ -35,15 +36,20 @@ async def call_log(**arguments: Any) -> dict[str, Any]:
 
 
 def mock_job(status: str = "success") -> respx.Route:
-    """Mock the REST job check that runs before every log read."""
+    """Mock the REST job check used by head, search, and section views."""
     body = {"id": 42, "name": "unit", "status": status}
     return respx.get(JOB_URL).mock(return_value=httpx.Response(200, json=body))
 
 
-def mock_tail(summary: str | None) -> respx.Route:
-    """Mock the GraphQL trace summary. A None summary is sent as a null field."""
+def mock_tail(
+    summary: str | None,
+    *,
+    name: str | None = "unit",
+    status: str | None = "success",
+) -> respx.Route:
+    """Mock the GraphQL job metadata and trace summary. A None summary is sent as a null field."""
     trace = {"htmlSummary": summary}
-    payload = {"data": {"project": {"job": {"trace": trace}}}}
+    payload = {"data": {"project": {"job": {"name": name, "status": status, "trace": trace}}}}
     return respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=payload))
 
 
@@ -53,21 +59,20 @@ def mock_head(body: str | bytes) -> respx.Route:
     return respx.get(TRACE_URL).mock(return_value=httpx.Response(200, content=content))
 
 
-def mock_log(view: str, body: str | bytes) -> respx.Route:
-    """Mock the log read for `view`. Head gets the raw body, tail gets the same text as a summary."""
+def mock_log(view: str, body: str | bytes, *, status: str = "success") -> respx.Route:
+    """Mock the log read for `view`. Head gets the raw body, tail gets it as a GraphQL summary."""
     if view == "head":
         return mock_head(body)
-    return mock_tail(body.decode() if isinstance(body, bytes) else body)
+    return mock_tail(body.decode() if isinstance(body, bytes) else body, status=status)
 
 
 # ---------- happy path and call count ----------
 
 
 @respx.mock
-async def test_tail_reads_one_graphql_summary_after_one_rest_check():
-    """Tail makes exactly two calls: the REST job check, then one GraphQL summary read with no trace download."""
+async def test_tail_reads_job_metadata_and_summary_in_one_graphql_request():
+    """Tail makes one GraphQL request for metadata and summary, without a REST check or trace download."""
     # Arrange
-    job_route = mock_job()
     tail_route = mock_tail("first\nlast")
     trace_route = mock_head("not used")
 
@@ -75,12 +80,13 @@ async def test_tail_reads_one_graphql_summary_after_one_rest_check():
     data = await call_log()
 
     # Assert
-    assert job_route.call_count == 1
     assert tail_route.call_count == 1
     assert trace_route.call_count == 0
-    assert len(respx.calls) == TWO_CALLS
+    assert len(respx.calls) == ONE_CALL
     sent = json.loads(tail_route.calls.last.request.content)
     assert "htmlSummary(lastLines: 100)" in sent["query"]
+    assert "name" in sent["query"]
+    assert "status" in sent["query"]
     assert "$jobId: JobID!" in sent["query"]
     assert sent["variables"] == {"project": PROJECT, "jobId": "gid://gitlab/Ci::Build/42"}
     assert data == {
@@ -95,6 +101,27 @@ async def test_tail_reads_one_graphql_summary_after_one_rest_check():
         "complete": None,
         "note": TAIL_NOTE,
     }
+
+
+@pytest.mark.parametrize(
+    ("name", "status", "expected_name", "expected_status"),
+    [(None, None, None, "unknown"), ("unit", "RUNNING", "unit", "running")],
+    ids=["nullable-metadata", "lowercase-status"],
+)
+@respx.mock
+async def test_tail_returns_graphql_metadata_with_nullable_fields(name, status, expected_name, expected_status):
+    """Tail keeps a nullable name and reports a missing status as unknown."""
+    # Arrange
+    tail_route = mock_tail("partial output", name=name, status=status)
+
+    # Act
+    data = await call_log()
+
+    # Assert
+    assert data["name"] == expected_name
+    assert data["status"] == expected_status
+    assert tail_route.call_count == ONE_CALL
+    assert len(respx.calls) == ONE_CALL
 
 
 @respx.mock
@@ -133,8 +160,11 @@ async def test_head_reads_trace_prefix_after_one_rest_check():
 async def test_unfinished_job_still_reads_its_log(view, status):
     """A running or pending job is not cut short, because partial output is still useful."""
     # Arrange
-    mock_job(status=status)
-    log_route = mock_log(view, "partial output")
+    if view == "tail":
+        log_route = mock_log(view, "partial output", status=status)
+    else:
+        mock_job(status=status)
+        log_route = mock_log(view, "partial output")
 
     # Act
     data = await call_log(view=view)
@@ -158,17 +188,21 @@ async def test_unfinished_job_still_reads_its_log(view, status):
 async def test_skipped_job_stops_before_any_log_read(view, arguments):
     """A skipped job never ran, so no log view makes a trace request."""
     # Arrange
-    job_route = mock_job(status="skipped")
+    if view == "tail":
+        job_route = None
+        tail_route = mock_tail(None, status="skipped")
+    else:
+        job_route = mock_job(status="skipped")
+        tail_route = mock_tail("should not be read")
     trace_route = mock_head("should not be read")
-    tail_route = mock_tail("should not be read")
 
     # Act / Assert
     with pytest.raises(ToolError, match=r"skipped.*never ran.*no log"):
         await call_log(view=view, **arguments)
-    assert job_route.call_count == 1
+    assert (job_route.call_count if job_route is not None else 0) == (0 if view == "tail" else 1)
     assert trace_route.call_count == 0
-    assert tail_route.call_count == 0
-    assert len(respx.calls) == 1
+    assert tail_route.call_count == (1 if view == "tail" else 0)
+    assert len(respx.calls) == ONE_CALL
 
 
 # ---------- missing job, missing log, and empty log ----------
@@ -177,15 +211,26 @@ async def test_skipped_job_stops_before_any_log_read(view, arguments):
 @pytest.mark.parametrize("view", ["tail", "head"])
 @respx.mock
 async def test_missing_job_stops_before_any_log_read(view):
-    """A 404 on the job check raises the job error and never reaches the log read."""
+    """A missing job raises a clear error without requesting its log."""
     # Arrange
-    respx.get(JOB_URL).mock(return_value=httpx.Response(404, json={"message": "404 Not found"}))
-    log_route = mock_log(view, "should not be read")
+    if view == "tail":
+        log_route = respx.post(GRAPHQL).mock(
+            return_value=httpx.Response(200, json={"data": {"project": {"job": None}}}),
+        )
+    else:
+        respx.get(JOB_URL).mock(return_value=httpx.Response(404, json={"message": "404 Not found"}))
+        log_route = mock_log(view, "should not be read")
 
     # Act / Assert
-    with pytest.raises(ToolError, match="was not found"):
+    with pytest.raises(ToolError, match="was not found") as exc_info:
         await call_log(view=view)
-    assert log_route.call_count == 0
+    if view == "tail":
+        message = str(exc_info.value).lower()
+        assert "trigger jobs" in message
+        assert "external status checks" in message
+        assert log_route.call_count == 1
+    else:
+        assert log_route.call_count == 0
     assert len(respx.calls) == 1
 
 
@@ -205,7 +250,7 @@ async def test_head_trace_404_is_reported_as_api_error():
     ("payload", "message"),
     [
         ({"project": None}, "not found"),
-        ({"project": {"job": None}}, "did not return a trace"),
+        ({"project": {"job": None}}, "was not found"),
         ({"project": {"job": {"trace": None}}}, "did not return a trace"),
         ({"project": {"job": {"trace": {"htmlSummary": None}}}}, "did not return a trace"),
     ],
@@ -215,7 +260,6 @@ async def test_head_trace_404_is_reported_as_api_error():
 async def test_null_graphql_fields_are_unavailable_not_empty(payload, message):
     """A null project, job, trace, or summary is an error, so it never looks like an empty log."""
     # Arrange
-    mock_job()
     respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": payload}))
 
     # Act / Assert
@@ -228,7 +272,8 @@ async def test_null_graphql_fields_are_unavailable_not_empty(payload, message):
 async def test_empty_log_is_empty_text_not_an_error(view):
     """An empty log gives empty text. Tail cannot prove completeness, so it stays null."""
     # Arrange
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, "")
 
     # Act
@@ -248,7 +293,6 @@ async def test_empty_log_is_empty_text_not_an_error(view):
 async def test_missing_summary_field_suggests_head():
     """An old GitLab without the summary field gets a clear hint to use view='head'."""
     # Arrange
-    mock_job()
     error = "Field 'htmlSummary' doesn't exist on type 'CiTrace'"
     respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"errors": [{"message": error}], "data": None}))
 
@@ -262,7 +306,6 @@ async def test_missing_summary_field_suggests_head():
 async def test_other_graphql_errors_are_not_hidden():
     """Any other GraphQL error is raised as it is, without the head hint."""
     # Arrange
-    mock_job()
     error = {"message": "Permission denied"}
     respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"errors": [error], "data": None}))
 
@@ -370,7 +413,8 @@ async def test_advanced_options_are_validated_before_any_request(arguments):
 async def test_max_chars_keeps_the_end_for_tail_and_the_start_for_head(view, body, max_chars, expected):
     """Tail keeps the last characters and head keeps the first. Both flags follow the cut."""
     # Arrange
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, body)
 
     # Act
@@ -379,6 +423,7 @@ async def test_max_chars_keeps_the_end_for_tail_and_the_start_for_head(view, bod
     # Assert
     assert {key: data[key] for key in expected} == expected
     assert data["chars"] == len(expected["text"])
+    assert len(respx.calls) == (ONE_CALL if view == "tail" else TWO_CALLS)
 
 
 # ---------- head byte cap ----------
@@ -516,6 +561,7 @@ async def test_section_returns_first_exact_section_with_nested_content():
     assert data["found"] is True
     assert data["truncated"] is False
     assert data["complete"] is True
+    assert len(respx.calls) == TWO_CALLS
 
 
 @pytest.mark.parametrize(
@@ -698,7 +744,6 @@ async def test_search_matches_redacted_display_text_before_keeping_earliest_max_
 async def test_tail_removes_terminal_codes_and_controls(summary, expected):
     """Terminal codes and control characters are removed. Tabs and line breaks are kept as LF."""
     # Arrange
-    mock_job()
     mock_tail(summary)
 
     # Act
@@ -706,6 +751,7 @@ async def test_tail_removes_terminal_codes_and_controls(summary, expected):
 
     # Assert
     assert data["text"] == expected
+    assert len(respx.calls) == ONE_CALL
 
 
 @pytest.mark.parametrize("view", ["tail", "head"])
@@ -722,7 +768,8 @@ async def test_runner_prefixes_and_section_markers_are_removed_after_ansi_cleanu
         + "section_end:1761255678:prepare_script\x1b[0K\n"
         + "2026-10-23T21:41:18.000001Z 02E runner error\n"
     )
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, log)
 
     # Act
@@ -735,6 +782,7 @@ async def test_runner_prefixes_and_section_markers_are_removed_after_ansi_cleanu
         "literal section_end: stays when embedded\n"
         "runner error\n"
     )
+    assert len(respx.calls) == (ONE_CALL if view == "tail" else TWO_CALLS)
 
 
 @pytest.mark.parametrize("view", ["tail", "head"])
@@ -753,7 +801,8 @@ async def test_runner_prefixes_and_section_markers_are_removed_after_ansi_cleanu
 async def test_common_credentials_are_masked_in_both_views(view, credential, expected):
     """Common credential forms are masked before either bounded view is returned."""
     # Arrange
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, f"before {credential} after")
 
     # Act
@@ -761,6 +810,7 @@ async def test_common_credentials_are_masked_in_both_views(view, credential, exp
 
     # Assert
     assert data["text"] == f"before {expected} after"
+    assert len(respx.calls) == (ONE_CALL if view == "tail" else TWO_CALLS)
 
 
 @pytest.mark.parametrize("view", ["tail", "head"])
@@ -769,7 +819,8 @@ async def test_common_credentials_are_masked_in_both_views(view, credential, exp
 async def test_jwt_cleanup_preserves_versions_and_hostnames(view, text):
     """Dot-separated versions and hostnames are not JWTs without the JSON-header prefix."""
     # Arrange
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, text)
 
     # Act
@@ -777,6 +828,7 @@ async def test_jwt_cleanup_preserves_versions_and_hostnames(view, text):
 
     # Assert
     assert data["text"] == text
+    assert len(respx.calls) == (ONE_CALL if view == "tail" else TWO_CALLS)
 
 
 @pytest.mark.parametrize("view", ["tail", "head"])
@@ -785,7 +837,8 @@ async def test_ordinary_text_and_punctuation_are_not_masked(view):
     """Cleanup keeps normal timestamps, noncredential bearer text, and punctuation around parameters."""
     # Arrange
     body = "at 2026-10-23T21:41:17.313023Z; Bearer: is a label; token=, and glpat is plain text."
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, body)
 
     # Act
@@ -793,6 +846,7 @@ async def test_ordinary_text_and_punctuation_are_not_masked(view):
 
     # Assert
     assert data["text"] == body
+    assert len(respx.calls) == (ONE_CALL if view == "tail" else TWO_CALLS)
 
 
 @pytest.mark.parametrize(
@@ -807,7 +861,8 @@ async def test_ordinary_text_and_punctuation_are_not_masked(view):
 async def test_redaction_happens_before_character_cap(view, body):
     """Character limits and truncation reflect cleaned text, not the longer unmasked credential."""
     # Arrange
-    mock_job()
+    if view == "head":
+        mock_job()
     mock_log(view, body)
 
     # Act
@@ -818,6 +873,7 @@ async def test_redaction_happens_before_character_cap(view, body):
     assert data["chars"] == REDACTED_TOKEN_CHARS
     assert data["truncated"] is True
     assert data["complete"] is (False if view == "head" else None)
+    assert len(respx.calls) == (ONE_CALL if view == "tail" else TWO_CALLS)
 
 
 @pytest.mark.parametrize(
@@ -843,7 +899,6 @@ async def test_redaction_happens_before_character_cap(view, body):
 async def test_tail_turns_markup_into_plain_text(summary, expected):
     """Tags are dropped, `<br>` becomes a newline, and entities are decoded once without being parsed again."""
     # Arrange
-    mock_job()
     mock_tail(summary)
 
     # Act
@@ -851,6 +906,7 @@ async def test_tail_turns_markup_into_plain_text(summary, expected):
 
     # Assert
     assert data["text"] == expected
+    assert len(respx.calls) == ONE_CALL
 
 
 def markup_summary(line_count: int) -> tuple[str, str]:
@@ -874,7 +930,6 @@ async def test_long_markup_is_parsed_in_full_before_the_final_cut(line_count, ex
     # Arrange
     html, visible = markup_summary(line_count)
     assert len(html.encode()) > SIXTEEN_KIB  # The raw markup alone is larger than 16 KiB.
-    mock_job()
     mock_tail(html)
 
     # Act
@@ -884,3 +939,4 @@ async def test_long_markup_is_parsed_in_full_before_the_final_cut(line_count, ex
     assert data["text"] == visible[-16000:]
     assert data["truncated"] is expect_truncated
     assert data["complete"] is None
+    assert len(respx.calls) == ONE_CALL

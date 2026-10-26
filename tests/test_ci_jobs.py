@@ -32,12 +32,12 @@ def rest_job(**overrides: Any) -> dict[str, Any]:
         "status": "failed",
         "allow_failure": False,
         "failure_reason": "script_failure",
-        "created_at": "2026-10-01T12:00:00.000Z",
-        "started_at": "2026-10-01T12:01:00.000Z",
+        "created_at": "2026-10-01T12:00:00.678Z",
+        "started_at": "2026-10-01T12:01:00.789Z",
         "finished_at": "2026-10-01T12:02:30.500Z",
         "erased_at": None,
-        "duration": 89.5,
-        "queued_duration": 0.4,
+        "duration": 89.6,
+        "queued_duration": 0.6,
         "web_url": "https://gitlab.example.com/group/project/-/jobs/42",
         "pipeline": {"id": 901, "project_id": 1, "ref": "main", "sha": "abc123", "status": "failed"},
         "runner": {"id": 7, "description": "shared-runner", "runner_type": "instance_type", "active": True},
@@ -73,15 +73,41 @@ async def test_returns_timing_failure_and_runner_in_one_request(gitlab_env):
         "status": "failed",
         "allow_failure": False,
         "failure_reason": "script_failure",
-        "created_at": "2026-10-01T12:00:00.000Z",
-        "started_at": "2026-10-01T12:01:00.000Z",
-        "finished_at": "2026-10-01T12:02:30.500Z",
+        "created_at": "2026-10-01T12:00:00Z",
+        "started_at": "2026-10-01T12:01:00Z",
+        "finished_at": "2026-10-01T12:02:30Z",
         "erased_at": None,
-        "duration_s": 89.5,
-        "queued_duration_s": 0.4,
+        "duration_s": 90,
+        "queued_duration_s": 1,
         "runner": {"id": 7, "description": "shared-runner"},
         "web_url": "https://gitlab.example.com/group/project/-/jobs/42",
     }
+
+
+@respx.mock
+async def test_compacts_timezone_offsets_and_preserves_zero_and_null_durations(gitlab_env):
+    """Timestamp precision and timezone offsets stay clear, while zero and null durations remain distinct."""
+    # Arrange
+    job = rest_job(
+        created_at="2026-10-01T12:00:00.987+05:30",
+        started_at="2026-10-01T12:01:00.654-04:00",
+        finished_at="2026-10-01T12:02:30.321Z",
+        erased_at="2026-10-02T09:00:00.123+00:00",
+        duration=0,
+        queued_duration=None,
+    )
+    respx.get(JOB_URL).mock(return_value=httpx.Response(200, json=job))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert data["created_at"] == "2026-10-01T12:00:00+05:30"
+    assert data["started_at"] == "2026-10-01T12:01:00-04:00"
+    assert data["finished_at"] == "2026-10-01T12:02:30Z"
+    assert data["erased_at"] == "2026-10-02T09:00:00+00:00"
+    assert data["duration_s"] == 0
+    assert data["queued_duration_s"] is None
 
 
 @respx.mock
