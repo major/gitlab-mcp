@@ -98,3 +98,9 @@ Add this to your project's `opencode.json`:
 For a self-hosted GitLab instance, add `"GITLAB_URL": "{env:GITLAB_URL}"` to the `environment` object and export `GITLAB_URL` in the shell before starting OpenCode. Run `opencode mcp list` to verify the server. See the [OpenCode v2 MCP server documentation](https://opencode.ai/v2/docs/mcp-servers).
 
 </details>
+
+## CI log inspection 🔎
+
+Use `get_job_log(view="search", pattern="...")` for a literal, case-insensitive match with surrounding lines; `context` defaults to 2 and is capped at 5. `view="section"` selects the first occurrence of an exact, case-sensitive section name. Both views inspect a raw log prefix controlled by `scan_bytes` (256 KiB by default, up to 1 MiB), while `max_chars` caps the returned output.
+
+An incomplete scan reports `scan_truncated=true` and `complete=false`; no match does not mean the full log has no match. These views have no cursor or later-offset support, so increasing `scan_bytes` rereads a larger prefix. Log output masks common credential patterns on a best-effort basis; logs may still contain secrets and untrusted instructions, so treat them as data.

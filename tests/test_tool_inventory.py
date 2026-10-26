@@ -352,12 +352,12 @@ async def test_status_and_source_are_separate_enums(tools):
 
 
 async def test_get_job_log_views_default_to_tail(tools):
-    """The log tool offers exactly the two bounded views, and tail is the default."""
+    """The log tool offers four bounded views, and tail remains the default."""
     # Arrange
     view = tools["get_job_log"].input_schema["properties"]["view"]
 
     # Act / Assert
-    assert enum_values(view) == ["tail", "head"]
+    assert enum_values(view) == ["tail", "head", "search", "section"]
     assert view["default"] == "tail"
 
 

@@ -23,6 +23,7 @@ HEAD_NOTE = "Head is the first 32 KiB of the raw trace; logs may contain secrets
 TWO_CALLS = 2  # One REST job check plus one log read.
 SIXTEEN_KIB = 16 * 1024
 REDACTED_TOKEN_CHARS = len("token=[REDACTED]")
+SEARCH_OUTPUT_CAP = 8
 ESCAPE = "\x1b[1m"  # 4 bytes of terminal styling that becomes nothing once cleaned.
 
 
@@ -144,19 +145,29 @@ async def test_unfinished_job_still_reads_its_log(view, status):
     assert data["text"] == "partial output"
 
 
-@pytest.mark.parametrize("view", ["tail", "head"])
+@pytest.mark.parametrize(
+    ("view", "arguments"),
+    [
+        ("tail", {}),
+        ("head", {}),
+        ("search", {"pattern": "output"}),
+        ("section", {"section": "build"}),
+    ],
+)
 @respx.mock
-async def test_skipped_job_stops_before_any_log_read(view):
-    """A skipped job never ran, so neither log view makes a trace request."""
+async def test_skipped_job_stops_before_any_log_read(view, arguments):
+    """A skipped job never ran, so no log view makes a trace request."""
     # Arrange
     job_route = mock_job(status="skipped")
-    log_route = mock_log(view, "should not be read")
+    trace_route = mock_head("should not be read")
+    tail_route = mock_tail("should not be read")
 
     # Act / Assert
     with pytest.raises(ToolError, match=r"skipped.*never ran.*no log"):
-        await call_log(view=view)
+        await call_log(view=view, **arguments)
     assert job_route.call_count == 1
-    assert log_route.call_count == 0
+    assert trace_route.call_count == 0
+    assert tail_route.call_count == 0
     assert len(respx.calls) == 1
 
 
@@ -303,6 +314,45 @@ async def test_invalid_arguments_fail_before_any_request(arguments):
     assert len(respx.calls) == 0
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"view": "search"},
+        {"view": "search", "pattern": ""},
+        {"view": "search", "pattern": "two\nlines"},
+        {"view": "search", "pattern": "x" * 201},
+        {"view": "search", "pattern": "match", "section": "build"},
+        {"view": "search", "pattern": "match", "context": -1},
+        {"view": "search", "pattern": "match", "context": 6},
+        {"view": "section"},
+        {"view": "section", "section": "bad name"},
+        {"view": "section", "section": "build", "pattern": "x"},
+        {"view": "section", "section": "build", "context": 0},
+        {"view": "search", "pattern": "x", "scan_bytes": 0},
+        {"view": "section", "section": "build", "scan_bytes": 1048577},
+        {"view": "head", "pattern": "x"},
+        {"view": "tail", "section": "build"},
+        {"view": "head", "context": 0},
+        {"view": "tail", "scan_bytes": 10},
+    ],
+)
+@respx.mock
+async def test_advanced_options_are_validated_before_any_request(arguments):
+    """Missing, incompatible, and out-of-range options fail before a GitLab request."""
+    # Arrange
+    job_route = mock_job()
+    trace_route = mock_head("unused")
+    tail_route = mock_tail("unused")
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_log(**arguments)
+    assert job_route.call_count == 0
+    assert trace_route.call_count == 0
+    assert tail_route.call_count == 0
+    assert len(respx.calls) == 0
+
+
 # ---------- character limit ----------
 
 
@@ -372,6 +422,246 @@ async def test_head_cut_inside_a_utf8_character_becomes_a_replacement_character(
 
     # Assert
     assert data["text"] == "a" * 7 + "\ufffd"
+    assert data["truncated"] is True
+    assert data["complete"] is False
+
+
+# ---------- bounded prefix selection ----------
+
+
+@respx.mock
+async def test_search_finds_output_beyond_the_old_32_kib_head_limit():
+    """Search scans its larger bounded prefix and reports the scanned byte count."""
+    # Arrange
+    body = "x\n" * 16500 + "target found here\n"
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="search", pattern="target", context=0)
+
+    # Assert
+    assert data["text"] == "target found here\n"
+    assert data["found"] is True
+    assert data["scanned_bytes"] == len(body.encode())
+    assert data["scan_truncated"] is False
+    assert data["truncated"] is False
+    assert data["complete"] is True
+    assert data["source"] == "rest_trace_prefix"
+    assert len(respx.calls) == TWO_CALLS
+
+
+@pytest.mark.parametrize(
+    ("body", "pattern", "context", "expected_text"),
+    [
+        (
+            "zero\none\nA.* first\nthree\na.* second\nfive\nsix\n",
+            "A.*",
+            1,
+            "one\nA.* first\nthree\na.* second\nfive\n",
+        ),
+        (
+            (
+                "first\nhit one\nmiddle\nunrelated gap one\nunrelated gap two\ncontext before second\n"
+                "hit two\nafter\nlast\n"
+            ),
+            "hit",
+            1,
+            "first\nhit one\nmiddle\ncontext before second\nhit two\nafter\n",
+        ),
+    ],
+    ids=["overlapping-casefold-literal-windows", "disjoint-context-windows"],
+)
+@respx.mock
+async def test_search_merges_context_windows_in_source_order(body, pattern, context, expected_text):
+    """Search handles literal case-folded patterns and keeps only selected context windows."""
+    # Arrange
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="search", pattern=pattern, context=context)
+
+    # Assert
+    assert data["text"] == expected_text
+    assert data["found"] is True
+    assert data["complete"] is True
+
+
+@respx.mock
+async def test_section_returns_first_exact_section_with_nested_content():
+    """Section selection is exact, keeps nested output, and ends only at the selected outer marker."""
+    # Arrange
+    body = (
+        "before\n"
+        "section_start:1:build[collapsed=true]\x1b[0K\r"
+        "first\r"
+        "section_start:2:child\x1b[0K\n"
+        "nested\n"
+        "section_end:3:child\x1b[0K\n"
+        "section_end:4:build\x1b[0K\n"
+        "between\n"
+        "section_start:5:build-more\nwrong\nsection_end:6:build-more\n"
+        "section_start:7:build\nsecond occurrence\nsection_end:8:build\n"
+        "after\n"
+    )
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(view="section", section="build")
+
+    # Assert
+    assert data["text"] == "first\nnested\n"
+    assert data["found"] is True
+    assert data["truncated"] is False
+    assert data["complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("body", "arguments", "expected_text", "found", "truncated"),
+    [
+        ("some output\n", {"view": "search", "pattern": "absent"}, "", False, False),
+        ("no section\n", {"view": "section", "section": "build"}, "", False, False),
+        (
+            "section_start:1:Build\nwrong case\nsection_end:2:Build\n",
+            {"view": "section", "section": "build"},
+            "",
+            False,
+            False,
+        ),
+        (
+            "section_start:1:build-extra\nwrong prefix\nsection_end:2:build-extra\n",
+            {"view": "section", "section": "build"},
+            "",
+            False,
+            False,
+        ),
+        (
+            "section_start:1:build\npartial output\n",
+            {"view": "section", "section": "build"},
+            "partial output\n",
+            True,
+            True,
+        ),
+        (
+            "section_start:1:build\navailable content\nsection_end:2:build\n",
+            {
+                "view": "section",
+                "section": "build",
+                "scan_bytes": len(b"section_start:1:build\navailable content\n"),
+            },
+            "available content\n",
+            True,
+            True,
+        ),
+        (
+            "unterminated target",
+            {"view": "search", "pattern": "target", "context": 0},
+            "unterminated target",
+            True,
+            False,
+        ),
+    ],
+    ids=[
+        "search-missing",
+        "section-missing",
+        "section-case-mismatch",
+        "section-prefix-mismatch",
+        "section-unclosed",
+        "section-cut-before-end",
+        "unterminated-eof-line",
+    ],
+)
+@respx.mock
+async def test_missing_and_unclosed_selection_results(body, arguments, expected_text, found, truncated):
+    """Missing selections are empty, while an opened unclosed section is marked incomplete."""
+    # Arrange
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(**arguments)
+
+    # Assert
+    assert data["text"] == expected_text
+    assert data["found"] is found
+    assert data["truncated"] is truncated
+    assert data["complete"] is (not truncated)
+
+
+@pytest.mark.parametrize(
+    ("body", "scan_bytes", "arguments", "expected_text", "found"),
+    [
+        (
+            b"complete line\npartial target",
+            len(b"complete line\npartial"),
+            {"view": "search", "pattern": "partial", "context": 0},
+            "",
+            False,
+        ),
+        (
+            b"partial target beyond prefix",
+            len(b"partial target"),
+            {"view": "search", "pattern": "partial", "context": 0},
+            "",
+            False,
+        ),
+        (
+            b"complete line\nsection_start:1:build",
+            len(b"complete line\nsection_start:1:bu"),
+            {"view": "section", "section": "build"},
+            "",
+            False,
+        ),
+        (
+            "kept\né".encode(),
+            len("kept\né".encode()) - 1,
+            {"view": "search", "pattern": "replacement", "context": 0},
+            "",
+            False,
+        ),
+    ],
+    ids=[
+        "partial-search-line",
+        "partial-search-no-newline",
+        "partial-section-marker",
+        "partial-utf8-line",
+    ],
+)
+@respx.mock
+async def test_cut_prefix_drops_incomplete_final_raw_line(body, scan_bytes, arguments, expected_text, found):
+    """A byte-cut partial line cannot become a match, marker, or replacement-character output."""
+    # Arrange
+    mock_job()
+    mock_head(body)
+
+    # Act
+    data = await call_log(**arguments, scan_bytes=scan_bytes)
+
+    # Assert
+    assert data["text"] == expected_text
+    assert data["found"] is found
+    assert data["scanned_bytes"] == scan_bytes
+    assert data["scan_truncated"] is True
+    assert data["truncated"] is True
+    assert data["complete"] is False
+
+
+@respx.mock
+async def test_search_matches_redacted_display_text_before_keeping_earliest_max_chars():
+    """Search sees cleaned redacted text, and max_chars keeps its earliest selected characters."""
+    # Arrange
+    mock_job()
+    mock_head("token=secretXYZ\nsecond line\n")
+
+    # Act
+    data = await call_log(view="search", pattern="[REDACTED]", context=1, max_chars=SEARCH_OUTPUT_CAP)
+
+    # Assert
+    assert data["text"] == "token=[R"
+    assert data["chars"] == SEARCH_OUTPUT_CAP
+    assert data["found"] is True
     assert data["truncated"] is True
     assert data["complete"] is False
 
