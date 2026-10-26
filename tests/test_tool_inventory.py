@@ -280,7 +280,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"project"},
             {"mr_iid", "schedule_id", "ref", "status", "source", "updated_after", "limit", "cursor"},
         ),
-        ("get_pipeline", {"project", "pipeline_id"}, {"statuses", "include_retried", "limit", "cursor"}),
+        (
+            "get_pipeline",
+            {"project", "pipeline_id"},
+            {"statuses", "include_retried", "include_failure_excerpts", "limit", "cursor"},
+        ),
         (
             "get_pipeline_test_report",
             {"project", "pipeline_id"},
@@ -388,6 +392,15 @@ async def test_get_pipeline_failures_schema_defaults_and_required_fields(tools):
     # Act / Assert
     assert set(schema["required"]) == {"project", "pipeline_id"}
     assert {name: properties[name]["default"] for name in expected_defaults} == expected_defaults
+
+
+async def test_get_pipeline_failure_excerpts_default_to_disabled(tools):
+    """Pipeline detail keeps failure excerpts disabled by default."""
+    # Arrange
+    property_schema = tools["get_pipeline"].input_schema["properties"]["include_failure_excerpts"]
+
+    # Act / Assert
+    assert property_schema["default"] is False
 
 
 async def test_status_and_source_are_separate_enums(tools):

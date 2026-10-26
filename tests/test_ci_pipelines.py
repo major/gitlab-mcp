@@ -18,6 +18,8 @@ PROJECT = "group/project"
 ENCODED_PROJECT = "group%2Fproject"
 PIPELINES_URL = f"{API}/projects/{ENCODED_PROJECT}/pipelines"
 TEXT_LIMIT = 200  # Matches the cap for names and stages in ci_pipelines.
+TWO_GRAPHQL_REQUESTS = 2
+EXCERPT_CHAR_LIMIT = 1000
 LIST_HEADER = "pipeline_id\tname\tstatus\tsource\tref\tsha\tcreated\tupdated"
 JOB_HEADER = (
     "job_id\ttype\tname\tstage\tstatus\tallow_failure\tduration_s\tscheduled_at"
@@ -116,6 +118,15 @@ def graphql_response(project: dict[str, Any] | None) -> httpx.Response:
 def pipeline_response(pipeline: dict[str, Any] | None) -> httpx.Response:
     """Answer a `project.pipeline` query with one pipeline, or with null when it does not exist."""
     return graphql_response({"pipeline": pipeline})
+
+
+def failure_log_response(*summaries: str | None) -> httpx.Response:
+    """Build an aliased log response for summaries in the requested job order."""
+    project = {
+        f"job_{index}": {"trace": {"htmlSummary": summary}} if summary is not None else None
+        for index, summary in enumerate(summaries)
+    }
+    return graphql_response(project)
 
 
 def sent_variables(route: respx.Route, index: int = -1) -> dict[str, Any]:
@@ -639,6 +650,281 @@ async def test_empty_job_page_is_header_only_and_has_no_cursor(gitlab_env):
 
 
 @respx.mock
+async def test_failure_excerpts_are_disabled_without_changing_requests_or_output(gitlab_env):
+    """The default call with a failed build job keeps the old output and sends no log request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=pipeline_response(
+            pipeline_node(job_node("Ci::Build", 11, status="FAILED")),
+        ),
+    )
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901})
+
+    # Assert
+    assert route.call_count == 1
+    assert len(respx.calls) == 1
+    assert set(data) == {
+        "pipeline_id",
+        "status",
+        "source",
+        "ref",
+        "sha",
+        "created_at",
+        "started_at",
+        "duration_s",
+        "web_url",
+        "jobs",
+    }
+    assert rows(data["jobs"])[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("order", ["newest_first", "oldest_first"], ids=["newest", "oldest"])
+@respx.mock
+async def test_failure_excerpts_follow_displayed_order_and_only_select_failed_builds(gitlab_env, order):
+    """Excerpt jobs follow the displayed page order and exclude failed bridges and external statuses."""
+    # Arrange
+    page = pipeline_node(
+        job_node("Ci::Build", 12, status="FAILED"),
+        job_node("Ci::Bridge", 13, status="FAILED"),
+        job_node("Ci::Build", 14, status="SUCCESS"),
+        job_node("GenericCommitStatus", 15, status="FAILED"),
+        job_node("Ci::Build", 11, status="FAILED"),
+        has_next=True,
+        cursor="next-page",
+        has_previous=True,
+        start_cursor="previous-page",
+    )
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[pipeline_response(page), failure_log_response("first output", "second output")],
+    )
+    expected_ids = [12, 11] if order == "newest_first" else [11, 12]
+
+    # Act
+    data = await call_tool(
+        "get_pipeline",
+        {"pipeline_id": 901, "order": order, "include_failure_excerpts": True},
+    )
+
+    # Assert
+    assert route.call_count == TWO_GRAPHQL_REQUESTS
+    assert [entry["job_id"] for entry in data["failure_excerpts"]] == expected_ids
+    assert [entry["text"] for entry in data["failure_excerpts"]] == ["first output", "second output"]
+    assert sent_variables(route, 1) == {
+        "project": PROJECT,
+        "job0": f"gid://gitlab/Ci::Build/{expected_ids[0]}",
+        "job1": f"gid://gitlab/Ci::Build/{expected_ids[1]}",
+    }
+    assert data["excerpt_safety_note"]
+    assert "last 100 lines" in data["excerpt_safety_note"]
+    assert data["next_cursor"]
+    scope = json.loads(base64.urlsafe_b64decode(data["next_cursor"]))["scope"]
+    assert scope["include_failure_excerpts"] is True
+    assert set(scope) == {
+        "tool",
+        "project",
+        "pipeline_id",
+        "statuses",
+        "include_retried",
+        "order",
+        "limit",
+        "include_failure_excerpts",
+    }
+    assert "excerpt_warning" not in data
+    assert "failure_excerpts_omitted" not in data
+
+
+@respx.mock
+async def test_failure_excerpt_cap_counts_only_extra_failed_builds_on_current_page(gitlab_env):
+    """Only five failed builds are fetched, while failed bridges and external statuses do not count as omitted."""
+    # Arrange
+    builds = [job_node("Ci::Build", number, status="FAILED") for number in range(20, 14, -1)]
+    page = pipeline_node(
+        *builds,
+        job_node("Ci::Bridge", 14, status="FAILED"),
+        job_node("CommitStatus", 13, status="FAILED"),
+        has_next=True,
+        cursor="next-page",
+    )
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[pipeline_response(page), failure_log_response(*(f"log {number}" for number in range(20, 15, -1)))],
+    )
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
+
+    # Assert
+    assert route.call_count == TWO_GRAPHQL_REQUESTS
+    assert [entry["job_id"] for entry in data["failure_excerpts"]] == [20, 19, 18, 17, 16]
+    assert data["failure_excerpts_omitted"] == 1
+    assert "job5" not in json.loads(route.calls[1].request.content)["variables"]
+
+
+@respx.mock
+async def test_failure_excerpts_are_masked_bounded_and_distinguish_missing_from_empty(gitlab_env):
+    """Excerpts keep at most 1000 masked characters and distinguish unavailable from empty summaries."""
+    # Arrange
+    jobs = [
+        job_node("Ci::Build", 11, status="FAILED"),
+        job_node("Ci::Build", 12, status="FAILED"),
+    ]
+    long_summary = "x" * 1100 + " token=secretXYZ"
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            pipeline_response(pipeline_node(*jobs)),
+            failure_log_response(long_summary, ""),
+        ],
+    )
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
+
+    # Assert
+    assert route.call_count == TWO_GRAPHQL_REQUESTS
+    first, second = data["failure_excerpts"]
+    assert first["available"] is True
+    assert first["chars"] == EXCERPT_CHAR_LIMIT
+    assert first["truncated"] is True
+    assert len(first["text"]) <= EXCERPT_CHAR_LIMIT
+    assert "secretXYZ" not in first["text"]
+    assert "[REDACTED]" in first["text"]
+    assert second["available"] is True
+    assert second["text"] == ""
+    assert second["chars"] == 0
+    assert second["truncated"] is False
+
+
+@respx.mock
+async def test_missing_failure_excerpt_is_unavailable_but_empty_excerpt_is_available(gitlab_env):
+    """A missing aliased job result is unavailable, while an empty summary is a real empty excerpt."""
+    # Arrange
+    response = graphql_response(
+        {
+            "pipeline": pipeline_node(
+                job_node("Ci::Build", 11, status="FAILED"),
+                job_node("Ci::Build", 12, status="FAILED"),
+            ),
+        },
+    )
+    log_data = graphql_response({"job_0": None, "job_1": {"trace": {"htmlSummary": ""}}})
+    route = respx.post(GRAPHQL).mock(side_effect=[response, log_data])
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
+
+    # Assert
+    assert route.call_count == TWO_GRAPHQL_REQUESTS
+    unavailable, empty = data["failure_excerpts"]
+    assert unavailable["available"] is False
+    assert unavailable["text"] == ""
+    assert empty["available"] is True
+    assert empty["text"] == ""
+
+
+@respx.mock
+async def test_log_graphql_error_keeps_job_table_and_adds_excerpt_warning(gitlab_env):
+    """A log batch failure adds unavailable excerpts and a warning without losing pipeline metadata or jobs."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            pipeline_response(pipeline_node(job_node("Ci::Build", 11, status="FAILED"))),
+            httpx.Response(200, json={"errors": [{"message": "Denied"}], "data": None}),
+        ],
+    )
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
+
+    # Assert
+    assert route.call_count == TWO_GRAPHQL_REQUESTS
+    assert rows(data["jobs"])[0]["job_id"] == "11"
+    assert data["failure_excerpts"][0]["available"] is False
+    assert data["excerpt_warning"]
+    assert "Denied" in data["excerpt_warning"]
+
+
+@pytest.mark.parametrize(
+    "jobs",
+    [
+        (),
+        (job_node("Ci::Build", 11, status="SUCCESS"),),
+        (job_node("Ci::Bridge", 11, status="FAILED"), job_node("GenericCommitStatus", 12, status="FAILED")),
+    ],
+    ids=["empty", "no-failed-builds", "failed-non-builds"],
+)
+@respx.mock
+async def test_empty_or_ineligible_page_does_not_request_failure_logs(gitlab_env, jobs):
+    """No selected failed build jobs means no second request and an empty excerpt list."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node(*jobs)))
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
+
+    # Assert
+    assert route.call_count == 1
+    assert data["failure_excerpts"] == []
+    assert data["excerpt_safety_note"]
+
+
+@respx.mock
+async def test_legacy_job_cursor_scope_is_accepted_when_excerpts_are_disabled(gitlab_env):
+    """A cursor with the pre-excerpt scope remains valid for the default call."""
+    # Arrange
+    scope = {
+        "tool": "get_pipeline",
+        "project": PROJECT,
+        "pipeline_id": 901,
+        "statuses": None,
+        "include_retried": False,
+        "order": "newest_first",
+        "limit": 50,
+    }
+    cursor = encode_payload({"scope": scope, "after": "legacy-cursor"})
+    route = respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node()))
+
+    # Act
+    await call_tool("get_pipeline", {"pipeline_id": 901, "cursor": cursor})
+
+    # Assert
+    assert route.call_count == 1
+    assert sent_variables(route)["after"] == "legacy-cursor"
+
+
+@pytest.mark.parametrize(
+    ("scope_with_excerpts", "requested_excerpts"),
+    [(False, True), (True, False)],
+    ids=["disabled-to-enabled", "enabled-to-disabled"],
+)
+@respx.mock
+async def test_job_cursor_rejects_failure_excerpt_toggle(gitlab_env, scope_with_excerpts, requested_excerpts):
+    """Changing the excerpt option invalidates cursors, while disabled legacy scope remains unchanged."""
+    # Arrange
+    scope = {
+        "tool": "get_pipeline",
+        "project": PROJECT,
+        "pipeline_id": 901,
+        "statuses": None,
+        "include_retried": False,
+        "order": "newest_first",
+        "limit": 50,
+    }
+    if scope_with_excerpts:
+        scope["include_failure_excerpts"] = True
+    cursor = encode_payload({"scope": scope, "after": "cursor"})
+    route = respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Invalid cursor"):
+        await call_tool(
+            "get_pipeline",
+            {"pipeline_id": 901, "include_failure_excerpts": requested_excerpts, "cursor": cursor},
+        )
+    assert route.call_count == 0
+
+
+@respx.mock
 async def test_next_cursor_resumes_jobs_with_the_same_arguments(gitlab_env):
     """A job page with more jobs returns a cursor that requests the next page with the same arguments."""
     # Arrange
@@ -649,6 +935,15 @@ async def test_next_cursor_resumes_jobs_with_the_same_arguments(gitlab_env):
         ],
     )
     first = await call_tool("get_pipeline", {"pipeline_id": 901, "statuses": ["failed"]})
+    assert json.loads(base64.urlsafe_b64decode(first["next_cursor"]))["scope"] == {
+        "tool": "get_pipeline",
+        "project": PROJECT,
+        "pipeline_id": 901,
+        "statuses": ["failed"],
+        "include_retried": False,
+        "order": "newest_first",
+        "limit": 50,
+    }
 
     # Act
     second = await call_tool(
