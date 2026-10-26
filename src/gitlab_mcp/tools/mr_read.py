@@ -73,8 +73,7 @@ query(
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
 query(
-  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeJobs: Boolean! = false,
-  $includeLabels: Boolean!
+  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeLabels: Boolean!
 ) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
@@ -89,7 +88,7 @@ query(
       detailedMergeStatus shouldBeRebased conflicts
       approved approvedBy { nodes { username } }
       reviewers { nodes { username mergeRequestInteraction { reviewState } } }
-      headPipeline { status id @include(if: $includeJobs) }
+      headPipeline { status id }
       autoMergeStrategy
       diffStatsSummary { additions deletions fileCount }
       resolvableDiscussionsCount resolvedDiscussionsCount
@@ -266,6 +265,11 @@ class MergeRequestDetail(BaseModel):
     approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     reviewers: list[Reviewer] = Field(default_factory=list, exclude_if=lambda v: not v)
     pipeline_status: str = Field(default="", exclude_if=lambda v: not v)  # Head pipeline, lowercased.
+    latest_pipeline_id: int | None = Field(
+        default=None,
+        description="Numeric ID of the latest pipeline attached to the merge request.",
+        exclude_if=lambda value: value is None,
+    )
     failed_jobs: str = Field(default="", exclude_if=lambda value: not value)
     jobs_complete: bool = Field(default=True, exclude_if=lambda value: value)
     auto_merge_strategy: str = Field(default="", exclude_if=lambda v: not v)
@@ -791,6 +795,9 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     author = node["author"]
     # headPipeline can be null, so check before reading it.
     pipeline = node["headPipeline"]
+    pipeline_id = (
+        numeric_gid(pipeline.get("id"), {"Ci::Pipeline"}) if pipeline and pipeline.get("id") is not None else None
+    )
     merged_at, merged_by = _merged_metadata(node)
     description, description_truncated = _cap_description(
         node.get("description") if include_description else None,
@@ -828,6 +835,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
         reviewers=[_to_reviewer(reviewer) for reviewer in node["reviewers"]["nodes"]],
         pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
+        latest_pipeline_id=pipeline_id,
         auto_merge_strategy=node["autoMergeStrategy"] or "",
         changes=_to_diff_summary(node["diffStatsSummary"]),
         threads=_to_thread_index(node),
@@ -980,6 +988,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
     - The description is skipped by default. Set `include_description=true` to read it when you need it.
     - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
+    - `latest_pipeline_id` is the numeric ID of the head pipeline when one is attached, even when jobs are not
+      requested.
     - `issue_keys` lists unique uppercase-prefix-number keys from the title on every call and from the raw description
       when included, up to 100. `issue_key_prefixes` filters by literal prefixes, not regular expressions. Set
       `issue_key_pattern` to replace that extraction with a caller-authored regex; it cannot be combined with prefixes.
@@ -1002,7 +1012,6 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         project,
         iid,
         includeDescription=include_description,
-        includeJobs=include_jobs,
         includeLabels=include_labels,
     )
     detail = _to_detail(
@@ -1020,14 +1029,10 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     if not include_jobs or pipeline is None:
         return detail
 
-    pipeline_gid = pipeline.get("id")
-    pipeline_match = (
-        re.fullmatch(r"gid://gitlab/Ci::Pipeline/([0-9]+)", pipeline_gid) if isinstance(pipeline_gid, str) else None
-    )
-    if pipeline_match is None:
+    pipeline_id = detail.latest_pipeline_id
+    if pipeline_id is None:
         raise ToolError("The pipeline ID format is invalid; expected a numeric pipeline GID.")  # noqa: TRY003
 
-    pipeline_id = pipeline_match.group(1)
     jobs: list[dict[str, Any]] = []
     page = 1
     for _ in range(MAX_PAGES):
