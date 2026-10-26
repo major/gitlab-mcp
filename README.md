@@ -122,6 +122,10 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 
 </details>
 
+## Pipeline job ordering 🚦
+
+`get_pipeline` defaults to `order="newest_first"`, which lists jobs by descending numeric job ID. Use `order="oldest_first"` for ascending job IDs across pages, with one GraphQL request per call. This is creation order by ID, not stage order: retries and dynamically created jobs can appear later. Keep the same order, filters, and page size when following `next_cursor`.
+
 ## CI log inspection 🔎
 
 Use `get_job_log(view="search", pattern="...")` for a literal, case-insensitive match with surrounding lines; `context` defaults to 2 and is capped at 5. `view="section"` selects the first occurrence of an exact, case-sensitive section name. Both views inspect at most `scan_bytes` raw bytes (256 KiB by default, up to 1 MiB), while `max_chars` caps the returned output.

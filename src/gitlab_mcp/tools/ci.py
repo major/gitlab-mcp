@@ -114,6 +114,15 @@ async def get_pipeline(  # noqa: PLR0913, PLR0917 - each argument is one filter 
         bool,
         Field(description="True includes older attempts of retried jobs. False shows only the latest attempt."),
     ] = False,
+    order: Annotated[
+        Literal["newest_first", "oldest_first"],
+        Field(
+            description=(
+                "Order by numeric job ID: newest_first is descending and oldest_first is ascending. This is not "
+                "stage order."
+            ),
+        ),
+    ] = "newest_first",
     limit: Annotated[int, Field(ge=1, le=100, description="Jobs per page, from 1 to 100.")] = 50,
     cursor: Annotated[
         str | None,
@@ -124,9 +133,9 @@ async def get_pipeline(  # noqa: PLR0913, PLR0917 - each argument is one filter 
 
     The `type` column tells the job kinds apart. `build` jobs run on a runner, so `get_job` can read them. `bridge`
     jobs start a downstream pipeline, shown in the downstream columns. `external` jobs are commit statuses from other
-    CI systems, so `get_job` cannot read them. `statuses` keeps only jobs with those states. `next_cursor` fetches the
-    next page of matching jobs and is empty when none remain. The cursor is rejected when any argument changes.
-    An empty `jobs` table means no matching jobs.
+    CI systems, so `get_job` cannot read them. `order` selects numeric job ID order, not stage order. `statuses` keeps
+    only jobs with those states. `next_cursor` fetches the next page of matching jobs and is empty when none remain.
+    The cursor is rejected when any argument changes. An empty `jobs` table means no matching jobs.
     """
     return await _ci_pipelines.get_pipeline(
         client=get_client(ctx),
@@ -135,6 +144,7 @@ async def get_pipeline(  # noqa: PLR0913, PLR0917 - each argument is one filter 
         # A new list, because list[CiStatus] is not a list[str] for the type checker.
         statuses=None if statuses is None else [*statuses],
         include_retried=include_retried,
+        order=order,
         limit=limit,
         cursor=cursor,
     )
