@@ -25,6 +25,7 @@ THREE_PAGES = 3
 REASON_CAP = 200
 OLD_CONTEXT_LINE = 8
 NEW_CONTEXT_LINE = 11
+MIXED_INLINE_LINE = 2
 MR_URL = f"{BASE}/projects/{ENCODED_PROJECT}/merge_requests/{IID}"
 DIFF_URL = f"{MR_URL}/diffs"
 DISCUSSIONS_URL = f"{MR_URL}/discussions"
@@ -1359,3 +1360,211 @@ async def test_validate_only_ignores_people_and_sends_no_people_requests(gitlab_
     assert "warning" not in data
     assert not graphql_route.called
     assert not post_route.called
+
+
+@respx.mock
+async def test_general_note_validation_skips_diff_scan(gitlab_env):
+    """A general note needs both MR SHA checks but does not read diff pages."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([diff_file("unused.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[{"body": "A general review comment."}], validate_only=True)
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert len(mr_route.calls) == TWO_POSTS
+    assert not diff_route.called
+    assert not post_route.called
+
+
+@respx.mock
+async def test_general_note_posts_body_without_position_and_verifies_ids(gitlab_env):
+    """A general discussion uses the existing endpoint without a position and keeps its IDs."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(
+        return_value=response({"id": "general-discussion", "notes": [{"id": POSTED_NOTE_ID}]}, status=201)
+    )
+
+    # Act
+    data = await call_tool(notes=[{"body": "A general review comment."}])
+
+    # Assert
+    assert json.loads(post_route.calls[0].request.content) == {"body": "A general review comment."}
+    assert data["results"] == [
+        {
+            "index": 0,
+            "status": "posted",
+            "note_id": POSTED_NOTE_ID,
+            "discussion_id": "general-discussion",
+        }
+    ]
+    assert len(mr_route.calls) == TWO_POSTS
+    assert not diff_route.called
+
+
+@respx.mock
+async def test_general_note_with_malformed_returned_position_is_unverified_and_stops(gitlab_env):
+    """A malformed non-null returned position is not mistaken for an absent general-note position."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(
+        return_value=response(
+            {"id": "general-discussion", "notes": [{"id": POSTED_NOTE_ID, "position": "invalid"}]},
+            status=201,
+        )
+    )
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(
+        notes=[{"body": "First general comment."}, {"body": "Second general comment."}],
+        add_reviewers=["alice"],
+    )
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["unverified", "unattempted"]
+    assert data["results"][0]["note_id"] == POSTED_NOTE_ID
+    assert data["results"][0]["discussion_id"] == "general-discussion"
+    assert "position did not match" in data["warning"]
+    assert len(post_route.calls) == 1
+    assert len(mr_route.calls) == TWO_POSTS
+    assert not diff_route.called
+    assert not graphql_route.called
+
+
+@respx.mock
+async def test_mixed_general_file_and_line_notes_keep_order_and_scan_only_file_paths(gitlab_env):
+    """General, file, and line notes post in request order with positions only for diff notes."""
+    # Arrange
+    _, diff_route = add_preflight([([diff_file("src.py", patch="@@ -1,2 +1,2 @@\n one\n two")], None)])
+
+    def echo_general_or_position(request: httpx.Request) -> httpx.Response:
+        """Return matching IDs and include a position only when the request supplied one."""
+        payload = json.loads(request.content)
+        note: dict[str, Any] = {"id": POSTED_NOTE_ID}
+        if "position" in payload:
+            note["position"] = payload["position"]
+        return response({"id": f"discussion-{len(post_route.calls) + 1}", "notes": [note]}, status=201)
+
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=echo_general_or_position)
+    notes = [
+        {"body": "General comment."},
+        {"file": "src.py", "body": "File comment."},
+        review_note("src.py", 2, "Line comment."),
+    ]
+
+    # Act
+    data = await call_tool(notes=notes)
+
+    # Assert
+    payloads = [json.loads(call.request.content) for call in post_route.calls]
+    assert [item["body"] for item in payloads] == ["General comment.", "File comment.", "Line comment."]
+    assert payloads[0] == {"body": "General comment."}
+    assert payloads[1]["position"] == {
+        "position_type": "file",
+        "old_path": "src.py",
+        "new_path": "src.py",
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+    }
+    assert payloads[2]["position"]["new_line"] == MIXED_INLINE_LINE
+    assert [item["index"] for item in data["results"]] == [0, 1, 2]
+    assert [item["status"] for item in data["results"]] == ["posted"] * 3
+    assert "position" not in data["results"][0]
+    assert data["results"][1]["position"] == {"path": "src.py"}
+    assert data["results"][2]["position"] == {"path": "src.py", "line": MIXED_INLINE_LINE}
+    assert len(diff_route.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("merge_requests", "request_count", "warning_part"),
+    [
+        pytest.param([merge_request(sha="d" * 40, head_sha="d" * 40)], 1, "stale", id="stale-sha"),
+        pytest.param(
+            [merge_request(), merge_request(sha="d" * 40, head_sha="d" * 40)],
+            TWO_POSTS,
+            "changed during preflight",
+            id="changed-sha",
+        ),
+    ],
+)
+@respx.mock
+async def test_general_note_sha_checks_stop_before_post(gitlab_env, merge_requests, request_count, warning_part):
+    """Stale and changed MR SHA values stop general-note batches before any write."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([], None)], merge_requests=merge_requests)
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[{"body": "General comment."}])
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert warning_part in data["warning"]
+    assert len(mr_route.calls) == request_count
+    assert not diff_route.called
+    assert not post_route.called
+
+
+@respx.mock
+async def test_invalid_file_note_in_mixed_batch_prevents_general_note_post(gitlab_env):
+    """An invalid diff note makes the whole mixed batch atomic and skips people changes."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(
+        notes=[{"body": "General comment."}, review_note("src.py", 99)],
+        add_reviewers=["alice"],
+    )
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["validated", "failed"]
+    assert "No notes were posted" in data["warning"]
+    assert not post_route.called
+    assert not graphql_route.called
+
+
+@respx.mock
+async def test_line_without_file_is_rejected_before_requests(gitlab_env):
+    """A line coordinate cannot identify a discussion position without a file path."""
+    # Arrange
+    mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    result = await call_tool_result(notes=[{"line": 1, "body": "Missing path."}])
+
+    # Assert
+    assert result.is_error
+    assert not mr_route.called
+    assert not post_route.called
+
+
+@respx.mock
+async def test_unknown_general_note_outcome_stops_later_notes_and_people(gitlab_env):
+    """An unknown general-note outcome stops the batch and prevents people changes."""
+    # Arrange
+    mr_route, diff_route = add_preflight([([], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(return_value=response({"message": "unknown"}, status=503))
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(
+        notes=[{"body": "First general comment."}, {"body": "Second general comment."}],
+        add_reviewers=["alice"],
+    )
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["unknown", "unattempted"]
+    assert "outcome is unknown" in data["warning"]
+    assert len(post_route.calls) == 1
+    assert len(mr_route.calls) == TWO_POSTS
+    assert not diff_route.called
+    assert not graphql_route.called

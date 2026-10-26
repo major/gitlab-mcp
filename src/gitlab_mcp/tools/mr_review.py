@@ -30,22 +30,22 @@ PEOPLE_SKIPPED_WARNING = "Reviewers and assignees were not changed because not e
 
 
 class ReviewNote(BaseModel):
-    """One inline note on a diff line, or a file-level note when no line is set.
+    """One general note, file-level note, or inline note on a merge request.
 
-    Set at most one of ``line`` or ``old_line``. Set neither for a file-level note: it needs only a diff path, so it
-    works for findings on lines outside the diff hunks and for collapsed or too-large diffs. Set exactly one of
-    ``body`` or ``body_path``. The body may contain up to 100000 UTF-8 bytes. ``body_path`` must be an absolute
-    server-local path to a regular UTF-8 file.
+    Omit ``file``, ``line``, and ``old_line`` for a general merge-request discussion. Set ``file`` without either
+    line coordinate for a file-level note, or set a file and at most one line coordinate for an inline note. Set
+    exactly one of ``body`` or ``body_path``. The body may contain up to 100000 UTF-8 bytes. ``body_path`` must be an
+    absolute server-local path to a regular UTF-8 file.
     """
 
-    file: str = Field(min_length=1, description="Diff path.")
+    file: str | None = Field(default=None, min_length=1, description="Diff path. Omit for a general MR note.")
     line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
         default=None,
-        description="New-side line. Omit line and old_line for a file-level note.",
+        description="New-side line. Requires file. Omit both coordinates for a file-level or general note.",
     )
     old_line: Annotated[int, Field(strict=True, ge=1)] | None = Field(
         default=None,
-        description="Old-side line. Omit line and old_line for a file-level note.",
+        description="Old-side line. Requires file. Omit both coordinates for a file-level or general note.",
     )
     body: str | None = Field(
         default=None,
@@ -59,10 +59,12 @@ class ReviewNote(BaseModel):
     @model_validator(mode="after")
     def validate_sources_and_location(self) -> ReviewNote:
         """Require exactly one line side and exactly one body source."""
-        if not self.file.strip():
+        if self.file is not None and not self.file.strip():
             raise_review_preflight_error("file must not be blank")
         if self.line is not None and self.old_line is not None:
             raise_review_preflight_error("Set at most one of line or old_line")
+        if self.file is None and (self.line is not None or self.old_line is not None):
+            raise_review_preflight_error("file is required when line or old_line is set")
         if (self.body is None) == (self.body_path is None):
             raise_review_preflight_error("Set exactly one of body or body_path")
         return self
@@ -265,12 +267,15 @@ def _note_position(matches: list[dict[str, Any]], note: ReviewNote) -> dict[str,
     A file-level note (no line) needs only its path to appear once in the diff. A line note also needs a usable
     hunk, so collapsed or too-large patches fail only that note.
     """
+    if note.file is None:
+        raise_review_preflight_error("file is required for a diff position")
+    file = note.file
     if not matches:
-        raise_review_preflight_error(f"Diff preflight could not find {note.file!r} within {MAX_PAGES} pages")
+        raise_review_preflight_error(f"Diff preflight could not find {file!r} within {MAX_PAGES} pages")
     if len(matches) != 1:
-        raise_review_preflight_error(f"Diff preflight found ambiguous path {note.file!r}")
+        raise_review_preflight_error(f"Diff preflight found ambiguous path {file!r}")
     raw = matches[0]
-    old_path, new_path = _diff_paths(raw, note.file)
+    old_path, new_path = _diff_paths(raw, file)
     if note.line is None and note.old_line is None:
         # Omit the line keys entirely: _review_response_matches treats a missing key and a null key the same way.
         return {"position_type": "file", "old_path": old_path, "new_path": new_path}
@@ -345,10 +350,14 @@ async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is pa
         refs = await _get_review_diff_refs(client, project, iid)
         if refs["sha"] != head_sha.lower() or refs["head_sha"] != head_sha.lower():
             return [], refs, "The supplied head_sha is stale. No notes were posted."
-        paths = await _scan_review_paths(client, project, iid, {note.file for note in notes})
-        checked = [
-            _check_note_position(paths[note.file], note, check) for note, check in zip(notes, checks, strict=True)
-        ]
+        requested_paths = {note.file for note in notes if note.file is not None}
+        paths = await _scan_review_paths(client, project, iid, requested_paths) if requested_paths else {}
+        checked = []
+        for note, check in zip(notes, checks, strict=True):
+            if note.file is None:
+                checked.append(check)
+            else:
+                checked.append(_check_note_position(paths[note.file], note, check))
         current_refs = await _get_review_diff_refs(client, project, iid)
         if current_refs != refs:
             return [], {}, "The merge request or its diff refs changed during preflight. No notes were posted."
@@ -357,7 +366,7 @@ async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is pa
     return checked, refs, ""
 
 
-def _review_response_ids(response: Any) -> tuple[str, int | None, dict[str, Any] | None]:
+def _review_response_ids(response: Any) -> tuple[str, int | None, Any]:
     """Extract IDs and the created root note position when the response has them."""
     if not isinstance(response, dict):
         return "", None, None
@@ -372,14 +381,14 @@ def _review_response_ids(response: Any) -> tuple[str, int | None, dict[str, Any]
     raw_note_id = root.get("id")
     note_id = raw_note_id if type(raw_note_id) is int else None
     position = root.get("position")
-    return discussion_id, note_id, position if isinstance(position, dict) else None
+    return discussion_id, note_id, position
 
 
 def _review_response_position(
-    actual: dict[str, Any] | None,
+    actual: Any,
 ) -> dict[str, str | int]:
     """Return one path and line coordinate, plus the old path for a rename."""
-    if actual is None:
+    if not isinstance(actual, dict):
         return {}
     old_path = actual.get("old_path")
     path = actual.get("path") or actual.get("new_path") or old_path
@@ -398,11 +407,13 @@ def _review_response_position(
 
 
 def _review_response_matches(
-    actual: dict[str, Any] | None,
+    actual: Any,
     expected: dict[str, str | int | None],
 ) -> bool:
     """Check that GitLab placed the note at the requested refs, paths, and coordinates."""
-    if actual is None:
+    if not expected:
+        return actual is None or actual == {}
+    if not isinstance(actual, dict):
         return False
     keys = ("position_type", "base_sha", "start_sha", "head_sha", "old_path", "new_path", "old_line", "new_line")
     return all(
@@ -421,12 +432,15 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
     body: str,
     position: dict[str, str | int | None],
 ) -> tuple[ReviewNotePostResult, str]:
-    """Post one note and verify the position returned for its created discussion."""
+    """Post one note and verify its position when it is a diff discussion."""
     try:
+        payload: dict[str, Any] = {"body": body}
+        if position:
+            payload["position"] = position
         response = await client.request(
             "POST",
             f"{mr_rest_path(project, iid)}/discussions",
-            json={"body": body, "position": position},
+            json=payload,
         )
     except GitLabAPIError as exc:
         if exc.status >= 500 or exc.status == 408:  # noqa: PLR2004 - these statuses can hide a committed write.
@@ -499,12 +513,14 @@ async def _post_review_note_batch(
     results: list[ReviewNotePostResult] = []
     warning = ""
     for index, check in enumerate(checks):
-        position: dict[str, str | int | None] = {
-            **check.position,
-            "base_sha": refs["base_sha"],
-            "start_sha": refs["start_sha"],
-            "head_sha": refs["head_sha"],
-        }
+        position: dict[str, str | int | None] = {}
+        if check.position:
+            position = {
+                **check.position,
+                "base_sha": refs["base_sha"],
+                "start_sha": refs["start_sha"],
+                "head_sha": refs["head_sha"],
+            }
         result, reason = await _post_one_review_note(client, project, iid, index, check.body, position)
         results.append(result)
         if reason:
@@ -606,18 +622,19 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         Field(description="Run all preflight checks and return positions without posting any notes."),
     ] = False,
 ) -> PostReviewNotesResult:
-    """Review inline comments: validate or post a sequential, bounded batch.
+    """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
-    Like `glab mr note create`, but creates diff discussions. Set `validate_only` to true to run all body, path, line,
-    and SHA checks without writing; validation does not need the user's `APPROVE`. Actual posting still requires the
-    user's explicit `APPROVE`. After APPROVE, call this tool directly; it reruns the same checks before the first
-    write. Do not call `validate_only` again. `head_sha` must be the full SHA from `get_merge_request` or
-    `get_merge_request_diff`.
+    Like `glab mr note create`. Omit `file`, `line`, and `old_line` for a general merge-request discussion. Set only
+    `file` for a file-level diff discussion, or set `file` and one line coordinate for an inline diff discussion. Set
+    `validate_only` to true to run all body, path, line, and SHA checks without writing; validation does not need the
+    user's `APPROVE`. Actual posting still requires the user's explicit `APPROVE`. After APPROVE, call this tool
+    directly; it reruns the same checks before the first write. Do not call `validate_only` again. `head_sha` must be
+    the full SHA from `get_merge_request` or `get_merge_request_diff`.
     Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
     for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
     `head_sha`, returns `unattempted` for every note and a `warning`.
-    Omit both `line` and `old_line` to create a file-level note. Use it for findings on lines outside the diff hunks.
-    It needs only the file's path in the diff, so it also works for collapsed or too-large diffs.
+    A file-level note needs only the file's path in the diff, so it works for findings outside diff hunks and for
+    collapsed or too-large diffs. General notes do not read diff pages, but still check the merge request head twice.
     A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
     computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
