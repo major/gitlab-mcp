@@ -7,6 +7,7 @@ from itertools import batched
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
+import regex
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 lazy from fastmcp import Context
@@ -148,10 +149,14 @@ BLOCKED_STATUS = "blocked_status"
 
 # Long descriptions are cut to keep one tool result small. The flag tells the agent it was cut.
 DESCRIPTION_CAP = 4000
-# Issue-key parsing is deliberately fixed and bounded; callers can only supply literal prefixes.
+# Default issue-key parsing uses fixed stdlib patterns; custom patterns have separate limits below.
 ISSUE_KEY_CAP = 100
 ISSUE_KEY_PREFIX_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
 ISSUE_KEY_PATTERN = re.compile(r"\b([A-Z][A-Z0-9_]{0,31}-[0-9]+)\b")
+# Caller-authored regexes have bounded scans and matches. The timeout limits matching, not pattern compilation.
+ISSUE_KEY_SCAN_CAP = 65_536
+ISSUE_KEY_MAX_LENGTH = 256
+ISSUE_KEY_MATCH_TIMEOUT = 0.05
 # The open-thread list is capped. Counts stay exact, and `index_complete` says whether the list is whole.
 THREAD_INDEX_CAP = 20
 
@@ -249,7 +254,11 @@ class MergeRequestDetail(BaseModel):
     description: str = Field(default="", exclude_if=lambda v: not v)
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
     issue_keys: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
-    issue_keys_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    issue_keys_truncated: bool | None = Field(
+        default=None,
+        description="True when the result cap, custom scan cap, or custom match-length cap excludes keys.",
+        exclude_if=lambda value: value is None,
+    )
     merge_status: str = Field(default="", exclude_if=lambda v: not v)  # GitLab's detailed status.
     should_be_rebased: bool = Field(default=False, exclude_if=lambda v: not v)
     conflicts: bool = Field(default=False, exclude_if=lambda v: not v)
@@ -622,8 +631,12 @@ def _extract_issue_keys(
     title: str,
     description: str | None,
     prefixes: list[str] | None,
+    custom_pattern: Any | None = None,
 ) -> tuple[list[str], bool]:
-    """Return unique issue keys in first-seen order, with a fixed cap and optional literal prefixes."""
+    """Return unique keys in first-seen order using default parsing or a supplied custom pattern."""
+    if custom_pattern is not None:
+        return _extract_custom_issue_keys(title, description, custom_pattern)
+
     text = f"{title}\n{description or ''}"
     keys: list[str] = []
     seen: set[str] = set()
@@ -638,6 +651,62 @@ def _extract_issue_keys(
             return keys, True
         keys.append(key)
     return keys, False
+
+
+def _extract_custom_issue_keys(
+    title: str,
+    description: str | None,
+    pattern: Any,
+) -> tuple[list[str], bool]:
+    """Return bounded full-match keys from caller-authored regex over the requested source text."""
+    text = f"{title}\n{description or ''}"
+    truncated = len(text) > ISSUE_KEY_SCAN_CAP
+    text = text[:ISSUE_KEY_SCAN_CAP]
+    keys: list[str] = []
+    seen: set[str] = set()
+    try:
+        for match in pattern.finditer(text, timeout=ISSUE_KEY_MATCH_TIMEOUT):
+            key = match.group(0)
+            if not key:
+                continue
+            if len(key) > ISSUE_KEY_MAX_LENGTH:
+                truncated = True
+                continue
+            if key in seen:
+                continue
+            if len(keys) == ISSUE_KEY_CAP:
+                truncated = True
+                break
+            seen.add(key)
+            keys.append(key)
+    except TimeoutError:
+        raise ToolError(  # noqa: TRY003
+            "Matching issue_key_pattern exceeded its 50 ms timeout. Simplify issue_key_pattern and try again."
+        ) from None
+    return keys, truncated
+
+
+def _compile_issue_key_pattern(
+    issue_key_pattern: str | None,
+    issue_key_prefixes: list[str] | None,
+) -> Any | None:
+    """Validate issue-key filters and compile a custom pattern before any GitLab request."""
+    if issue_key_pattern is not None and issue_key_prefixes is not None:
+        raise ToolError("issue_key_pattern cannot be used with issue_key_prefixes.")  # noqa: TRY003
+    if issue_key_prefixes is not None and any(
+        not ISSUE_KEY_PREFIX_PATTERN.fullmatch(prefix) for prefix in issue_key_prefixes
+    ):
+        message = (
+            "Each issue_key_prefixes item must start with an uppercase ASCII letter and contain only "
+            "uppercase letters, digits, or underscores, up to 32 characters."
+        )
+        raise ToolError(message)
+    if issue_key_pattern is None:
+        return None
+    try:
+        return regex.compile(issue_key_pattern)
+    except regex.error:
+        raise ToolError("issue_key_pattern must be a valid regular expression.") from None  # noqa: TRY003
 
 
 def _to_reviewer(node: dict[str, Any]) -> Reviewer:
@@ -705,13 +774,14 @@ def _merged_metadata(node: dict[str, Any]) -> tuple[str | None, str | None]:
     return merged_at[:10] if merged_at else None, merge_user.get("username") if merge_user else None
 
 
-def _to_detail(
+def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct optional output field.
     node: dict[str, Any],
     *,
     include_description: bool,
     include_labels: bool,
     issue_key_prefixes: list[str] | None,
     description_limit: int,
+    custom_issue_key_pattern: Any | None = None,
 ) -> MergeRequestDetail:
     """Convert one GraphQL merge request node into the detail shape.
 
@@ -731,6 +801,7 @@ def _to_detail(
         node["title"],
         node.get("description") if include_description else None,
         issue_key_prefixes,
+        custom_issue_key_pattern,
     )
     return MergeRequestDetail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
@@ -872,6 +943,19 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
             ),
         ),
     ] = None,
+    issue_key_pattern: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=256,
+            description=(
+                "Optional caller-authored regex that replaces default issue-key extraction. Matches return the full "
+                "text, preserve case, and are limited to 256 characters. The scan is limited to 65,536 characters "
+                "with a 50 ms matching timeout. Timeout does not sandbox pattern compilation. Cannot be combined "
+                "with issue_key_prefixes."
+            ),
+        ),
+    ] = None,
     description_limit: Annotated[
         int,
         Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
@@ -897,7 +981,10 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - The description is skipped by default. Set `include_description=true` to read it when you need it.
     - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
     - `issue_keys` lists unique uppercase-prefix-number keys from the title on every call and from the raw description
-      when included, up to 100. `issue_key_prefixes` filters by literal prefixes, not regular expressions.
+      when included, up to 100. `issue_key_prefixes` filters by literal prefixes, not regular expressions. Set
+      `issue_key_pattern` to replace that extraction with a caller-authored regex; it cannot be combined with prefixes.
+      Custom patterns return full matches, preserve case, and use a bounded scan with a matching timeout.
+      `issue_keys_truncated=true` means a result, scan, or match-length limit excluded content.
     - `description_limit` controls description length when the description is included. Zero skips it; the default is
       4000 characters.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
@@ -907,14 +994,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
     """
     include_description = include_description and description_limit > 0
-    if issue_key_prefixes is not None and any(
-        not ISSUE_KEY_PREFIX_PATTERN.fullmatch(prefix) for prefix in issue_key_prefixes
-    ):
-        message = (
-            "Each issue_key_prefixes item must start with an uppercase ASCII letter and contain only "
-            "uppercase letters, digits, or underscores, up to 32 characters."
-        )
-        raise ToolError(message)
+    custom_issue_key_pattern = _compile_issue_key_pattern(issue_key_pattern, issue_key_prefixes)
     client = get_client(ctx)
     node = await fetch_merge_request(
         client,
@@ -931,6 +1011,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         include_labels=include_labels,
         issue_key_prefixes=issue_key_prefixes,
         description_limit=description_limit,
+        custom_issue_key_pattern=custom_issue_key_pattern,
     )
     await _add_blockers(client, project, [detail])
     if include_commits_behind:
