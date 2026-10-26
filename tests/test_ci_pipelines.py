@@ -80,6 +80,8 @@ def pipeline_node(
     *jobs: dict[str, Any],
     has_next: bool = False,
     cursor: str | None = None,
+    has_previous: bool = False,
+    start_cursor: str | None = None,
     **overrides: Any,
 ) -> dict[str, Any]:
     """Build one GraphQL pipeline with a jobs page, shaped like the `project.pipeline` response."""
@@ -93,7 +95,15 @@ def pipeline_node(
         "startedAt": "2026-10-01T12:01:00Z",
         "finishedAt": None,
         "duration": 300,
-        "jobs": {"nodes": list(jobs), "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}},
+        "jobs": {
+            "nodes": list(jobs),
+            "pageInfo": {
+                "hasNextPage": has_next,
+                "endCursor": cursor,
+                "hasPreviousPage": has_previous,
+                "startCursor": start_cursor,
+            },
+        },
     }
     return node | overrides
 
@@ -448,6 +458,8 @@ async def test_maps_pipeline_metadata_and_job_types(gitlab_env):
         "pipelineId": "gid://gitlab/Ci::Pipeline/901",
         "first": 50,
         "after": None,
+        "last": None,
+        "before": None,
         "retried": False,
         "statuses": None,
     }
@@ -651,12 +663,144 @@ async def test_next_cursor_resumes_jobs_with_the_same_arguments(gitlab_env):
         "pipelineId": "gid://gitlab/Ci::Pipeline/901",
         "first": 50,
         "after": None,
+        "last": None,
+        "before": None,
         "retried": False,
         "statuses": ["FAILED"],
     }
     assert sent_variables(route, 1)["after"] == "cur-2"
     assert rows(second["jobs"])[0]["job_id"] == "12"
     assert "next_cursor" not in second
+
+
+@respx.mock
+async def test_oldest_first_pages_jobs_by_numeric_id_and_keeps_mixed_types(gitlab_env):
+    """Oldest-first pagination reverses each descending page and resumes before its start cursor."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            pipeline_response(
+                pipeline_node(
+                    job_node("Ci::Build", 12),
+                    job_node("Ci::Bridge", 11),
+                    has_previous=True,
+                    start_cursor="cursor-12",
+                ),
+            ),
+            pipeline_response(
+                pipeline_node(
+                    job_node("GenericCommitStatus", 14),
+                    job_node("CommitStatus", 13),
+                    has_previous=False,
+                    start_cursor="cursor-14",
+                ),
+            ),
+        ],
+    )
+
+    # Act
+    first = await call_tool(
+        "get_pipeline",
+        {
+            "pipeline_id": 901,
+            "order": "oldest_first",
+            "limit": 2,
+            "statuses": ["failed", "success"],
+            "include_retried": True,
+        },
+    )
+    second = await call_tool(
+        "get_pipeline",
+        {
+            "pipeline_id": 901,
+            "order": "oldest_first",
+            "limit": 2,
+            "statuses": ["failed", "success"],
+            "include_retried": True,
+            "cursor": first["next_cursor"],
+        },
+    )
+
+    # Assert
+    assert route.call_count == len((first, second))
+    assert sent_variables(route, 0) == {
+        "fullPath": PROJECT,
+        "pipelineId": "gid://gitlab/Ci::Pipeline/901",
+        "first": None,
+        "after": None,
+        "last": 2,
+        "before": None,
+        "retried": None,
+        "statuses": ["FAILED", "SUCCESS"],
+    }
+    assert sent_variables(route, 1) == {
+        "fullPath": PROJECT,
+        "pipelineId": "gid://gitlab/Ci::Pipeline/901",
+        "first": None,
+        "after": None,
+        "last": 2,
+        "before": "cursor-12",
+        "retried": None,
+        "statuses": ["FAILED", "SUCCESS"],
+    }
+    first_rows = rows(first["jobs"])
+    second_rows = rows(second["jobs"])
+    assert [(row["job_id"], row["type"]) for row in first_rows] == [("11", "bridge"), ("12", "build")]
+    assert [(row["job_id"], row["type"]) for row in second_rows] == [("13", "external"), ("14", "external")]
+    assert first["next_cursor"]
+    assert "next_cursor" not in second
+
+
+@respx.mock
+async def test_job_cursor_is_rejected_when_order_changes(gitlab_env):
+    """An oldest-first jobs cursor cannot resume the same pipeline in newest-first order."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=pipeline_response(
+            pipeline_node(job_node("Ci::Build", 11), has_previous=True, start_cursor="cursor-11"),
+        ),
+    )
+    first = await call_tool("get_pipeline", {"pipeline_id": 901, "order": "oldest_first"})
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Invalid cursor"):
+        await call_tool("get_pipeline", {"pipeline_id": 901, "cursor": first["next_cursor"]})
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize("before", ["", None, 7, ["cursor-11"]], ids=["empty", "null", "number", "list"])
+@respx.mock
+async def test_forged_backward_job_cursor_is_rejected_before_next_request(gitlab_env, before):
+    """A jobs cursor with the right scope but a bad `before` value fails before the next request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=pipeline_response(
+            pipeline_node(job_node("Ci::Build", 11), has_previous=True, start_cursor="cursor-11"),
+        ),
+    )
+    first = await call_tool("get_pipeline", {"pipeline_id": 901, "order": "oldest_first"})
+    cursor = forged_cursor(first["next_cursor"], before=before)
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Invalid cursor"):
+        await call_tool("get_pipeline", {"pipeline_id": 901, "order": "oldest_first", "cursor": cursor})
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_backward_page_without_start_cursor_fails(gitlab_env):
+    """GitLab reporting earlier jobs without a start cursor is an error, not a terminal page."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=pipeline_response(
+            pipeline_node(job_node("Ci::Build", 11), has_previous=True, start_cursor=None),
+        ),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="GitLab reported more jobs but did not return a cursor"):
+        await call_tool("get_pipeline", {"pipeline_id": 901, "order": "oldest_first"})
+    assert route.call_count == 1
 
 
 @pytest.mark.parametrize(

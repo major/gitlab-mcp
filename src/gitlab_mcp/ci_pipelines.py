@@ -1,7 +1,7 @@
 """Pipeline metadata readers for the CI tools 🚦."""
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field
@@ -47,20 +47,24 @@ TIMESTAMP_MESSAGE = "updated_after must be a timezone-aware ISO 8601 datetime, s
 # One flat query per page. The job type comes from each job's GID model, so no kind field is selected.
 _PIPELINE_QUERY = """
 query(
-  $fullPath: ID!, $pipelineId: CiPipelineID!, $first: Int!, $after: String,
+  $fullPath: ID!, $pipelineId: CiPipelineID!,
+  $first: Int, $after: String, $last: Int, $before: String,
   $retried: Boolean, $statuses: [CiJobStatus!]
 ) {
   project(fullPath: $fullPath) {
     pipeline(id: $pipelineId) {
       id status source ref sha createdAt startedAt finishedAt duration
       mergeRequest { iid }
-      jobs(first: $first, after: $after, retried: $retried, statuses: $statuses) {
+      jobs(
+        first: $first, after: $after, last: $last, before: $before,
+        retried: $retried, statuses: $statuses
+      ) {
         nodes {
           id name status allowFailure duration scheduledAt
           stage { name }
           downstreamPipeline { id project { fullPath } }
         }
-        pageInfo { hasNextPage endCursor }
+        pageInfo { hasNextPage endCursor hasPreviousPage startCursor }
       }
     }
   }
@@ -295,15 +299,18 @@ async def get_pipeline(  # noqa: PLR0913 - each argument is one filter or paging
     *,
     statuses: list[str] | None = None,
     include_retried: bool = False,
+    order: Literal["newest_first", "oldest_first"] = "newest_first",
     limit: int = 50,
     cursor: str | None = None,
 ) -> PipelineDetail:
     """Return one pipeline's metadata and one page of its jobs.
 
-    Jobs are the latest attempt of each job by default. Set `include_retried` to include older attempts.
-    `statuses` keeps only jobs with those statuses. `next_cursor` fetches the next page of matching jobs and
-    is empty when none remain. The cursor is rejected when any argument changes. Timestamps are full ISO 8601
-    values. An empty `jobs` table means no matching jobs, and a missing job list raises an error.
+    GitLab returns jobs in descending numeric job ID order. `newest_first` keeps that order; `oldest_first` uses
+    backward pagination and reverses each page so IDs are ascending. This is numeric job ID order, not stage order.
+    Jobs are the latest attempt of each job by default. Set `include_retried` to include older attempts. `statuses`
+    keeps only jobs with those statuses. `next_cursor` fetches the next page of matching jobs and is empty when
+    none remain. The cursor is rejected when any argument changes. Timestamps are full ISO 8601 values. An empty
+    `jobs` table means no matching jobs, and a missing job list raises an error.
     """
     _require_project(project)
     if pipeline_id < 1:
@@ -315,19 +322,23 @@ async def get_pipeline(  # noqa: PLR0913 - each argument is one filter or paging
         "pipeline_id": pipeline_id,
         "statuses": job_statuses,
         "include_retried": include_retried,
+        "order": order,
         "limit": limit,
     }
-    after: str | None = None
+    cursor_key = "after" if order == "newest_first" else "before"
+    resume_cursor: str | None = None
     if cursor is not None:
-        after = _resume_value(cursor, scope, "after")
-        if not isinstance(after, str) or not after:
+        resume_cursor = _resume_value(cursor, scope, cursor_key)
+        if not isinstance(resume_cursor, str) or not resume_cursor:
             raise InvalidCursorError
 
     variables = {
         "fullPath": project,
         "pipelineId": f"gid://gitlab/Ci::Pipeline/{pipeline_id}",
-        "first": limit,
-        "after": after,
+        "first": limit if order == "newest_first" else None,
+        "after": resume_cursor if order == "newest_first" else None,
+        "last": limit if order == "oldest_first" else None,
+        "before": resume_cursor if order == "oldest_first" else None,
         "retried": None if include_retried else False,  # None asks GitLab for both latest and retried jobs.
         "statuses": None if job_statuses is None else [status.upper() for status in job_statuses],
     }
@@ -343,9 +354,17 @@ async def get_pipeline(  # noqa: PLR0913 - each argument is one filter or paging
         raise_tool_error(f"GitLab did not return the jobs for pipeline {pipeline_id}, so they are unavailable.")
 
     page_info = jobs["pageInfo"]
-    if page_info["hasNextPage"] and not page_info["endCursor"]:
+    if order == "newest_first":
+        has_more = page_info["hasNextPage"]
+        page_cursor = page_info["endCursor"]
+        page_nodes = jobs["nodes"]
+    else:
+        has_more = page_info["hasPreviousPage"]
+        page_cursor = page_info["startCursor"]
+        page_nodes = reversed(jobs["nodes"])
+    if has_more and not page_cursor:
         raise_tool_error("GitLab reported more jobs but did not return a cursor.")
-    job_rows = [_job_row(node) for node in jobs["nodes"]]
+    job_rows = [_job_row(node) for node in page_nodes]
     merge_request = pipeline.get("mergeRequest")
     return PipelineDetail(
         pipeline_id=numeric_gid(pipeline["id"], PIPELINE_MODELS),
@@ -360,7 +379,5 @@ async def get_pipeline(  # noqa: PLR0913 - each argument is one filter or paging
         duration_s=pipeline["duration"],
         web_url=f"{client.settings.url}/{project}/-/pipelines/{pipeline_id}",
         jobs="\n".join(["\t".join(JOB_COLUMNS), *job_rows]),
-        next_cursor=(
-            encode_cursor({"scope": scope, "after": page_info["endCursor"]}) if page_info["hasNextPage"] else ""
-        ),
+        next_cursor=encode_cursor({"scope": scope, cursor_key: page_cursor}) if has_more else "",
     )
