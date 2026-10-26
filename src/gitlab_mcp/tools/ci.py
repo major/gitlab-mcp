@@ -376,8 +376,13 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     ] = "tail",
     max_chars: Annotated[int, Field(ge=1, le=16000, description="Maximum characters of text, from 1 to 16000.")] = 8000,
     pattern: Annotated[
-        str | None,
-        Field(description="Required for search: a nonempty, single-line literal of at most 200 characters."),
+        str | list[str] | None,
+        Field(
+            description=(
+                "Required for search: one nonempty, single-line literal of at most 200 characters, or a list of 1 to "
+                "10 such literals. List matches include their 1-based pattern indices."
+            ),
+        ),
     ] = None,
     section: Annotated[
         str | None,
@@ -423,7 +428,8 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     `tail` makes one GraphQL request for the last 100 summary lines, not the whole log. A skipped tail has no
     summary and ends after that one request. `head`, `search`, `section`, and `failures` each make two REST requests:
     one job check and one bounded trace read. A skipped job in those views stops after the job check. `head` reads
-    the first 32 KiB of the raw trace. `search` uses a case-insensitive literal pattern. `failures` matches common
+    the first 32 KiB of the raw trace. `search` uses one case-insensitive literal pattern or a list of 1 to 10. Each
+    matching line in list mode includes all matching 1-based pattern indices. `failures` matches common
     make errors, pytest `FAILED` lines, `error:` text, Python traceback headers, and `Error` followed by a numeric
     code. This conservative heuristic can miss other failure formats and can match error text that is not a failure.
     Both search views keep two context lines by default; pass `context` from 0 to 5 to change it. `section` selects

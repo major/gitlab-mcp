@@ -21,6 +21,7 @@ MAX_SCAN_BYTES = 1048576
 DEFAULT_CONTEXT = 2
 MAX_CONTEXT = 5
 MAX_PATTERN_CHARS = 200
+MAX_SEARCH_PATTERNS = 10
 # Fixed read limit for head. Only the first bytes of the raw trace are ever downloaded.
 HEAD_BYTES = 32768
 
@@ -240,12 +241,29 @@ async def _scan_text(
     return clean_log_text(raw.decode(errors="replace"), preserve_sections=True), scanned_bytes, cut, len(raw)
 
 
-def _search_selection(text: str, pattern: str, context: int) -> tuple[str, bool]:
-    """Select matching cleaned lines and merge their surrounding context windows."""
+def _search_selection(text: str, pattern: str | list[str], context: int) -> tuple[str, bool]:
+    """Select cleaned lines matching one or more literals and merge their context windows."""
     text = _SECTION_MARKER_PATTERN.sub("", text)
     lines = text.splitlines(keepends=True)
-    needle = pattern.casefold()
-    matching = [index for index, line in enumerate(lines) if needle in line.casefold()]
+
+    if isinstance(pattern, str):
+        needle = pattern.casefold()
+        matching = [index for index, line in enumerate(lines) if needle in line.casefold()]
+        if not matching:
+            return "", False
+        return _context_selection(lines, matching, context), True
+
+    matching: list[int] = []
+    for index, line in enumerate(lines):
+        folded_line = line.casefold()
+        pattern_indices = [
+            pattern_index for pattern_index, item in enumerate(pattern, start=1) if item.casefold() in folded_line
+        ]
+        if pattern_indices:
+            matching.append(index)
+            labels = ",".join(f"p{pattern_index}" for pattern_index in pattern_indices)
+            lines[index] = f"[{labels}] {line}"
+
     if not matching:
         return "", False
 
@@ -310,9 +328,25 @@ def _section_selection(text: str, section: str) -> tuple[str, bool, bool]:
     return "".join(content), selected, selected
 
 
+def _validate_search_patterns(pattern: str | list[str] | None) -> None:
+    """Validate one search literal or a bounded list of literals."""
+    if pattern is None:
+        raise_tool_error(f"Pass a nonempty, single-line search pattern of at most {MAX_PATTERN_CHARS} characters.")
+
+    if isinstance(pattern, str):
+        if not pattern or len(pattern) > MAX_PATTERN_CHARS or "\n" in pattern or "\r" in pattern:
+            raise_tool_error(f"Pass a nonempty, single-line search pattern of at most {MAX_PATTERN_CHARS} characters.")
+        return
+
+    if not 1 <= len(pattern) <= MAX_SEARCH_PATTERNS:
+        raise_tool_error(f"Pass from 1 to {MAX_SEARCH_PATTERNS} search patterns.")
+    if any(not item or len(item) > MAX_PATTERN_CHARS or "\n" in item or "\r" in item for item in pattern):
+        raise_tool_error(f"Pass nonempty, single-line search patterns of at most {MAX_PATTERN_CHARS} characters.")
+
+
 def _validate_advanced_options(  # noqa: C901, PLR0913 - validate the related view options together.
     view: Literal["tail", "head", "search", "section", "failures"],
-    pattern: str | None,
+    pattern: str | list[str] | None,
     section: str | None,
     context: int | None,
     scan_bytes: int | None,
@@ -339,10 +373,8 @@ def _validate_advanced_options(  # noqa: C901, PLR0913 - validate the related vi
     if view in {"search", "failures"}:
         if section is not None:
             raise_tool_error(f"Do not pass section with view='{view}'.")
-        if view == "search" and (
-            pattern is None or not pattern or len(pattern) > MAX_PATTERN_CHARS or "\n" in pattern or "\r" in pattern
-        ):
-            raise_tool_error(f"Pass a nonempty, single-line search pattern of at most {MAX_PATTERN_CHARS} characters.")
+        if view == "search":
+            _validate_search_patterns(pattern)
         if view == "failures" and pattern is not None:
             raise_tool_error("Do not pass pattern with view='failures'.")
         if context is not None and not 0 <= context <= MAX_CONTEXT:
@@ -363,7 +395,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
     *,
     view: Literal["tail", "head", "search", "section", "failures"] = "tail",
     max_chars: int = DEFAULT_CHARS,
-    pattern: str | None = None,
+    pattern: str | list[str] | None = None,
     section: str | None = None,
     context: int | None = None,
     scan_bytes: int | None = None,
@@ -373,7 +405,8 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
 
     `max_chars` is 1 to 16000. `tail` reads the GraphQL HTML summary, which holds only the last 100
     lines, so earlier output can be missing. `head` reads only the first 32 KiB of the raw trace. `search` finds
-    cleaned lines containing a case-insensitive literal pattern. `failures` finds common make errors, pytest `FAILED`
+    cleaned lines containing a case-insensitive literal pattern, or any pattern in a list of 1 to 10 literals. List
+    matches are prefixed with their 1-based pattern indices. `failures` finds common make errors, pytest `FAILED`
     lines, `error:` text, Python traceback headers, or `Error` lines followed by a numeric code. This is a
     conservative heuristic, not a complete failure detector. Search and failures include nearby context, defaulting
     to two lines before and after, with `context` from 0 to 5. `section` returns the first exact runner section.
