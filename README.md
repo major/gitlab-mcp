@@ -152,3 +152,7 @@ The tool returns failed runner and build jobs only. It excludes bridges and exte
 ## Merge request bootstrap 🔀
 
 For a full merge request bootstrap, call `get_merge_request` with `include_description=true` and `include_labels=true`. This adds no requests and returns the description, up to 100 labels, issue keys, open-thread index, source and target branches, head SHA, and pipeline status. Issue keys are extracted from the title on every call and from the full fetched description before description output is capped. Use `issue_key_prefixes` to filter keys by up to 20 validated literal prefixes.
+
+## Merge request review notes 📝
+
+`post_review_notes` accepts general, file-level, and inline notes in one batch. Omit `file`, `line`, and `old_line` for a general merge-request discussion. Set only `file` for a file-level discussion, or set `file` and one line coordinate for an inline discussion. General-only batches skip diff reads, but still verify the supplied `head_sha` against the merge request twice. Mixed batches validate every diff note before posting any note. Use `validate_only=true` to check the batch without writing.
