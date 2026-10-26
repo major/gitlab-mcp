@@ -397,7 +397,29 @@ class _Update:
             self.failed["rebase"] = str(exc)
             return
         if mr.get("has_conflicts"):
-            self.failed["rebase"] = "GitLab cannot rebase this MR because it has conflicts. Rebase locally and push."
+            source_branch = mr.get("source_branch")
+            target_branch = mr.get("target_branch")
+            head_sha = mr.get("sha")
+            details = [
+                f"{name} '{value}'"
+                for name, value in (
+                    ("source branch", source_branch),
+                    ("target branch", target_branch),
+                    ("head SHA", head_sha),
+                )
+                if isinstance(value, str) and value
+            ]
+            message = "GitLab cannot rebase this MR because it has conflicts."
+            if details:
+                message += f" MR details: {', '.join(details)}."
+            if isinstance(source_branch, str) and source_branch and isinstance(head_sha, str) and head_sha:
+                message += f" Rebase locally, then push with `--force-with-lease={source_branch}:{head_sha}`."
+            else:
+                message += (
+                    " Rebase locally, then use `--force-with-lease` when pushing "
+                    "after verifying the expected remote SHA."
+                )
+            self.failed["rebase"] = message
             return
         await self.attempt("rebase", self.client.request("PUT", f"{self.path}/rebase"), accepted=self.pending)
         if "rebase" in self.pending:
