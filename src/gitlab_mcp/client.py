@@ -363,6 +363,17 @@ class GitLabClient:
             cause = TimeoutError(f"timed out after {self.settings.timeout} seconds")
             raise GitLabConnectionError(self.settings.url, cause) from exc
 
+    async def get_artifact_prefix(self, path: str, *, max_bytes: int) -> tuple[bytes, bool]:
+        """Download a bounded job artifact prefix without forwarding credentials to untrusted hosts.
+
+        Artifact downloads can redirect to separate storage hosts, so they use an
+        isolated transport with a strict origin allowlist rather than the shared
+        GitLab API client.
+        """
+        from gitlab_mcp.artifact_download import get_artifact_prefix  # noqa: PLC0415
+
+        return await get_artifact_prefix(self.settings, path, max_bytes=max_bytes)
+
     async def _read_trace_prefix(self, path: str, max_bytes: int) -> tuple[bytes, bool]:
         """Open the streamed GET, check the status, and read the prefix. The stream closes on every exit."""
         async with self._http.stream(
