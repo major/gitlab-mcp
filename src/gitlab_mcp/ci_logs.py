@@ -65,6 +65,8 @@ _FAILURE_PATTERNS = (
     re.compile(r"Traceback \(most recent call last\):"),
     re.compile(r"(?i)\bError\s*:?\s*\d+\b"),
 )
+_PYTEST_SUMMARY_HEADER_PATTERN = re.compile(r"(?i)^={3,}.*\bshort test summary info\b.*={3,}\s*$")
+_PYTEST_SUMMARY_FOOTER_PATTERN = re.compile(r"^={3,}")
 _GLPAT_PATTERN = re.compile(r"(?i)(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
 _BEARER_PATTERN = re.compile(r"(?i)(?<![A-Za-z0-9_-])(Bearer[ \t]+)[-A-Za-z0-9._~+/]+={0,}")
 _JWT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
@@ -78,10 +80,11 @@ class JobLog(BaseModel):
     job_id: int
     name: str | None
     status: str
-    view: Literal["tail", "head", "search", "section", "failures"]
+    view: Literal["tail", "summary", "head", "search", "section", "failures"]
     text: str = Field(
         description=(
-            "Cleaned log text. Tail keeps the last max_chars characters; head and advanced views keep the first."
+            "Cleaned log text. Tail and summary keep the last max_chars characters; "
+            "head and advanced views keep the first."
         ),
     )
     chars: int = Field(description="Length of text in characters.")
@@ -91,7 +94,7 @@ class JobLog(BaseModel):
             "Head and advanced views: True when nothing was cut. A search or failures scan at a nonzero byte_offset "
             "is always False, "
             "because earlier trace bytes were not read. This is trace completeness, not job status. It is null for "
-            "tail because the summary cannot prove completeness."
+            "tail and summary because the last-100-lines response cannot prove completeness."
         ),
     )
     scanned_bytes: int | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -297,6 +300,29 @@ def _failure_selection(text: str, context: int) -> tuple[str, bool]:
     return _context_selection(lines, matching, context), True
 
 
+def _summary_selection(text: str) -> tuple[str, bool]:
+    """Select make targets, pytest's short summary block, and recognized terminal error lines."""
+    lines = text.splitlines(keepends=True)
+    selected: set[int] = set()
+    in_pytest_summary = False
+
+    for index, line in enumerate(lines):
+        marker_line = line.removesuffix("\n")
+        if _PYTEST_SUMMARY_HEADER_PATTERN.fullmatch(marker_line):
+            selected.add(index)
+            in_pytest_summary = True
+        elif in_pytest_summary:
+            if _PYTEST_SUMMARY_FOOTER_PATTERN.match(marker_line):
+                in_pytest_summary = False
+            else:
+                selected.add(index)
+
+        if _FAILURE_PATTERNS[0].search(line) or any(pattern.search(line) for pattern in _FAILURE_PATTERNS[2:]):
+            selected.add(index)
+
+    return "".join(lines[index] for index in sorted(selected)), bool(selected)
+
+
 def _section_selection(text: str, section: str) -> tuple[str, bool, bool]:
     """Return the first exact section's contents, whether it was found, and whether it was unclosed."""
     selected = False
@@ -345,7 +371,7 @@ def _validate_search_patterns(pattern: str | list[str] | None) -> None:
 
 
 def _validate_advanced_options(  # noqa: C901, PLR0913 - validate the related view options together.
-    view: Literal["tail", "head", "search", "section", "failures"],
+    view: Literal["tail", "summary", "head", "search", "section", "failures"],
     pattern: str | list[str] | None,
     section: str | None,
     context: int | None,
@@ -359,7 +385,7 @@ def _validate_advanced_options(  # noqa: C901, PLR0913 - validate the related vi
     if byte_offset is not None and view not in {"search", "failures"}:
         raise_tool_error("byte_offset is only valid for view='search' or view='failures'.")
 
-    if view in {"tail", "head"}:
+    if view in {"tail", "summary", "head"}:
         if any(value is not None for value in (pattern, section, context, scan_bytes)):
             raise_tool_error(
                 "pattern, section, context, and scan_bytes are only valid for search, section, or failures views."
@@ -393,7 +419,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
     project: str,
     job_id: int,
     *,
-    view: Literal["tail", "head", "search", "section", "failures"] = "tail",
+    view: Literal["tail", "summary", "head", "search", "section", "failures"] = "tail",
     max_chars: int = DEFAULT_CHARS,
     pattern: str | list[str] | None = None,
     section: str | None = None,
@@ -401,11 +427,13 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
     scan_bytes: int | None = None,
     byte_offset: int | None = None,
 ) -> JobLog:
-    """Return a bounded slice of one CI job's log. `tail` keeps the last lines, `head` keeps the start.
+    """Return a bounded slice of one CI job's log. `tail` keeps the last lines, `summary` selects failure evidence.
 
-    `max_chars` is 1 to 16000. `tail` reads the GraphQL HTML summary, which holds only the last 100
-    lines, so earlier output can be missing. `head` reads only the first 32 KiB of the raw trace. `search` finds
-    cleaned lines containing a case-insensitive literal pattern, or any pattern in a list of 1 to 10 literals. List
+    `max_chars` is 1 to 16000. `tail` and `summary` read the GraphQL HTML summary, which holds only the last 100
+    lines, so earlier failures can be missing even when `truncated` is false. `summary` selects make target failures,
+    pytest's short summary block, and recognized terminal errors. No marker means none was found in this window, not
+    that the job succeeded. `head` reads only the first 32 KiB of the raw trace. `search` finds cleaned lines
+    containing a case-insensitive literal pattern, or any pattern in a list of 1 to 10 literals. List
     matches are prefixed with their 1-based pattern indices. `failures` finds common make errors, pytest `FAILED`
     lines, `error:` text, Python traceback headers, or `Error` lines followed by a numeric code. This is a
     conservative heuristic, not a complete failure detector. Search and failures include nearby context, defaulting
@@ -438,7 +466,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
         byte_offset=byte_offset,
     )
     effective_byte_offset = 0 if byte_offset is None else byte_offset
-    if view == "tail" and not project.strip():
+    if view in {"tail", "summary"} and not project.strip():
         raise_tool_error("Pass a project path, like group/project.")
 
     scanned_bytes = None
@@ -446,9 +474,11 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
     found = None
     next_offset = None
     unclosed_section = False
-    if view == "tail":
+    if view in {"tail", "summary"}:
         name, status, raw_text = await _tail_text(client, project, job_id)
-        byte_cut = False  # The tail view has no byte cap. Only the character cut below applies.
+        if view == "summary":
+            raw_text, found = _summary_selection(raw_text)
+        byte_cut = False  # Tail and summary have no byte cap. Only the character cut below applies.
     else:
         job = await get_job(client, project, job_id)
         if job.status == "skipped":
@@ -483,7 +513,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
             raw_text, found, unclosed_section = _section_selection(raw_text, section)
         byte_cut = scan_truncated
 
-    text = raw_text[-max_chars:] if view == "tail" else raw_text[:max_chars]
+    text = raw_text[-max_chars:] if view in {"tail", "summary"} else raw_text[:max_chars]
     truncated = byte_cut or len(raw_text) > max_chars or (view == "section" and unclosed_section)
     return JobLog(
         job_id=job_id,
@@ -495,7 +525,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
         truncated=truncated,
         complete=(
             None
-            if view == "tail"
+            if view in {"tail", "summary"}
             else not truncated and not (view in {"search", "failures"} and effective_byte_offset > 0)
         ),
         scanned_bytes=scanned_bytes,
