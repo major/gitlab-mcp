@@ -99,6 +99,29 @@ For a self-hosted GitLab instance, add `"GITLAB_URL": "{env:GITLAB_URL}"` to the
 
 </details>
 
+<details>
+<summary>Goose</summary>
+
+Merge this into `~/.config/goose/config.yaml` on Linux or macOS:
+
+```yaml
+extensions:
+  gitlab:
+    name: GitLab
+    cmd: uvx
+    args:
+      - --from
+      - git+https://github.com/major/gitlab-mcp.git
+      - gitlab-mcp
+    enabled: true
+    type: stdio
+    timeout: 300
+```
+
+Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `GITLAB_URL` for a self-hosted instance, as described in [Prerequisites](#prerequisites). The extension inherits these environment variables, so do not add literal secrets to the YAML file. Start a new session after changing the configuration. Verified with Goose CLI 1.56.0 on 2026-10-26. See the [Goose extensions documentation](https://github.com/aaif-goose/goose/blob/v1.56.0/documentation/docs/getting-started/using-extensions.md).
+
+</details>
+
 ## CI log inspection 🔎
 
 Use `get_job_log(view="search", pattern="...")` for a literal, case-insensitive match with surrounding lines; `context` defaults to 2 and is capped at 5. `view="section"` selects the first occurrence of an exact, case-sensitive section name. Both views inspect a raw log prefix controlled by `scan_bytes` (256 KiB by default, up to 1 MiB), while `max_chars` caps the returned output.
