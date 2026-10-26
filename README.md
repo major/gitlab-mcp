@@ -159,6 +159,15 @@ The tool returns failed runner and build jobs only. It excludes bridges and exte
 
 Example: `api_get(resource="file", project="group/project", ref="main", file_path="README.md", fields=["file_path", "content"])` reads a UTF-8 file from an explicit project, branch, and path.
 
+## Guarded CI actions
+
+| Tool | Purpose |
+| --- | --- |
+| `retry_ci` | Retry a job or pipeline, only when its current status is failed or canceled and its SHA matches required `expected_sha`. Equivalent to `glab ci retry`. |
+| `create_pipeline` | Create a pipeline for `ref` only when it matches required `expected_sha`; an optional bounded environment-variable dictionary is accepted, and its values are never included in output. Equivalent to `glab ci run`. |
+
+Use `validate_only=true` on either tool to perform preflight reads without writing. Preflight checks are neither atomic nor a deduplication guarantee: the ref or status may change between GET and POST. Check the resulting SHA and any warning before taking action. Duplicate work is still possible, so do not blindly retry a write with an unknown outcome. Retrying trigger jobs requires GitLab 17.0 or later.
+
 ## Merge request bootstrap 🔀
 
 For a full merge request bootstrap, call `get_merge_request` with `include_description=true` and `include_labels=true`. This adds no requests and returns the description, up to 100 labels, issue keys, open-thread index, source and target branches, head SHA, and pipeline status. Issue keys are extracted from the title on every call and from the full fetched description before description output is capped. Use `issue_key_prefixes` to filter keys by up to 20 validated literal prefixes.

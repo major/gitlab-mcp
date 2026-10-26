@@ -3,6 +3,7 @@
 from gitlab_mcp.tools import (
     api,
     ci,
+    ci_write,
     labels,
     mr_create,
     mr_diff,
@@ -18,6 +19,7 @@ from gitlab_mcp.tools import (
 __all__ = [
     "api",
     "ci",
+    "ci_write",
     "labels",
     "mr_create",
     "mr_diff",
