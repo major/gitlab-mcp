@@ -1,6 +1,7 @@
 """GitLab tool modules. Importing this package registers every tool it contains 🧩."""
 
 from gitlab_mcp.tools import (
+    api,
     ci,
     labels,
     mr_create,
@@ -15,6 +16,7 @@ from gitlab_mcp.tools import (
 )
 
 __all__ = [
+    "api",
     "ci",
     "labels",
     "mr_create",

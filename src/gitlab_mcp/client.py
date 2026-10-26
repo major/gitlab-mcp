@@ -31,6 +31,10 @@ _ERROR_BODY_CAP = 1024
 # Size of each piece read from a streamed body. Small enough to stop early on big traces.
 _STREAM_CHUNK_SIZE = 4096
 
+# GitLab pagination headers should stay small and point to a usable page.
+_MAX_NEXT_PAGE = 1_000_000
+_MAX_NEXT_PAGE_LENGTH = 7
+
 # Keep verification enabled. This tells users how to configure their own CA bundle.
 _TLS_CERTIFICATE_HINT = (
     "certificate verification failed; set SSL_CERT_FILE to a PEM CA bundle that trusts "
@@ -77,11 +81,11 @@ def _detail_from_bytes(raw: bytes) -> str:
     """
     try:
         body = json.loads(raw)
-    except ValueError:  # Not JSON, for example an HTML error page, or a body cut by the read cap.
+        if not isinstance(body, dict):
+            return ""
+        return _as_text(body.get("message") or body.get("error"))[:_DETAIL_CAP].strip().rstrip(". ")
+    except ValueError, RecursionError:  # Invalid JSON or a nested error value exceeded the recursion limit.
         return ""
-    if not isinstance(body, dict):
-        return ""
-    return _as_text(body.get("message") or body.get("error"))[:_DETAIL_CAP].strip().rstrip(". ")
 
 
 def _is_certificate_verification_error(error: BaseException) -> bool:
@@ -114,6 +118,18 @@ async def _read_capped(response: httpx.Response, limit: int) -> bytes:
         if len(collected) > limit:
             break  # Enough to prove truncation. The rest of the body is not read.
     return bytes(collected)
+
+
+def _parse_next_page(value: str | None) -> int | None:
+    """Parse a bounded positive ASCII page number from GitLab's pagination header."""
+    if value is None or value == "":
+        return None
+    if len(value) > _MAX_NEXT_PAGE_LENGTH or not all("0" <= char <= "9" for char in value):
+        raise ToolError("GitLab returned an invalid next-page header.")  # noqa: TRY003 - explain invalid response.
+    page = int(value)
+    if page < 1 or page > _MAX_NEXT_PAGE:
+        raise ToolError("GitLab returned an invalid next-page header.")  # noqa: TRY003 - explain invalid response.
+    return page
 
 
 class GitLabConnectionError(ToolError):
@@ -224,6 +240,70 @@ class GitLabClient:
         response = await self._send("GET", path, params=params)
         next_page = response.headers.get("X-Next-Page")  # Empty string on the last page.
         return response.json(), int(next_page) if next_page else None
+
+    async def get_bounded_json(
+        self,
+        path: str,
+        *,
+        max_bytes: int = 131072,
+        **params: Any,
+    ) -> tuple[Any, int | None]:
+        """Stream a bounded JSON response and return its body and next-page number.
+
+        Compression is disabled and rejected if the server ignores the request,
+        so the byte cap also bounds the bytes passed to the JSON parser.
+
+        Raises:
+            ValueError: When `max_bytes` is not positive.
+            GitLabConnectionError: When the instance cannot be reached or the stream exceeds its timeout.
+            GitLabAPIError: When GitLab returns an error status.
+            GitLabRedirectError: When GitLab answers with a redirect.
+            ToolError: When the body is too large, the JSON is invalid, or pagination is invalid.
+        """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")  # noqa: TRY003 - explain invalid input.
+        try:
+            # The deadline bounds async opening and reading, but cannot interrupt synchronous JSON parsing.
+            async with asyncio.timeout(self.settings.timeout):
+                return await self._read_bounded_json(path, max_bytes, params)
+        except httpx.HTTPError as exc:
+            raise GitLabConnectionError(self.settings.url, exc) from exc
+        except TimeoutError as exc:
+            cause = TimeoutError(f"timed out after {self.settings.timeout} seconds")
+            raise GitLabConnectionError(self.settings.url, cause) from exc
+
+    async def _read_bounded_json(
+        self,
+        path: str,
+        max_bytes: int,
+        params: dict[str, Any],
+    ) -> tuple[Any, int | None]:
+        """Open a streamed JSON GET, validate its headers, and read a capped body."""
+        async with self._http.stream(
+            "GET",
+            path,
+            params=params or None,
+            headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+            follow_redirects=False,
+        ) as response:
+            if response.status_code in _REDIRECT_STATUSES:
+                raise GitLabRedirectError(path, response.status_code)
+            content_encoding = response.headers.get("Content-Encoding")
+            if content_encoding is not None and content_encoding.strip().casefold() != "identity":
+                raise ToolError(f"GitLab returned an unsupported Content-Encoding for {path}.")  # noqa: TRY003
+            if response.is_error:
+                raw = await _read_capped(response, _ERROR_BODY_CAP)
+                raise GitLabAPIError(response.status_code, path, _detail_from_bytes(raw))
+
+            data = await _read_capped(response, max_bytes)
+            if len(data) > max_bytes:
+                raise ToolError(f"GitLab response for {path} exceeds the {max_bytes}-byte limit.")  # noqa: TRY003
+            next_page = _parse_next_page(response.headers.get("X-Next-Page"))
+            try:
+                body = json.loads(data)
+            except (ValueError, RecursionError) as exc:
+                raise ToolError(f"GitLab returned invalid JSON for {path}.") from exc  # noqa: TRY003
+        return body, next_page
 
     async def get_trace_prefix(self, path: str, *, max_bytes: int) -> tuple[bytes, bool]:
         """Stream a plain-text body from `path` and keep only its first `max_bytes` bytes 🪵.
