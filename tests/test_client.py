@@ -7,6 +7,7 @@ The HTTP layer is still mocked with respx, so no real request leaves the test.
 import itertools
 import json
 import ssl
+import sys
 lazy from collections.abc import AsyncIterator, Iterable
 
 import httpx
@@ -28,6 +29,8 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 NOTES_PATH = "/projects/group%2Fproject/merge_requests/2187/notes"
 NOTES_URL = f"{API}/projects/group%2Fproject/merge_requests/2187/notes"
 DETAIL_CAP = 300
+ERROR_BODY_CAP = 1024
+FORBIDDEN_STATUS = 403
 TRACE_PATH = "/projects/group%2Fproject/jobs/42/trace"
 TRACE_URL = f"{API}/projects/group%2Fproject/jobs/42/trace"
 
@@ -578,3 +581,197 @@ async def test_trace_prefix_rejects_a_limit_that_is_not_positive(client, max_byt
     with pytest.raises(ValueError, match="max_bytes must be positive"):
         await client.get_trace_prefix(TRACE_PATH, max_bytes=max_bytes)
     assert not route.called
+
+
+@respx.mock
+async def test_get_bounded_json_sends_params_and_identity_headers_and_returns_next_page(client):
+    """The streamed JSON GET sends its parameters and returns a valid next-page number."""
+    # Arrange
+    route = respx.get(f"{API}/projects").mock(
+        return_value=httpx.Response(200, json=[{"id": 1}], headers={"X-Next-Page": "2"}),
+    )
+
+    # Act
+    result = await client.get_bounded_json("/projects", max_bytes=100, membership=True, per_page=20)
+
+    # Assert
+    request = route.calls.last.request
+    assert result == ([{"id": 1}], 2)
+    assert dict(request.url.params) == {"membership": "true", "per_page": "20"}
+    assert request.headers["Accept"] == "application/json"
+    assert request.headers["Accept-Encoding"] == "identity"
+    assert request.headers["PRIVATE-TOKEN"] == "glpat-test"
+
+
+@pytest.mark.parametrize("header", [None, ""])
+@respx.mock
+async def test_get_bounded_json_treats_missing_or_empty_next_page_as_none(client, header):
+    """A missing or empty next-page header means there is no next page."""
+    # Arrange
+    headers = {} if header is None else {"X-Next-Page": header}
+    respx.get(f"{API}/projects").mock(return_value=httpx.Response(200, json=[], headers=headers))
+
+    # Act
+    result = await client.get_bounded_json("/projects")
+
+    # Assert
+    assert result == ([], None)
+
+
+@pytest.mark.parametrize("header", ["0", "-1", "+1", "1.0", "1000001", "00000001", "x" * 8, b"\xff"])
+@respx.mock
+async def test_get_bounded_json_rejects_invalid_next_page_headers(client, header):
+    """Only short positive ASCII page numbers up to one million are accepted."""
+    # Arrange
+    respx.get(f"{API}/projects").mock(
+        return_value=httpx.Response(200, json=[], headers={"X-Next-Page": header}),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="invalid next-page"):
+        await client.get_bounded_json("/projects")
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+@respx.mock
+async def test_get_bounded_json_rejects_nonpositive_limit_without_request(client, max_bytes):
+    """A JSON byte limit must be positive, and invalid limits send no request."""
+    # Arrange
+    route = respx.get(f"{API}/projects").mock(return_value=httpx.Response(200, json=[]))
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="max_bytes must be positive"):
+        await client.get_bounded_json("/projects", max_bytes=max_bytes)
+    assert not route.called
+
+
+@respx.mock
+async def test_get_bounded_json_rejects_oversized_success_without_leaking_body(client):
+    """An oversized successful body is cut off early and its content is not included in the error."""
+    # Arrange
+    stream = SpyStream(itertools.repeat(b"secret" * 1000))
+    respx.get(f"{API}/projects").mock(return_value=httpx.Response(200, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(ToolError) as info:
+        await client.get_bounded_json("/projects", max_bytes=10)
+    assert "10-byte limit" in str(info.value)
+    assert "secret" not in str(info.value)
+    assert stream.pulled == 1
+    assert stream.closed == 1
+
+
+@respx.mock
+async def test_get_bounded_json_caps_error_body_and_preserves_status_hint(client):
+    """An error body is capped and the normal status hint remains available."""
+    # Arrange
+    stream = SpyStream(itertools.repeat(b'{"message":"secret"}' + b"x" * 10_000))
+    respx.get(f"{API}/projects").mock(return_value=httpx.Response(FORBIDDEN_STATUS, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(GitLabAPIError) as info:
+        await client.get_bounded_json("/projects")
+    assert "HTTP 403" in str(info.value)
+    assert "permission" in str(info.value)
+    assert "secret" not in str(info.value)
+    assert stream.pulled == 1
+    assert stream.closed == 1
+
+
+@respx.mock
+async def test_get_bounded_json_deep_error_detail_keeps_status_hint(client):
+    """Deep nested error details are omitted without hiding the HTTP status and hint."""
+    # Arrange
+    body = b'{"message":' + b"[" * 450 + b'"secret"' + b"]" * 450 + b"}"
+    assert len(body) < ERROR_BODY_CAP
+    respx.get(f"{API}/projects").mock(return_value=httpx.Response(FORBIDDEN_STATUS, content=body))
+
+    # Act / Assert
+    recursion_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(850)
+    try:
+        assert len(json.loads(body)["message"]) == 1
+        with pytest.raises(GitLabAPIError) as info:
+            await client.get_bounded_json("/projects")
+    finally:
+        sys.setrecursionlimit(recursion_limit)
+    assert info.value.status == FORBIDDEN_STATUS
+    assert info.value.detail == ""
+    assert "permission" in str(info.value)
+    assert "secret" not in str(info.value)
+
+
+@pytest.mark.parametrize("status", [200, 403])
+@respx.mock
+async def test_get_bounded_json_refuses_compressed_response_without_reading_body(client, status):
+    """Unexpected compression is refused before the body can be decompressed."""
+    # Arrange
+    stream = SpyStream([b"compressed data"])
+    respx.get(f"{API}/projects").mock(
+        return_value=httpx.Response(status, headers={"Content-Encoding": "gzip"}, stream=stream),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="unsupported Content-Encoding"):
+        await client.get_bounded_json("/projects")
+    assert stream.pulled == 0
+    assert stream.closed == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"not json", b"[" * 1100 + b"x" + b"]" * 1100],
+    ids=["malformed", "deep-invalid"],
+)
+@respx.mock
+async def test_get_bounded_json_reports_invalid_json_without_response_content(client, body):
+    """Malformed or deeply nested JSON becomes a short error with no body content."""
+    # Arrange
+    respx.get(f"{API}/projects").mock(return_value=httpx.Response(200, content=body))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="invalid JSON") as info:
+        await client.get_bounded_json("/projects")
+    assert "not json" not in str(info.value)
+
+
+async def test_get_bounded_json_does_not_follow_redirects(client):
+    """A redirect is refused and the token is not sent to the redirect target."""
+    # Arrange
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{API}/projects").mock(
+            return_value=httpx.Response(302, headers={"Location": "https://attacker.example.net/projects"}),
+        )
+        elsewhere = router.get("https://attacker.example.net/projects").mock(
+            return_value=httpx.Response(200, json=[]),
+        )
+
+        # Act / Assert
+        with pytest.raises(GitLabRedirectError):
+            await client.get_bounded_json("/projects")
+        assert not elsewhere.called
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        pytest.param(httpx.ReadError("reset"), "Could not reach https://gitlab.example.com: reset", id="read"),
+        pytest.param(
+            TimeoutError(),
+            "Could not reach https://gitlab.example.com: timed out after 30.0 seconds",
+            id="deadline",
+        ),
+    ],
+)
+@respx.mock
+async def test_get_bounded_json_stream_failure_is_connection_error_and_closes(client, error, expected_message):
+    """A read failure or deadline timeout follows the client's connection error convention."""
+    # Arrange
+    stream = SpyStream([b"[]"], error=error)
+    respx.get(f"{API}/projects").mock(return_value=httpx.Response(200, stream=stream))
+
+    # Act / Assert
+    with pytest.raises(GitLabConnectionError) as info:
+        await client.get_bounded_json("/projects")
+    assert str(info.value) == expected_message
+    assert stream.closed == 1

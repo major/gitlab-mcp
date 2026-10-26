@@ -14,6 +14,7 @@ PIPELINE_TEST_REPORT_MAX_LIMIT = 100
 
 # One name per line, alphabetical, so a new tool is a one-line change.
 READ_ONLY_TOOLS = {
+    "api_get",
     "get_current_user",
     "get_job",
     "get_job_log",

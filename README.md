@@ -149,6 +149,16 @@ incomplete until the cursor is empty.
 
 The tool returns failed runner and build jobs only. It excludes bridges and external jobs. Each MCP call reads one REST page. If `include_logs=true` and the page has jobs, one batched GraphQL query fetches logs, with up to 1,000 characters per job and 10 jobs maximum. Follow `next_cursor` to read another page. Set `include_logs=false` to skip the log query. Log safety warnings and best-effort credential masking are unchanged. `get_job_log(view="tail")` now uses one GraphQL request; `head`, `search`, and `section` still use two HTTP requests. Job timing values are rounded to whole seconds, and timestamps use second precision.
 
+## Safe API reads 🔎
+
+| Tool | Purpose |
+| --- | --- |
+| `api_get` | Read selected fields for a project, its members, MR commits, or a file at a ref. |
+
+`fields` is required and accepts only a flat allowlist of fields; email fields are not available. Each request reads one page of at most 20 items. The transport response is limited to 128 KiB and serialized output to 16,000 characters. The `members` resource includes inherited members. For `file`, JSON file content is decoded as UTF-8 only when `content` is requested and is limited to 8,192 bytes. Binary or oversized file content is refused. A selected field that is missing from a response is returned as `null`. This tool does not accept arbitrary URLs.
+
+Example: `api_get(resource="file", project="group/project", ref="main", file_path="README.md", fields=["file_path", "content"])` reads a UTF-8 file from an explicit project, branch, and path.
+
 ## Merge request bootstrap 🔀
 
 For a full merge request bootstrap, call `get_merge_request` with `include_description=true` and `include_labels=true`. This adds no requests and returns the description, up to 100 labels, issue keys, open-thread index, source and target branches, head SHA, and pipeline status. Issue keys are extracted from the title on every call and from the full fetched description before description output is capped. Use `issue_key_prefixes` to filter keys by up to 20 validated literal prefixes.
