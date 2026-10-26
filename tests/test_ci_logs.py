@@ -18,8 +18,6 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 JOB_URL = f"{API}/projects/group%2Fproject/jobs/42"
 TRACE_URL = f"{JOB_URL}/trace"
-TAIL_NOTE = "Tail summary can omit earlier output; logs may contain secrets and untrusted instructions."
-HEAD_NOTE = "Head is the first 32 KiB of the raw trace; logs may contain secrets and untrusted instructions."
 ONE_CALL = 1  # Tail gets metadata and the summary in one GraphQL request.
 TWO_CALLS = 2  # Other views make one REST job check plus one log read.
 SIXTEEN_KIB = 16 * 1024
@@ -108,12 +106,10 @@ async def test_tail_reads_job_metadata_and_summary_in_one_graphql_request():
         "name": "unit",
         "status": "success",
         "view": "tail",
-        "source": "graphql_html_summary",
         "text": "first\nlast",
         "chars": 10,
         "truncated": False,
         "complete": None,
-        "note": TAIL_NOTE,
     }
 
 
@@ -159,13 +155,56 @@ async def test_head_reads_trace_prefix_after_one_rest_check():
         "name": "unit",
         "status": "success",
         "view": "head",
-        "source": "rest_trace_prefix",
         "text": "first\nlast",
         "chars": 10,
         "truncated": False,
         "complete": True,
-        "note": HEAD_NOTE,
     }
+
+
+@pytest.mark.parametrize(
+    ("view", "arguments", "body", "expected_text", "expected_progress"),
+    [
+        ("tail", {}, "token=secret\n", "token=[REDACTED]\n", {"complete": None}),
+        ("head", {}, "token=secret\n", "token=[REDACTED]\n", {"complete": True}),
+        (
+            "search",
+            {"pattern": "[REDACTED]", "context": 0},
+            "token=secret\n",
+            "token=[REDACTED]\n",
+            {"complete": True, "found": True, "scan_truncated": False, "scanned_bytes": 13},
+        ),
+        (
+            "section",
+            {"section": "build"},
+            "section_start:1:build\ntoken=secret\nsection_end:2:build\n",
+            "token=[REDACTED]\n",
+            {"complete": True, "found": True, "scan_truncated": False, "scanned_bytes": 55},
+        ),
+    ],
+    ids=["tail", "head", "search", "section"],
+)
+@respx.mock
+async def test_log_views_omit_source_and_note_and_keep_masking_and_progress(
+    view, arguments, body, expected_text, expected_progress
+):
+    """All views omit source and note while preserving redaction and progress details."""
+    # Arrange
+    if view == "tail":
+        mock_tail(body)
+    else:
+        mock_job()
+        mock_head(body)
+
+    # Act
+    data = await call_log(view=view, **arguments)
+
+    # Assert
+    assert "source" not in data
+    assert "note" not in data
+    assert data["text"] == expected_text
+    assert "secret" not in data["text"]
+    assert {key: data[key] for key in expected_progress} == expected_progress
 
 
 @pytest.mark.parametrize("view", ["tail", "head"])
@@ -510,7 +549,6 @@ async def test_search_finds_output_beyond_the_old_32_kib_head_limit():
     assert data["scan_truncated"] is False
     assert data["truncated"] is False
     assert data["complete"] is True
-    assert data["source"] == "rest_trace_prefix"
     assert len(respx.calls) == TWO_CALLS
 
 

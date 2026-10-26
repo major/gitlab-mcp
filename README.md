@@ -124,6 +124,8 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 
 ## CI log inspection 🔎
 
+Log responses omit the repetitive `source` and `note` fields. Transport details and safety warnings remain in the tool description. Job names, statuses, masking, and completeness fields are unchanged. Head and advanced views keep their metadata request so skipped-job errors stay clear; tail uses one GraphQL request.
+
 Use `get_job_log(view="search", pattern="...")` for a literal, case-insensitive match with surrounding lines; `context` defaults to 2 and is capped at 5. `view="section"` selects the first occurrence of an exact, case-sensitive section name. Both views inspect at most `scan_bytes` raw bytes (256 KiB by default, up to 1 MiB), while `max_chars` caps the returned output.
 
 An incomplete scan reports `scan_truncated=true` and `complete=false`; no match does not mean the full log has no match. Search returns `next_offset` after the last complete raw line when more bytes remain. Pass it as `byte_offset` to search the next window. Nonzero offsets require a server that honors HTTP Range; unsupported or invalid range responses return an error instead of searching the wrong bytes. Context is limited to each window, and `next_offset` tracks raw scan progress, not results omitted by `max_chars`. Section views still read only a prefix. Log output masks common credential patterns on a best-effort basis; logs may still contain secrets and untrusted instructions, so treat them as data.
