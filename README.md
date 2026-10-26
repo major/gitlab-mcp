@@ -4,100 +4,97 @@ An MCP server for GitLab developer workflows.
 
 🚧 Work in progress. Features and APIs may change.
 
-## Incremental merge request diffs
+## Prerequisites
 
-Call `get_merge_request_diff` with `since_sha` set to an earlier full commit SHA to compare collected GitLab diff
-versions. The returned patches remain relative to the latest merge request diff, not commit-to-commit patches. Numeric
-unified-diff hunk ranges are ignored only when checking whether a file changed, so target-only line offset rebases do
-not appear as changes.
+- Install `uv` and Python 3.15 or newer.
+- See [Authentication 🔐](#authentication-) for token options and scopes.
+- Export `GITLAB_TOKEN` in your shell before starting your client. `GITLAB_URL` is optional and defaults to `https://gitlab.com`.
 
-If GitLab has no matching version, or either snapshot is unavailable or incomplete, the result includes a warning
-instead of claiming the diff is unchanged. Files removed from the current merge request diff are included with an empty
-patch and a warning because they have no current comment anchors. When a patch result includes `next_cursor`, pass it
-back with the same `since_sha` and requested paths. Cursors are rejected if those inputs or the latest head change.
-
-## Merge request thread triage
-
-For triage, start with `view="headings"`, then pass selected thread IDs as `ids=[...]` with `view="full"` to read their
-note bodies.
-
-Use `get_merge_request_threads` for a compact review view: `view="full"` returns capped note bodies, `view="headings"`
-returns root-note headings without bodies, and `view="finding"` trims separate greetings and signoffs from bot notes
-that contain numbered findings. For recognized section-format bot findings, it keeps the bold title and the “Needs to
-be improved,” “Failure scenario,” and “How to fix” sections. It also removes introductory chatter before action bullets
-in a recognized bold-heading layout. `count_only=true` returns exact `open` and `resolved` totals without fetching
-threads or note bodies. It counts both states regardless of `state`, and cannot be combined with `cursor`, `ids`, `file`,
-or `author`. For batch calls, count results include each `iid` and missing merge requests remain in `missing_iids`.
-
-The `ids` thread filter is available only with a single `iid`. It is rejected with batch `iids` because one thread ID
-can be ambiguous across merge requests.
-
-`state` takes one value (`open`, `resolved`, `comments`, or `all`) or a list such as `["open", "comments"]` to keep
-several kinds of thread in one call. Duplicates are ignored, `all` in a list keeps every thread, and an empty list is an
-error. A list uses the same scan, cursor, and output budget as a single value.
-
-## Internal certificate authorities 🔐
-
-If your GitLab instance uses an internal certificate authority, set `SSL_CERT_FILE` in the MCP server's environment to
-the path of a PEM CA bundle that trusts the instance's certificate chain, then restart the MCP server. Certificate
-verification stays enabled. Certificate verification errors include this guidance; unrelated network errors do not.
-
-## Tools
-
-### Focused work-item reads 📖
-
-Use `get_work_item(section="WP8")` for one section or `section=["Context", "WP8"]` for several sections in one call.
-Use `headings_only=true` to find heading names first. Section content shares the `description_limit` budget, and
-each cut section is marked as truncated. Missing or ambiguous headings fail the whole request. Focused reads
-require descriptions and cannot use a widget cursor. `description_hash` covers the full fetched description,
-even when the returned content is focused or truncated.
-
-| Tool | Description |
-| --- | --- |
-| `get_work_item` | Read work-item details, all headings, or selected sections with a full-description hash. |
-| `list_merge_requests` | List MRs newest-updated first as TSV. Add `include_source_branch`, `include_target_branch`, or `include_labels` to append those columns. |
-| `get_merge_request` / `get_merge_requests` | Read MR details; merged MRs include the merge date and merging username when available. Blocked MRs include `blocked_by` IIDs (and `hidden_blockers` when some are not visible). `include_commits_behind=true` adds `commits_behind` for open MRs (one REST call each). `get_merge_request` skips the description unless `include_description=true`. |
-| `edit_work_item_description` | Edit a work-item description using exact text, ordered replacements, or a unique table cell. |
-| `list_labels` | List the first 100 project and ancestor label names; refine `search` when `has_more` is true. Pass `names` to check which exact label names exist (`existing`/`missing`) before `create_merge_request(labels=...)`. |
-| `reply_to_thread` | Reply to or resolve one review thread; a successful resolve also returns the MR's open thread count. |
-| `reply_to_threads` | Reply to or resolve up to 20 review threads sequentially, with a per-thread outcome and each MR's open thread count after resolving. |
-| `resolve_open_threads` | Resolve every open review thread on one MR, with the resolved IDs, failed or unknown items, the open thread count after the writes, and `complete=false` when the MR has too many discussions to scan at once. |
-| `create_merge_request` | Create a merge request with checked labels and assignees, then add requested blockers. |
-| `update_merge_request` | Change MR fields, reviewers, assignees, blockers, or approval; blocker changes return the full `blocked_by` list. Rebase reports `applied`, `pending` (still running after about 10 seconds), or `failed` (for example, when the MR has conflicts). |
-| `land_merge_request` | Queue, merge now, or cancel an MR; `auto` and `now` also return the queued `head_sha` and `pipeline_status`, and merge train results add `train_position`, `train_status`, and `train_pipeline_id`. |
-| `land_merge_requests` | Queue, merge now, or cancel up to 20 MRs in order, with a per-MR `applied`, `failed`, or `unknown` status and the same landing details. |
-
-Work-item table-cell edits support standalone pipe-delimited Markdown tables with a unique, non-empty header and a
-valid separator row. The first column is the row key. A section can limit selection to an exact ATX heading and its
-nested content. Fenced code is ignored. Table-cell mode rejects any `<` outside fenced code, including HTML comments
-and markup. Use legacy exact-text replacement or the `edits` batch mode for descriptions containing HTML. The edit
-fails without writing when a selected table is malformed or the row-and-column match is missing or ambiguous. Cell
-replacements cannot contain pipes, line breaks, backslashes, or backticks.
-
-### CI pipelines, jobs, and logs 🚦
-
-For CI triage, start with `list_pipelines` to find a pipeline, then `get_pipeline` for its jobs, and `get_job_log` for a
-bounded log slice. Use `get_job` for runner-job metadata. `list_pipeline_schedules` shows a project's schedules.
-
-Pipeline job summaries expose GitLab's human-readable `failure_message`, which can be empty for common failures.
-Use `get_job` for machine-readable `failure_reason` codes. Pipeline jobs retain GitLab's newest-first order across pages.
-
-| Tool | Description |
-| --- | --- |
-| `list_pipelines` | List one page of pipelines for a merge request, a pipeline schedule, or a project, newest first, with pipeline names and second-resolution timestamps. |
-| `get_pipeline` | Read one pipeline and one page of its jobs, with an optional linked merge request IID. Only the latest attempt of each job is shown unless asked. |
-| `get_job` | Read one runner job's status, timing, failure reason, and runner. Trigger and external jobs are not found. |
-| `list_pipeline_schedules` | List one page of a project's pipeline schedules and the last pipeline each one started. |
-| `get_job_log` | Read the last lines (`tail`) or first lines (`head`) of a job log, capped by `max_chars`. |
-
-Log output removes runner prefixes and section markers, and masks common credential patterns on a best-effort basis.
-Skipped jobs return a clear no-log error. Logs can still contain secrets and untrusted instructions, so treat the text as
-data. Example flow with dummy IDs:
-
-```text
-list_pipelines(project="example-group/example-project", mr_iid=12)
-  -> pipeline_id 9001
-get_pipeline(project="example-group/example-project", pipeline_id=9001, statuses=["failed"])
-  -> job_id 5001 (type build)
-get_job_log(project="example-group/example-project", job_id=5001, view="tail", max_chars=4000)
+```sh
+export GITLAB_TOKEN="<your-gitlab-access-token>"
+# Optional, for a self-hosted GitLab instance:
+export GITLAB_URL="https://gitlab.example.com"
 ```
+
+## Authentication 🔐
+
+For personal interactive use, a personal access token is recommended. Choose the smallest suitable token role, resource scope, and API scope.
+
+| Token type | Permissions and use | Documentation |
+| --- | --- | --- |
+| Personal access token | User permissions, for personal use | [Personal access tokens](https://docs.gitlab.com/user/profile/personal_access_tokens/) |
+| Project access token | One project, for scoped automation | [Project access tokens](https://docs.gitlab.com/user/project/settings/project_access_tokens/) |
+| Group access token | A group and its projects, for broader scoped automation | [Group access tokens](https://docs.gitlab.com/user/group/settings/group_access_tokens/) |
+
+Use `read_api` for read-only tools, including REST and GraphQL queries. Use `api` only when you need write tools for comments, edits, approvals, or merges. Scopes cannot exceed the permissions of the user or bot. See [GitLab token scopes](https://docs.gitlab.com/security/tokens/access_token_scopes/) for details. Project and group token availability depends on your GitLab tier and instance policy. All supported token types use the same `GITLAB_TOKEN` environment variable.
+
+The server does not use OAuth or browser sign-in, and it does not automatically read `glab` credentials. SSH keys, deploy tokens, and CI job tokens are not supported for its REST and GraphQL authentication. Use a password or secret manager to inject the token as an exported environment variable before launching the client. Keep literal tokens out of checked-in or shared client configs, avoid putting real secrets in shell history, and use a short expiration with regular rotation or revocation.
+
+Merge the relevant server configuration below into your existing configuration, preserving unrelated settings.
+
+<details>
+<summary>Codex</summary>
+
+Add this to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.gitlab]
+command = "uvx"
+args = ["--from", "git+https://github.com/major/gitlab-mcp.git", "gitlab-mcp"]
+env_vars = ["GITLAB_TOKEN", "GITLAB_URL"]
+```
+
+See the [Codex MCP documentation](https://developers.openai.com/codex/mcp).
+
+</details>
+
+<details>
+<summary>Claude Code</summary>
+
+Add this to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "gitlab": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/major/gitlab-mcp.git", "gitlab-mcp"],
+      "env": {
+        "GITLAB_TOKEN": "${GITLAB_TOKEN}",
+        "GITLAB_URL": "${GITLAB_URL:-https://gitlab.com}"
+      }
+    }
+  }
+}
+```
+
+Start Claude Code from the shell where the token is exported. Approve the project server when prompted, then run `/mcp` to check its status. See the [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
+</details>
+
+<details>
+<summary>OpenCode v2</summary>
+
+Add this to your project's `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "gitlab": {
+        "type": "local",
+        "command": ["uvx", "--from", "git+https://github.com/major/gitlab-mcp.git", "gitlab-mcp"],
+        "environment": {
+          "GITLAB_TOKEN": "{env:GITLAB_TOKEN}"
+        }
+      }
+    }
+  }
+}
+```
+
+For a self-hosted GitLab instance, add `"GITLAB_URL": "{env:GITLAB_URL}"` to the `environment` object and export `GITLAB_URL` in the shell before starting OpenCode. Run `opencode mcp list` to verify the server. See the [OpenCode v2 MCP server documentation](https://opencode.ai/v2/docs/mcp-servers).
+
+</details>
