@@ -22,6 +22,7 @@ TAIL_NOTE = "Tail summary can omit earlier output; logs may contain secrets and 
 HEAD_NOTE = "Head is the first 32 KiB of the raw trace; logs may contain secrets and untrusted instructions."
 TWO_CALLS = 2  # One REST job check plus one log read.
 SIXTEEN_KIB = 16 * 1024
+REDACTED_TOKEN_CHARS = len("token=[REDACTED]")
 ESCAPE = "\x1b[1m"  # 4 bytes of terminal styling that becomes nothing once cleaned.
 
 
@@ -141,6 +142,22 @@ async def test_unfinished_job_still_reads_its_log(view, status):
     assert log_route.call_count == 1
     assert data["status"] == status
     assert data["text"] == "partial output"
+
+
+@pytest.mark.parametrize("view", ["tail", "head"])
+@respx.mock
+async def test_skipped_job_stops_before_any_log_read(view):
+    """A skipped job never ran, so neither log view makes a trace request."""
+    # Arrange
+    job_route = mock_job(status="skipped")
+    log_route = mock_log(view, "should not be read")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"skipped.*never ran.*no log"):
+        await call_log(view=view)
+    assert job_route.call_count == 1
+    assert log_route.call_count == 0
+    assert len(respx.calls) == 1
 
 
 # ---------- missing job, missing log, and empty log ----------
@@ -399,6 +416,118 @@ async def test_tail_removes_terminal_codes_and_controls(summary, expected):
 
     # Assert
     assert data["text"] == expected
+
+
+@pytest.mark.parametrize("view", ["tail", "head"])
+@respx.mock
+async def test_runner_prefixes_and_section_markers_are_removed_after_ansi_cleanup(view):
+    """Runner prefixes and marker lines are removed, while ordinary timestamps and embedded markers stay."""
+    # Arrange
+    log = (
+        ESCAPE
+        + "2026-10-23T21:41:17.313023Z 01O Running job\x1b[0m\n"
+        + "section_start:1761255677:prepare_script\x1b[0K\n"
+        + "ordinary timestamp 2026-10-23T21:41:17Z is text\n"
+        + "literal section_end: stays when embedded\n"
+        + "section_end:1761255678:prepare_script\x1b[0K\n"
+        + "2026-10-23T21:41:18.000001Z 02E runner error\n"
+    )
+    mock_job()
+    mock_log(view, log)
+
+    # Act
+    data = await call_log(view=view)
+
+    # Assert
+    assert data["text"] == (
+        "Running job\n"
+        "ordinary timestamp 2026-10-23T21:41:17Z is text\n"
+        "literal section_end: stays when embedded\n"
+        "runner error\n"
+    )
+
+
+@pytest.mark.parametrize("view", ["tail", "head"])
+@pytest.mark.parametrize(
+    ("credential", "expected"),
+    [
+        ("glpat-abc123XYZ", "[REDACTED]"),
+        ("Bearer AbCd123._-", "Bearer [REDACTED]"),
+        ("bEaReR abc/def+ghi==", "bEaReR [REDACTED]"),
+        ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_123", "[REDACTED]"),
+        ("ToKeN=abc123XYZ&next=ok", "ToKeN=[REDACTED]&next=ok"),
+    ],
+    ids=["gitlab-token", "bearer-token", "bearer-rfc6750", "jwt", "token-parameter"],
+)
+@respx.mock
+async def test_common_credentials_are_masked_in_both_views(view, credential, expected):
+    """Common credential forms are masked before either bounded view is returned."""
+    # Arrange
+    mock_job()
+    mock_log(view, f"before {credential} after")
+
+    # Act
+    data = await call_log(view=view)
+
+    # Assert
+    assert data["text"] == f"before {expected} after"
+
+
+@pytest.mark.parametrize("view", ["tail", "head"])
+@pytest.mark.parametrize("text", ["v1.2.3", "registry.example.com"])
+@respx.mock
+async def test_jwt_cleanup_preserves_versions_and_hostnames(view, text):
+    """Dot-separated versions and hostnames are not JWTs without the JSON-header prefix."""
+    # Arrange
+    mock_job()
+    mock_log(view, text)
+
+    # Act
+    data = await call_log(view=view)
+
+    # Assert
+    assert data["text"] == text
+
+
+@pytest.mark.parametrize("view", ["tail", "head"])
+@respx.mock
+async def test_ordinary_text_and_punctuation_are_not_masked(view):
+    """Cleanup keeps normal timestamps, noncredential bearer text, and punctuation around parameters."""
+    # Arrange
+    body = "at 2026-10-23T21:41:17.313023Z; Bearer: is a label; token=, and glpat is plain text."
+    mock_job()
+    mock_log(view, body)
+
+    # Act
+    data = await call_log(view=view)
+
+    # Assert
+    assert data["text"] == body
+
+
+@pytest.mark.parametrize(
+    ("view", "body"),
+    [
+        ("head", "token=secretXYZ tail"),
+        ("tail", "prefix token=secretXYZ"),
+    ],
+    ids=["head-redaction-before-cap", "tail-redaction-before-cap"],
+)
+@respx.mock
+async def test_redaction_happens_before_character_cap(view, body):
+    """Character limits and truncation reflect cleaned text, not the longer unmasked credential."""
+    # Arrange
+    mock_job()
+    mock_log(view, body)
+
+    # Act
+    data = await call_log(view=view, max_chars=REDACTED_TOKEN_CHARS)
+
+    # Assert
+    assert data["text"] == "token=[REDACTED]"
+    assert data["chars"] == REDACTED_TOKEN_CHARS
+    assert data["truncated"] is True
+    assert data["complete"] is (False if view == "head" else None)
 
 
 @pytest.mark.parametrize(
