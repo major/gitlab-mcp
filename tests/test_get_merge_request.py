@@ -18,6 +18,7 @@ from mcp_helpers import call_tool as call_mcp_tool
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
 IID = 2187
+AUTHOR_ID = 314
 BLOCKER_IIDS = [2100, 2101]
 HIDDEN_BLOCKERS = 3
 PIPELINE_JOBS = "https://gitlab.example.com/api/v4/projects/group%2Fproject/pipelines/123/jobs"
@@ -38,7 +39,7 @@ def make_mr(**overrides: Any) -> dict[str, Any]:
         "draft": False,
         "sourceBranch": "feat/rebuild",
         "targetBranch": "main",
-        "author": {"username": "bkearney"},
+        "author": {"id": f"gid://gitlab/User/{AUTHOR_ID}", "username": "bkearney"},
         "diffRefs": {"headSha": HEAD_SHA},
         "detailedMergeStatus": "MERGEABLE",
         "shouldBeRebased": False,
@@ -132,6 +133,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "iid": str(IID),
         "includeDescription": True,
         "includeJobs": False,
+        "includeLabels": False,
     }
     assert data == {
         "iid": IID,
@@ -139,6 +141,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "state": "opened",
         "draft": True,
         "author": "bkearney",
+        "author_id": AUTHOR_ID,
         "source_branch": "feat/rebuild",
         "target_branch": "main",
         "head_sha": HEAD_SHA,
@@ -648,6 +651,7 @@ async def test_description_obeys_requested_limit(
         "iid": str(IID),
         "includeDescription": True,
         "includeJobs": False,
+        "includeLabels": False,
     }
     assert len(data["description"]) == expected_length
     assert ("description_truncated" in data) is expected_truncated
@@ -702,9 +706,165 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
         "iid": str(IID),
         "includeDescription": False,
         "includeJobs": False,
+        "includeLabels": False,
     }
     assert {"description", "description_truncated"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"
+
+
+@respx.mock
+async def test_zero_description_limit_still_extracts_title_issue_keys(gitlab_env):
+    """A zero description limit skips its text but still returns issue keys from the title."""
+    # Arrange
+    node = make_mr(title="TITLE-3", description="BODY-4")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(include_description=True, description_limit=0)
+
+    # Assert
+    assert route.call_count == 1
+    assert sent_variables(route)["includeDescription"] is False
+    assert data["issue_keys"] == ["TITLE-3"]
+    assert "BODY-4" not in data["issue_keys"]
+    assert {"description", "description_truncated"}.isdisjoint(data)
+
+
+@respx.mock
+async def test_include_labels_returns_label_page_and_numeric_author_id(gitlab_env):
+    """The optional labels connection and author ID come from the existing GraphQL request."""
+    # Arrange
+    node = make_mr(
+        labels={"nodes": [{"title": "backend"}, {"title": "urgent"}], "pageInfo": {"hasNextPage": True}},
+    )
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(include_labels=True)
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert route.call_count == 1
+    assert request["variables"]["includeLabels"] is True
+    assert "author { id username }" in request["query"]
+    assert "labels(first: 100) @include(if: $includeLabels)" in request["query"]
+    assert "pageInfo { hasNextPage }" in request["query"]
+    assert data["author_id"] == AUTHOR_ID
+    assert data["labels"] == ["backend", "urgent"]
+    assert data["labels_truncated"] is True
+
+
+@respx.mock
+async def test_title_issue_keys_are_available_by_default(gitlab_env):
+    """The default result extracts title keys but does not expose the unfetched description."""
+    # Arrange
+    node = make_mr(title="TITLE-1", description="BODY-2")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert route.call_count == 1
+    assert request["variables"]["includeLabels"] is False
+    assert "labels(first: 100) @include(if: $includeLabels)" in request["query"]
+    assert {"labels", "labels_truncated"}.isdisjoint(data)
+    assert data["issue_keys"] == ["TITLE-1"]
+    assert "BODY-2" not in data["issue_keys"]
+    assert "description" not in data
+    assert "issue_keys_truncated" not in data
+
+
+@respx.mock
+async def test_null_author_omits_author_id(gitlab_env):
+    """A deleted or banned author is safely omitted along with its numeric ID."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(author=None)))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert route.call_count == 1
+    assert "author" not in data
+    assert "author_id" not in data
+
+
+@respx.mock
+async def test_issue_keys_deduplicate_in_source_order_before_description_truncation(gitlab_env):
+    """Issue keys use the full fetched description and keep first-seen title/description order."""
+    # Arrange
+    description = "one ALPHA-9 TWO BETA_2-4 ALPHA-9 GAMMA-3"
+    node = make_mr(title="ALPHA-9 intro", description=description)
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(include_description=True, description_limit=8)
+
+    # Assert
+    assert route.call_count == 1
+    assert data["description"] == "one ALPH"
+    assert data["description_truncated"] is True
+    assert data["issue_keys"] == ["ALPHA-9", "BETA_2-4", "GAMMA-3"]
+    assert "issue_keys_truncated" not in data
+
+
+@pytest.mark.parametrize(
+    ("prefixes", "expected"),
+    [
+        (None, ["ALPHA-1", "BETA_2-4"]),
+        (["BETA_2"], ["BETA_2-4"]),
+        (["GAMMA"], []),
+    ],
+    ids=["all", "literal-prefix", "no-match"],
+)
+@respx.mock
+async def test_issue_key_prefixes_filter_literal_prefixes(gitlab_env, prefixes, expected):
+    """Optional validated prefixes filter matching keys literally, without changing fetch count."""
+    # Arrange
+    node = make_mr(title="ALPHA-1", description="BETA_2-4 ALPHA-1")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(include_description=True, issue_key_prefixes=prefixes)
+
+    # Assert
+    assert route.call_count == 1
+    if expected:
+        assert data["issue_keys"] == expected
+    else:
+        assert "issue_keys" not in data
+
+
+@pytest.mark.parametrize("prefixes", [["a"], ["A.*"], ["A" * 33], ["A", "B"] + ["C"] * 19])
+@respx.mock
+async def test_invalid_issue_key_prefixes_fail_before_request(gitlab_env, prefixes):
+    """Invalid or oversized issue-key prefix filters are rejected before calling GitLab."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="issue_key_prefixes"):
+        await call_tool(include_description=True, issue_key_prefixes=prefixes)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_issue_keys_are_capped_at_one_hundred(gitlab_env):
+    """Issue-key results keep the first 100 unique keys and mark the result as truncated."""
+    # Arrange
+    title = "KEY-0"
+    description = " ".join(f"KEY-{number}" for number in range(1, 101))
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(title=title, description=description)))
+
+    # Act
+    data = await call_tool(include_description=True)
+
+    # Assert
+    assert route.call_count == 1
+    assert data["issue_keys"] == [f"KEY-{number}" for number in range(100)]
+    assert data["issue_keys_truncated"] is True
 
 
 @pytest.mark.parametrize("description_limit", [-1, DESCRIPTION_CAP + 1])

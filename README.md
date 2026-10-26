@@ -148,3 +148,7 @@ incomplete until the cursor is empty.
 | `get_pipeline_failures` | List failed runner/build jobs and optionally fetch their log tails. |
 
 The tool returns failed runner and build jobs only. It excludes bridges and external jobs. Each MCP call reads one REST page. If `include_logs=true` and the page has jobs, one batched GraphQL query fetches logs, with up to 1,000 characters per job and 10 jobs maximum. Follow `next_cursor` to read another page. Set `include_logs=false` to skip the log query. Log safety warnings and best-effort credential masking are unchanged. `get_job_log(view="tail")` now uses one GraphQL request; `head`, `search`, and `section` still use two HTTP requests. Job timing values are rounded to whole seconds, and timestamps use second precision.
+
+## Merge request bootstrap 🔀
+
+For a full merge request bootstrap, call `get_merge_request` with `include_description=true` and `include_labels=true`. This adds no requests and returns the description, up to 100 labels, issue keys, open-thread index, source and target branches, head SHA, and pipeline status. Issue keys are extracted from the title on every call and from the full fetched description before description output is capped. Use `issue_key_prefixes` to filter keys by up to 20 validated literal prefixes.
