@@ -36,6 +36,12 @@ can be ambiguous across merge requests.
 several kinds of thread in one call. Duplicates are ignored, `all` in a list keeps every thread, and an empty list is an
 error. A list uses the same scan, cursor, and output budget as a single value.
 
+## Internal certificate authorities 🔐
+
+If your GitLab instance uses an internal certificate authority, set `SSL_CERT_FILE` in the MCP server's environment to
+the path of a PEM CA bundle that trusts the instance's certificate chain, then restart the MCP server. Certificate
+verification stays enabled. Certificate verification errors include this guidance; unrelated network errors do not.
+
 ## Tools
 
 ### Focused work-item reads 📖

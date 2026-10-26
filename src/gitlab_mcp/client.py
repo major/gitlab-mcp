@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import ssl
 from typing import Any, Literal
 
 import httpx
@@ -29,6 +30,12 @@ _ERROR_BODY_CAP = 1024
 
 # Size of each piece read from a streamed body. Small enough to stop early on big traces.
 _STREAM_CHUNK_SIZE = 4096
+
+# Keep verification enabled. This tells users how to configure their own CA bundle.
+_TLS_CERTIFICATE_HINT = (
+    "certificate verification failed; set SSL_CERT_FILE to a PEM CA bundle that trusts "
+    "the GitLab instance certificate chain, then restart MCP server."
+)
 
 # Statuses that are redirects. The trace read never follows them.
 _REDIRECT_STATUSES = range(300, 400)
@@ -77,6 +84,23 @@ def _detail_from_bytes(raw: bytes) -> str:
     return _as_text(body.get("message") or body.get("error"))[:_DETAIL_CAP].strip().rstrip(". ")
 
 
+def _is_certificate_verification_error(error: BaseException) -> bool:
+    """Find certificate verification failures in an exception and its chained errors."""
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if "certificate_verify_failed" in str(current).casefold():
+            return True
+        pending.extend(chained for chained in (current.__cause__, current.__context__) if chained is not None)
+    return False
+
+
 async def _read_capped(response: httpx.Response, limit: int) -> bytes:
     """Read decoded body bytes until `limit + 1` are collected or the body ends.
 
@@ -97,7 +121,10 @@ class GitLabConnectionError(ToolError):
 
     def __init__(self, url: str, cause: Exception) -> None:
         """Include the instance URL and the network error."""
-        super().__init__(f"Could not reach {url}: {cause}")
+        message = f"Could not reach {url}: {cause}"
+        if _is_certificate_verification_error(cause):
+            message += f". {_TLS_CERTIFICATE_HINT}"
+        super().__init__(message)
 
 
 class GitLabAPIError(ToolError):
