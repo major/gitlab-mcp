@@ -1,6 +1,8 @@
 """Tests for the get_merge_request tool, run through a real in-memory MCP client 🧪."""
 
 import json
+import re
+from types import SimpleNamespace
 from typing import Any
 lazy from collections.abc import Callable
 
@@ -12,7 +14,8 @@ from fastmcp.exceptions import ToolError
 
 from gitlab_mcp import mcp
 from gitlab_mcp.common import MAX_PAGES
-from gitlab_mcp.tools.mr_read import DESCRIPTION_CAP, THREAD_INDEX_CAP
+from gitlab_mcp.tools import mr_read
+from gitlab_mcp.tools.mr_read import DESCRIPTION_CAP, ISSUE_KEY_SCAN_CAP, THREAD_INDEX_CAP
 from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -835,6 +838,174 @@ async def test_issue_key_prefixes_filter_literal_prefixes(gitlab_env, prefixes, 
         assert data["issue_keys"] == expected
     else:
         assert "issue_keys" not in data
+
+
+@respx.mock
+async def test_custom_issue_key_pattern_returns_full_matches_in_source_order(gitlab_env):
+    """Custom patterns return full, case-preserved matches and deduplicate in title/description order."""
+    # Arrange
+    node = make_mr(title="task-1 then REF#2", description="REF#2 then task-1")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(
+        include_description=True,
+        issue_key_pattern=r"(?i:(task-[0-9]+))|(?i:(ref#[0-9]+))",
+    )
+
+    # Assert
+    assert route.call_count == 1
+    assert data["issue_keys"] == ["task-1", "REF#2"]
+    assert "issue_keys_truncated" not in data
+
+
+@pytest.mark.parametrize(
+    ("include_description", "expected_keys"),
+    [
+        (False, []),
+        (True, ["TASK-22"]),
+    ],
+    ids=["description-skipped", "raw-description-after-display-cap"],
+)
+@respx.mock
+async def test_custom_issue_key_pattern_scans_description_only_when_requested(
+    gitlab_env, include_description, expected_keys
+):
+    """Custom extraction follows description opt-in and scans raw text beyond the displayed description cap."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=graphql_response(make_mr(title="no-key", description="padding TASK-22")),
+    )
+
+    # Act
+    data = await call_tool(
+        include_description=include_description,
+        description_limit=1,
+        issue_key_pattern=r"TASK-[0-9]+",
+    )
+
+    # Assert
+    assert sent_variables(route)["includeDescription"] is include_description
+    assert data.get("issue_keys", []) == expected_keys
+    assert ("description" in data) is include_description
+    if include_description:
+        assert data["description"] == "p"
+
+
+@pytest.mark.parametrize("pattern", [r"(?=x)", r"(?=.)"], ids=["no-match", "empty-matches"])
+@respx.mock
+async def test_custom_issue_key_pattern_omits_no_and_empty_matches(gitlab_env, pattern):
+    """No matches and zero-length matches produce no issue key and no truncation flag."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(title="text")))
+
+    # Act
+    data = await call_tool(issue_key_pattern=pattern)
+
+    # Assert
+    assert route.call_count == 1
+    assert "issue_keys" not in data
+    assert "issue_keys_truncated" not in data
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error_message"),
+    [
+        ({"issue_key_pattern": "["}, "issue_key_pattern"),
+        ({"issue_key_pattern": ""}, "issue_key_pattern"),
+        ({"issue_key_pattern": "x" * 257}, "issue_key_pattern"),
+        (
+            {"issue_key_pattern": r"KEY-[0-9]+", "issue_key_prefixes": []},
+            "cannot be used with issue_key_prefixes",
+        ),
+    ],
+    ids=["invalid-regex", "empty-pattern", "pattern-too-long", "conflicting-prefix-filter"],
+)
+@respx.mock
+async def test_invalid_custom_issue_key_patterns_fail_before_request(gitlab_env, arguments, error_message):
+    """Invalid, oversized, or conflicting custom patterns are rejected before any GitLab request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=error_message):
+        await call_tool(**arguments)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_custom_issue_key_pattern_reports_match_timeout_without_partial_results(gitlab_env, monkeypatch):
+    """A regex timeout raises an actionable error instead of returning matches found before the timeout."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(title="KEY-1")))
+    timeouts: list[float] = []
+
+    def matches_then_times_out(text: str, *, timeout: float):
+        """Yield one apparent match, then simulate the regex engine timing out."""
+        timeouts.append(timeout)
+        yield re.match(r"KEY-[0-9]+", "KEY-1")
+        raise TimeoutError
+
+    monkeypatch.setattr(
+        mr_read.regex,
+        "compile",
+        lambda _pattern: SimpleNamespace(finditer=matches_then_times_out),
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"timeout.*Simplify issue_key_pattern"):
+        await call_tool(issue_key_pattern=r"KEY-[0-9]+")
+    assert route.call_count == 1
+    assert timeouts == [0.05]
+
+
+@respx.mock
+async def test_custom_issue_key_pattern_scan_cap_marks_even_empty_results_truncated(gitlab_env):
+    """A cut custom scan marks truncation even when the only key is beyond the scan boundary."""
+    # Arrange
+    node = make_mr(title="x" * ISSUE_KEY_SCAN_CAP + " KEY-2")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(issue_key_pattern=r"KEY-[0-9]+")
+
+    # Assert
+    assert route.call_count == 1
+    assert "issue_keys" not in data
+    assert data["issue_keys_truncated"] is True
+
+
+@respx.mock
+async def test_custom_issue_key_pattern_skips_oversized_matches_and_marks_truncated(gitlab_env):
+    """A full custom match longer than 256 characters is skipped and reported as truncated."""
+    # Arrange
+    node = make_mr(title="A" + "x" * 256 + "Z")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(issue_key_pattern=r"A.{256}Z")
+
+    # Assert
+    assert route.call_count == 1
+    assert "issue_keys" not in data
+    assert data["issue_keys_truncated"] is True
+
+
+@respx.mock
+async def test_custom_issue_key_pattern_caps_at_one_hundred_unique_keys(gitlab_env):
+    """Custom results keep the first 100 unique matches and mark truncation when another key is found."""
+    # Arrange
+    title = "KEY-0"
+    description = " ".join(f"KEY-{number}" for number in range(1, 101))
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(title=title, description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, issue_key_pattern=r"KEY-[0-9]+")
+
+    # Assert
+    assert route.call_count == 1
+    assert data["issue_keys"] == [f"KEY-{number}" for number in range(100)]
+    assert data["issue_keys_truncated"] is True
 
 
 @pytest.mark.parametrize("prefixes", [["a"], ["A.*"], ["A" * 33], ["A", "B"] + ["C"] * 19])
