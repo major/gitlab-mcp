@@ -416,6 +416,24 @@ async def test_get_job_log_views_default_to_tail(tools):
     assert view["default"] == "tail"
 
 
+async def test_get_job_log_pattern_schema_accepts_string_list_or_null(tools):
+    """The search pattern schema advertises both input forms and documents list bounds."""
+    # Arrange
+    pattern = tools["get_job_log"].input_schema["properties"]["pattern"]
+
+    # Act
+    branches = pattern["anyOf"]
+    accepted_types = {branch.get("type") for branch in branches}
+    list_schema = next(branch for branch in branches if branch.get("type") == "array")
+    list_description = pattern["description"]
+
+    # Assert
+    assert {"string", "array", "null"} <= accepted_types
+    assert list_schema["items"]["type"] == "string"
+    assert "1 to 10" in list_description
+    assert "200" in list_description
+
+
 async def test_pipeline_test_report_schema_bounds_build_ids_and_defaults_limit(tools):
     """The test report schema uses strict positive build IDs, bounded arrays, and standard paging inputs."""
     # Arrange

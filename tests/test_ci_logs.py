@@ -710,6 +710,100 @@ async def test_search_merges_context_windows_in_source_order(body, pattern, cont
 
 
 @respx.mock
+async def test_search_list_labels_all_matches_and_merges_context_windows():
+    """List search labels every matching pattern while merged context stays ordered and unique."""
+    # Arrange
+    mock_job()
+    mock_head("before\nAlpha beta ERROR\nbetween\nfatal error\nafter\n")
+
+    # Act
+    data = await call_log(view="search", pattern=["error", "alpha", "ERROR", "fatal"], context=1)
+
+    # Assert
+    assert data["text"] == ("before\n[p1,p2,p3] Alpha beta ERROR\nbetween\n[p1,p3,p4] fatal error\nafter\n")
+    assert data["found"] is True
+    assert data["complete"] is True
+    assert len(respx.calls) == TWO_CALLS
+
+
+@respx.mock
+async def test_search_list_returns_empty_when_no_pattern_matches():
+    """List search returns no text when none of its case-insensitive literals match."""
+    # Arrange
+    mock_job()
+    mock_head("ordinary output\nall checks passed\n")
+
+    # Act
+    data = await call_log(view="search", pattern=["missing", "absent"], context=0)
+
+    # Assert
+    assert data["text"] == ""
+    assert data["found"] is False
+    assert data["complete"] is True
+    assert len(respx.calls) == TWO_CALLS
+
+
+@respx.mock
+async def test_search_list_matches_redacted_lines_without_returning_secrets():
+    """List search matches the cleaned, masked line and does not expose its original credential."""
+    # Arrange
+    mock_job()
+    mock_head("token=secret-value\n")
+
+    # Act
+    data = await call_log(view="search", pattern=["[REDACTED]"], context=0)
+
+    # Assert
+    assert data["text"] == "[p1] token=[REDACTED]\n"
+    assert "secret-value" not in data["text"]
+    assert data["found"] is True
+
+
+@pytest.mark.parametrize(
+    ("pattern", "max_chars", "expected_text"),
+    [(["hit"], 1, "["), (["hit"], 4, "[p1]"), (["hit"], 6, "[p1] h")],
+    ids=["tiny-prefix-only", "label-fills-budget", "prefix-before-partial-match"],
+)
+@respx.mock
+async def test_search_list_counts_labels_inside_output_cap(pattern, max_chars, expected_text):
+    """List labels use the character budget, and clipping never exposes an unlabelled match."""
+    # Arrange
+    mock_job()
+    mock_head("hit the target\n")
+
+    # Act
+    data = await call_log(view="search", pattern=pattern, context=0, max_chars=max_chars)
+
+    # Assert
+    assert data["text"] == expected_text
+    assert data["chars"] == len(expected_text)
+    assert data["chars"] <= max_chars
+    assert data["found"] is True
+    assert data["truncated"] is True
+    assert data["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [[], [""], ["valid", "two\nlines"], ["valid", "two\rlines"], ["x" * 201], ["x"] * 11],
+    ids=["empty-list", "empty-pattern", "newline", "carriage-return", "too-long", "too-many"],
+)
+@respx.mock
+async def test_search_list_rejects_invalid_limits_before_any_request(pattern):
+    """Invalid list sizes and entries are rejected before requesting job metadata or its trace."""
+    # Arrange
+    job_route = mock_job()
+    trace_route = mock_head("unused")
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_log(view="search", pattern=pattern)
+    assert job_route.call_count == 0
+    assert trace_route.call_count == 0
+    assert len(respx.calls) == 0
+
+
+@respx.mock
 async def test_section_returns_first_exact_section_with_nested_content():
     """Section selection is exact, keeps nested output, and ends only at the selected outer marker."""
     # Arrange
