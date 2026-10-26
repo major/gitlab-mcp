@@ -21,7 +21,7 @@ TEXT_LIMIT = 200  # Matches the cap for names, stages, and failure messages in c
 LIST_HEADER = "pipeline_id\tstatus\tsource\tref\tsha\tcreated\tupdated"
 JOB_HEADER = (
     "job_id\ttype\tname\tstage\tstatus\tallow_failure\tduration_s\tscheduled_at"
-    "\tdownstream_project\tdownstream_pipeline_id\tfailure_message"
+    "\tdownstream_project\tdownstream_pipeline_id\tfailure_reason"
 )
 
 
@@ -521,6 +521,57 @@ async def test_job_filters_map_to_graphql_variables(gitlab_env, arguments, expec
     assert {key: variables[key] for key in expected_variables} == expected_variables
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"detailedStatus": {"tooltip": "Failed - (script failure)"}}, "script_failure"),
+        (
+            {"detailedStatus": {"tooltip": "Failed - (job execution timeout)"}, "failureMessage": "ignored"},
+            "job_execution_timeout",
+        ),
+        ({"detailedStatus": {"tooltip": "Failed"}, "failureMessage": "Downstream failed"}, "Downstream failed"),
+        ({"detailedStatus": None}, ""),
+    ],
+    ids=["tooltip-reason", "tooltip-wins-over-message", "message-fallback", "nothing-known"],
+)
+@respx.mock
+async def test_failure_reason_comes_from_status_tooltip(gitlab_env, overrides, expected):
+    """failure_reason is the short code from the status tooltip, then GitLab's failure message, then blank."""
+    # Arrange
+    job = job_node("Ci::Build", 11, status="FAILED", **overrides)
+    route = respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node(job)))
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901})
+
+    # Assert
+    assert "detailedStatus { tooltip }" in json.loads(route.calls.last.request.content)["query"]
+    (row,) = rows(data["jobs"])
+    assert row["failure_reason"] == expected
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected"),
+    [
+        ("refs/merge-requests/7/merge", 7),
+        ("refs/merge-requests/42/head", 42),
+        ("main", None),
+    ],
+    ids=["merged-result", "mr-head", "branch"],
+)
+@respx.mock
+async def test_mr_iid_is_read_from_merge_request_refs(gitlab_env, ref, expected):
+    """Merge request pipelines report mr_iid, and other pipelines leave it out."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=pipeline_response(pipeline_node(ref=ref)))
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901})
+
+    # Assert
+    assert data.get("mr_iid") == expected
+
+
 @respx.mock
 async def test_long_text_is_capped_and_newlines_are_flattened(gitlab_env):
     """Names and failure messages are capped at 200 characters with "...", and line breaks become spaces."""
@@ -536,9 +587,9 @@ async def test_long_text_is_capped_and_newlines_are_flattened(gitlab_env):
     # Assert
     (row,) = rows(data["jobs"])
     assert row["name"] == "n" * (TEXT_LIMIT - 3) + "..."
-    assert row["failure_message"].startswith("boom line two ")
-    assert len(row["failure_message"]) == TEXT_LIMIT
-    assert row["failure_message"].endswith("...")
+    assert row["failure_reason"].startswith("boom line two ")
+    assert len(row["failure_reason"]) == TEXT_LIMIT
+    assert row["failure_reason"].endswith("...")
 
 
 @respx.mock

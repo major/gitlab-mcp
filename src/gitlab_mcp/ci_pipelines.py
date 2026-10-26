@@ -1,5 +1,6 @@
 """Pipeline metadata readers for the CI tools 🚦."""
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
@@ -41,8 +42,13 @@ JOB_COLUMNS = (
     "scheduled_at",
     "downstream_project",
     "downstream_pipeline_id",
-    "failure_message",
+    "failure_reason",
 )
+# GraphQL CiJob has no failureReason field, and failureMessage is often null. The status tooltip still
+# carries the reason, like "Failed - (script failure)", so the last "- (...)" group is read from it. 🩺
+_TOOLTIP_REASON = re.compile(r"- \(([^)]+)\)")
+# MR pipelines run on refs like refs/merge-requests/7/head or refs/merge-requests/7/merge.
+_MR_REF = re.compile(r"^refs/merge-requests/(\d+)/")
 TIMESTAMP_MESSAGE = "updated_after must be a timezone-aware ISO 8601 datetime, such as 2026-10-01T12:30:00Z."
 
 # One flat query per page. The job type comes from each job's GID model, so no kind field is selected.
@@ -57,6 +63,7 @@ query(
       jobs(first: $first, after: $after, retried: $retried, statuses: $statuses) {
         nodes {
           id name status allowFailure duration scheduledAt failureMessage
+          detailedStatus { tooltip }
           stage { name }
           downstreamPipeline { id project { fullPath } }
         }
@@ -93,12 +100,18 @@ class PipelineDetail(BaseModel):
     started_at: str | None = Field(default=None, exclude_if=lambda value: value is None)
     finished_at: str | None = Field(default=None, exclude_if=lambda value: value is None)
     duration_s: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    mr_iid: int | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Merge request IID when this is a merge request pipeline.",
+    )
     web_url: str
     jobs: str = Field(
         description=(
             "TSV with a header row. Columns: job_id, type, name, stage, status, allow_failure, duration_s, "
-            "scheduled_at, downstream_project, downstream_pipeline_id, failure_message. type is build, bridge, "
-            "or external. Empty downstream cells mean there is no downstream pipeline or GitLab did not return it."
+            "scheduled_at, downstream_project, downstream_pipeline_id, failure_reason. type is build, bridge, "
+            "or external. Empty downstream cells mean there is no downstream pipeline or GitLab did not return it. "
+            "failure_reason is a short code like script_failure, or the failure message GitLab sent."
         ),
     )
     next_cursor: str = Field(default="", exclude_if=lambda value: not value)  # Empty when no matching jobs remain.
@@ -251,6 +264,21 @@ def _downstream(node: dict[str, Any]) -> tuple[int | None, str | None]:
     return numeric_gid(downstream["id"], PIPELINE_MODELS), project.get("fullPath")
 
 
+def _failure_reason(node: dict[str, Any]) -> str | None:
+    """Return a short failure code like script_failure, falling back to GitLab's failure message."""
+    tooltip = (node.get("detailedStatus") or {}).get("tooltip") or ""
+    matches = _TOOLTIP_REASON.findall(tooltip)
+    if matches:
+        return matches[-1].strip().lower().replace(" ", "_")
+    return node["failureMessage"]
+
+
+def _mr_iid(ref: str) -> int | None:
+    """Return the merge request IID from a merge request pipeline ref, or None for other refs."""
+    match = _MR_REF.match(ref)
+    return int(match.group(1)) if match else None
+
+
 def _job_row(node: dict[str, Any]) -> str:
     """Render one GraphQL job as a TSV row. Long text is capped, and downstream cells can be empty."""
     model, job_id = parse_gid(node["id"])
@@ -267,7 +295,7 @@ def _job_row(node: dict[str, Any]) -> str:
         node["scheduledAt"],
         downstream_project,
         downstream_id,
-        cap(node["failureMessage"], TEXT_CAP),
+        cap(_failure_reason(node), TEXT_CAP),
     )
     return "\t".join(cell(value) for value in values)
 
@@ -349,6 +377,7 @@ async def get_pipeline(  # noqa: PLR0913 - each argument is one filter or paging
         started_at=pipeline["startedAt"],
         finished_at=pipeline["finishedAt"],
         duration_s=pipeline["duration"],
+        mr_iid=_mr_iid(pipeline["ref"]),
         web_url=f"{client.settings.url}/{project}/-/pipelines/{pipeline_id}",
         jobs="\n".join(["\t".join(JOB_COLUMNS), *job_rows]),
         next_cursor=(
