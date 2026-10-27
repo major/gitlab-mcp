@@ -73,7 +73,7 @@ query(
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
 query(
-  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeLabels: Boolean!
+  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeLabels: Boolean!, $includeThreads: Boolean!
 ) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
@@ -92,7 +92,7 @@ query(
       autoMergeStrategy
       diffStatsSummary { additions deletions fileCount }
       resolvableDiscussionsCount resolvedDiscussionsCount
-      discussions(first: 100) {
+      discussions(first: 100) @include(if: $includeThreads) {
         pageInfo { hasNextPage }
         nodes {
           id resolvable resolved
@@ -277,7 +277,7 @@ class MergeRequestDetail(BaseModel):
     hidden_blockers: int = Field(default=0, exclude_if=lambda v: not v)  # Blockers the token cannot see.
     commits_behind: int | None = Field(default=None, exclude_if=lambda value: value is None)  # Open MRs, when asked.
     changes: DiffSummary | None = Field(default=None, exclude_if=lambda v: v is None)
-    threads: ThreadIndex
+    threads: ThreadIndex | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CompactMergeRequest(BaseModel):
@@ -783,6 +783,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     *,
     include_description: bool,
     include_labels: bool,
+    include_threads: bool,
     issue_key_prefixes: list[str] | None,
     description_limit: int,
     custom_issue_key_pattern: Any | None = None,
@@ -838,7 +839,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         latest_pipeline_id=pipeline_id,
         auto_merge_strategy=node["autoMergeStrategy"] or "",
         changes=_to_diff_summary(node["diffStatsSummary"]),
-        threads=_to_thread_index(node),
+        threads=_to_thread_index(node) if include_threads else None,
     )
 
 
@@ -941,6 +942,10 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         bool,
         Field(description="Include the first 100 labels. Defaults to false to keep output compact."),
     ] = False,
+    include_threads: Annotated[
+        bool,
+        Field(description="Include the first page of open thread refs. Defaults to true; false skips discussion data."),
+    ] = True,
     issue_key_prefixes: Annotated[
         list[str] | None,
         Field(
@@ -984,6 +989,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `approved`: Free means one approval. Premium and Ultimate mean all approval rules pass.
     - `auto_merge_strategy`: `merge_when_checks_pass`, `merge_train`, `add_to_merge_train_when_checks_pass` (waiting).
     - `threads.open` IDs go to get_merge_request_threads. `index_complete` false means some are missing.
+      Set `include_threads=false` to omit this index. For discussion details across several MRs, use the batch mode of
+      `get_merge_request_threads` instead.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
     - The description is skipped by default. Set `include_description=true` to read it when you need it.
@@ -1013,11 +1020,13 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         iid,
         includeDescription=include_description,
         includeLabels=include_labels,
+        includeThreads=include_threads,
     )
     detail = _to_detail(
         node,
         include_description=include_description,
         include_labels=include_labels,
+        include_threads=include_threads,
         issue_key_prefixes=issue_key_prefixes,
         description_limit=description_limit,
         custom_issue_key_pattern=custom_issue_key_pattern,

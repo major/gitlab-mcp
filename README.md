@@ -212,7 +212,14 @@ duplicate prevention, so a manual retry could create another issue. Labels and a
 
 ## Merge request bootstrap 🔀
 
+| Tool | Purpose |
+| --- | --- |
+| `get_merge_request` | Read merge request status, approvals, pipeline, and detail fields. `include_threads=true` (the default) includes the open-thread index; set it to false when also reading threads. |
+| `get_merge_request_threads` | Read review threads and, by default, merge request status fields. `include_mr_status=true` preserves standalone status output; set it to false when also calling `get_merge_request`. |
+
 For a full merge request bootstrap, call `get_merge_request` with `include_description=true` and `include_labels=true`. This adds no requests and returns the description, up to 100 labels, issue keys, open-thread index, source and target branches, head SHA, pipeline status, and numeric `latest_pipeline_id` when a pipeline is attached. Issue keys are extracted from the title on every call and from the full fetched description before description output is capped. Use `issue_key_prefixes` to filter keys by up to 20 validated literal prefixes.
+
+When reading both tools together, set `include_threads=false` on `get_merge_request` and `include_mr_status=false` on `get_merge_request_threads` to avoid duplicate data. For re-reviews, start with `view="headings"` and request `view="full"` only for selected thread IDs using `ids=[...]`.
 
 For another issue-key format, pass `issue_key_pattern`, such as `(?i)task-[0-9]+|REF#[0-9]+`. It replaces the default pattern and cannot be combined with `issue_key_prefixes`. Full matches preserve case, ignore empty matches, and are deduplicated in source order. Patterns are limited to 256 characters; custom extraction scans at most 65,536 characters, keeps at most 100 unique keys, and skips matches longer than 256 characters. `issue_keys_truncated=true` signals any of these extraction limits. Matching has a 50 ms timeout and raises an error instead of returning partial results on timeout. Patterns are caller-authored configuration: matching against GitLab text is bounded, but arbitrary hostile pattern compilation is not sandboxed.
 

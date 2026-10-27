@@ -112,7 +112,17 @@ async def test_server_instructions_list_real_main_arguments(gitlab_env):
     """Every argument named in the instructions' main-argument summary exists on its tool."""
     # Arrange
     summary_args = {
-        "get_merge_request_threads": {"project", "iid", "iids", "state", "view", "count_only", "cursor"},
+        "get_merge_request": {"project", "iid", "include_threads"},
+        "get_merge_request_threads": {
+            "project",
+            "iid",
+            "iids",
+            "state",
+            "view",
+            "include_mr_status",
+            "count_only",
+            "cursor",
+        },
         "post_review_notes": {
             "project",
             "iid",
@@ -245,6 +255,8 @@ async def test_write_tools_are_marked_as_writes(tools, name):
 @pytest.mark.parametrize(
     ("name", "required", "optional"),
     [
+        ("get_merge_request", {"project", "iid"}, {"include_threads"}),
+        ("get_merge_request_threads", {"project"}, {"iid", "iids", "include_mr_status"}),
         ("get_work_item", {"project", "iid"}, {"scope", "include_description", "description_limit", "cursor"}),
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
         (

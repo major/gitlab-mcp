@@ -66,6 +66,9 @@ mcp = FastMCP(
         "resolve_open_threads to close every open thread, and "
         "edit_merge_request_description to update the description. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
+        "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "
+        "get_merge_request_threads(include_mr_status=false) to avoid duplicate data. For re-reviews, start with "
+        'view="headings" and use view="full" only for selected thread IDs. '
         "Use get_merge_request for approvals and jobs (add include_description=true for the description), "
         "and get_merge_request_diff for patches. "
         "For CI triage, use list_pipelines to find a pipeline, get_pipeline to inspect its jobs, then get_job_log "
@@ -79,8 +82,9 @@ mcp = FastMCP(
         "push with --force-with-lease. "
         # 🔍 Main arguments, so one tool search is enough. Client searches often cut long signatures.
         "Main arguments: "
-        "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, view=full|headings|finding, "
-        "count_only, cursor); "
+        "get_merge_request(project, iid, include_threads); "
+        "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, "
+        "view=full|headings|finding, include_mr_status, count_only, cursor); "
         "post_review_notes(project, iid, head_sha, notes=[{file, line or old_line (neither for a file-level note), "
         "body or body_path}] or batch_id, add_reviewers, add_assignees, validate_only); "
         "update_merge_request(project, iid, add_reviewers, remove_reviewers, add_assignees, remove_assignees, "
