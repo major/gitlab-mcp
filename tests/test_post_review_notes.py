@@ -151,6 +151,27 @@ async def call_tool_result(
     )
 
 
+async def validate_and_post_batch(notes: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate notes and post their cached batch within one MCP lifespan."""
+    async with Client(mcp) as client:
+        validation = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": notes, "validate_only": True},
+            raise_on_error=False,
+        )
+        posting = await client.call_tool(
+            "post_review_notes",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "head_sha": HEAD,
+                "batch_id": validation.structured_content["batch_id"],
+            },
+            raise_on_error=False,
+        )
+    return validation.structured_content, posting.structured_content
+
+
 def serve_people(request: httpx.Request) -> httpx.Response:
     """Answer the username lookup with the known users, and each people mutation with no errors."""
     query = json.loads(request.content)["query"]
@@ -181,8 +202,8 @@ def write_order() -> list[str]:
 
 
 @respx.mock
-async def test_validate_only_checks_new_and_old_side_positions_without_posting(gitlab_env):
-    """Validation returns each exact position after both SHA checks, without writes."""
+async def test_validate_only_prepares_new_and_old_side_notes_without_returning_positions(gitlab_env):
+    """Successful validation returns statuses and a batch token without exposing position blocks."""
     # Arrange
     patch = "@@ -5 +5,2 @@\n context\n+added"
     mr_route, diff_route = add_preflight([([diff_file("src.py", patch=patch)], None)])
@@ -197,17 +218,10 @@ async def test_validate_only_checks_new_and_old_side_positions_without_posting(g
 
     # Assert
     assert data["results"] == [
-        {
-            "index": 0,
-            "status": "validated",
-            "position": {"path": "src.py", "line": 6},
-        },
-        {
-            "index": 1,
-            "status": "validated",
-            "position": {"path": "src.py", "line": 5},
-        },
+        {"index": 0, "status": "validated"},
+        {"index": 1, "status": "validated"},
     ]
+    assert data["batch_id"]
     assert "warning" not in data
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -318,7 +332,7 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
 
 @respx.mock
 async def test_file_level_note_is_validated_from_its_path_alone(gitlab_env):
-    """A file-level note needs only its path in the diff, so validation returns just the path."""
+    """Successful file-level validation returns a batch token without a position block."""
     # Arrange
     _, diff_route = add_preflight([([diff_file("src.py", patch="")], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -330,7 +344,8 @@ async def test_file_level_note_is_validated_from_its_path_alone(gitlab_env):
     )
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py"}}]
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
     assert "warning" not in data
     assert len(diff_route.calls) == 1
     assert not post_route.called
@@ -1412,7 +1427,7 @@ async def test_gitlab_error_on_a_people_write_is_failed_with_its_reason(gitlab_e
 
 @respx.mock
 async def test_validate_only_ignores_people_and_sends_no_people_requests(gitlab_env):
-    """Validation returns positions only. People are applied by the real post, not by validation."""
+    """Successful validation returns a token without positions or people-write requests."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -1427,7 +1442,8 @@ async def test_validate_only_ignores_people_and_sends_no_people_requests(gitlab_
     )
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}}]
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
     assert "people" not in data
     assert "warning" not in data
     assert not graphql_route.called
@@ -1634,7 +1650,7 @@ async def test_compact_validation_keeps_batch_id_and_reposting_counts_success(gi
         posted_data = posted.structured_content
 
     # Assert
-    assert validated["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}}]
+    assert validated["results"] == [{"index": 0, "status": "validated"}]
     assert validated["posted_count"] == 0
     assert validated["batch_id"]
     assert posted_data == {"results": [], "posted_count": 1}
@@ -1885,7 +1901,10 @@ async def test_unchanged_lines_map_before_between_and_after_hunks_on_both_sides(
 ):
     """Verified gaps map by offset despite the earlier replacement's line-count change."""
     # Arrange
-    add_preflight([([diff_file("src.py", patch=EXPANSION_PATCH)], None)])
+    mr_route, diff_route = add_preflight(
+        [([diff_file("src.py", patch=EXPANSION_PATCH)], None)] * TWO_POSTS,
+        merge_requests=[merge_request() for _ in range(FOUR_PREFLIGHT_REQUESTS)],
+    )
     old_route, new_route = add_blobs(
         ("src.py", BASE_SHA, OLD_SNAPSHOT),
         ("src.py", HEAD, NEW_SNAPSHOT),
@@ -1895,17 +1914,28 @@ async def test_unchanged_lines_map_before_between_and_after_hunks_on_both_sides(
     note["line" if side == "new" else "old_line"] = target
 
     # Act
-    data = await call_tool(notes=[note], validate_only=True)
+    data, posted = await validate_and_post_batch([note])
 
     # Assert
-    assert data["results"] == [
-        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": expected_new}}
-    ]
-    assert len(old_route.calls) == 1
-    assert len(new_route.calls) == 1
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
+    assert posted["results"] == [{"index": 0, "status": "posted", "discussion_id": "discussion-1"}]
+    assert json.loads(post_route.calls[0].request.content)["position"] == {
+        "position_type": "text",
+        "old_path": "src.py",
+        "new_path": "src.py",
+        "old_line": expected_old,
+        "new_line": expected_new,
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+    }
+    assert len(old_route.calls) == TWO_POSTS
+    assert len(new_route.calls) == TWO_POSTS
     assert old_route.calls[0].request.url.params["ref"] == BASE_SHA
     assert new_route.calls[0].request.url.params["ref"] == HEAD
-    assert not post_route.called
+    assert len(mr_route.calls) == FOUR_PREFLIGHT_REQUESTS
+    assert len(diff_route.calls) == TWO_POSTS
 
 
 @respx.mock
@@ -1952,19 +1982,35 @@ async def test_zero_count_hunks_preserve_insertion_and_deletion_boundaries(
     patch = "@@ -2,0 +3 @@\n+inserted\n@@ -5 +5,0 @@\n-removed"
     old_blob = b"one\ntwo\nthree\nfour\nremoved\nsix\n"
     new_blob = b"one\ntwo\ninserted\nthree\nfour\nsix\n"
-    add_preflight([([diff_file("src.py", patch=patch)], None)])
+    mr_route, diff_route = add_preflight(
+        [([diff_file("src.py", patch=patch)], None)] * TWO_POSTS,
+        merge_requests=[merge_request() for _ in range(FOUR_PREFLIGHT_REQUESTS)],
+    )
     add_blobs(("src.py", BASE_SHA, old_blob), ("src.py", HEAD, new_blob))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     note = {"file": "src.py", "body": "Review unchanged code."}
     note["line" if side == "new" else "old_line"] = target
 
     # Act
-    data = await call_tool(notes=[note], validate_only=True)
+    data, posted = await validate_and_post_batch([note])
 
     # Assert
-    assert data["results"] == [
-        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": expected_new}}
-    ]
-    assert len(raw_blob_calls()) == TWO_POSTS
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
+    assert posted["results"] == [{"index": 0, "status": "posted", "discussion_id": "discussion-1"}]
+    assert json.loads(post_route.calls[0].request.content)["position"] == {
+        "position_type": "text",
+        "old_path": "src.py",
+        "new_path": "src.py",
+        "old_line": expected_old,
+        "new_line": expected_new,
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+    }
+    assert len(raw_blob_calls()) == FOUR_PREFLIGHT_REQUESTS
+    assert len(mr_route.calls) == FOUR_PREFLIGHT_REQUESTS
+    assert len(diff_route.calls) == TWO_POSTS
 
 
 @pytest.mark.parametrize(
@@ -1995,7 +2041,8 @@ async def test_unchanged_gap_comparison_preserves_git_blob_line_terminators(
     data = await call_tool(notes=[review_note("src.py", target)], validate_only=True)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": target}}]
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
 
 
 @pytest.mark.parametrize(
@@ -2139,21 +2186,39 @@ async def test_rename_uses_old_and_new_paths_and_base_head_refs(gitlab_env):
     # Arrange
     old_path, new_path = "old dir/src.py", "new dir/src.py"
     patch = "@@ -2 +2 @@\n-old\n+new"
-    add_preflight([([diff_file(old_path, new_path, patch)], None)])
+    mr_route, diff_route = add_preflight(
+        [([diff_file(old_path, new_path, patch)], None)] * TWO_POSTS,
+        merge_requests=[merge_request() for _ in range(FOUR_PREFLIGHT_REQUESTS)],
+    )
     old_route, new_route = add_blobs(
         (old_path, BASE_SHA, b"before\nold\nafter\n"),
         (new_path, HEAD, b"before\nnew\nafter\n"),
     )
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
 
     # Act
-    data = await call_tool(notes=[review_note(new_path, 3)], validate_only=True)
+    data, posted = await validate_and_post_batch([review_note(new_path, 3)])
 
     # Assert
-    assert data["results"][0]["position"] == {"path": new_path, "old_path": old_path, "line": 3}
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
+    assert posted["results"] == [{"index": 0, "status": "posted", "discussion_id": "discussion-1"}]
+    assert json.loads(post_route.calls[0].request.content)["position"] == {
+        "position_type": "text",
+        "old_path": old_path,
+        "new_path": new_path,
+        "old_line": 3,
+        "new_line": 3,
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+    }
     assert str(old_route.calls[0].request.url).endswith("/old%20dir%2Fsrc.py/raw?ref=" + BASE_SHA)
     assert str(new_route.calls[0].request.url).endswith("/new%20dir%2Fsrc.py/raw?ref=" + HEAD)
     assert old_route.calls[0].request.url.params["ref"] == BASE_SHA
     assert new_route.calls[0].request.url.params["ref"] == HEAD
+    assert len(mr_route.calls) == FOUR_PREFLIGHT_REQUESTS
+    assert len(diff_route.calls) == TWO_POSTS
 
 
 @respx.mock
@@ -2402,7 +2467,8 @@ async def test_invalid_diff_records_do_not_make_a_valid_expansion_ambiguous(gitl
     data = await call_tool(notes=[review_note("src.py", 2)], validate_only=True)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": 2}}]
+    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["batch_id"]
     assert len(old_route.calls) == 1
     assert len(new_route.calls) == 1
 

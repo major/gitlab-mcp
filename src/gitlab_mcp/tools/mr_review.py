@@ -907,6 +907,19 @@ def _cached_review_notes_with_overrides(
     return notes
 
 
+def _select_review_notes(notes: list[ReviewNote], indices: list[int] | None) -> tuple[list[ReviewNote], list[int]]:
+    """Select notes in caller order while keeping their original batch indices."""
+    if indices is None:
+        return notes.copy(), list(range(len(notes)))
+    if not indices:
+        raise ToolError("indices must contain at least one batch index.")  # noqa: TRY003
+    if len(set(indices)) != len(indices):
+        raise ToolError("indices must be unique.")  # noqa: TRY003
+    if any(index < 0 or index >= len(notes) for index in indices):
+        raise ToolError("indices must be within the cached batch.")  # noqa: TRY003
+    return [notes[index] for index in indices], indices
+
+
 async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the batch request.
     ctx: Context,
     project: str,
@@ -946,7 +959,12 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                 for note, check in zip(notes, checks, strict=True)
             )
             batch_id = get_review_batch_cache(ctx).put(project, iid, refs["head_sha"], cached_notes)
-            result = result.model_copy(update={"batch_id": batch_id})
+            result = result.model_copy(
+                update={
+                    "batch_id": batch_id,
+                    "results": [row.model_copy(update={"position": {}}) for row in result.results],
+                }
+            )
         return result
     return await _post_review_note_batch(client, project, iid, checks, refs)
 
@@ -994,6 +1012,13 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         str,
         Field(description="Full 40-character head SHA from get_merge_request or get_merge_request_diff."),
     ],
+    indices: Annotated[
+        list[int] | None,
+        Field(
+            min_length=1,
+            description="Unique zero-based indices to post from a cached batch, in posting order. Requires batch_id.",
+        ),
+    ] = None,
     notes: Annotated[
         list[ReviewNote] | None,
         Field(min_length=1, max_length=20, description="Notes to validate or post. Required unless batch_id is set."),
@@ -1049,11 +1074,14 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     alone is not enough. Then call this tool with that `batch_id` instead of `notes`. Optional `body_overrides` entries
     use `{index, body}` or `{index, body_path}` to replace cached bodies at zero-based indices. Each index must be
     unique and in range, each entry must set exactly one body source, and omitted indices keep their cached snapshots.
-    Overrides require `batch_id`. The tool checks every final body and reruns fresh SHA, path, and position checks
+    Overrides require `batch_id` and always use indices from the original full batch. Optional `indices` selects a
+    nonempty, unique, in-range subset to post, in the supplied order. It also requires `batch_id`; omitted `indices`
+    posts the full batch in its original order. Returned row indices always refer to the original batch. The tool
+    checks every selected final body and reruns fresh SHA, path, and position checks
     before the first write. The handle is opaque, is not approval, expires after 30 minutes,
     may be evicted earlier when the bounded cache is full, and is invalidated by a server restart. It is consumed on
-    any posting attempt, including failed preflight or writes. An invalid override index is checked after the handle
-    is claimed and therefore consumes it. If it is unavailable, send the notes again. `head_sha`
+    any posting attempt, including failed preflight or writes. Invalid override and selection indices are checked
+    after the handle is claimed and therefore consume it. If it is unavailable, send the notes again. `head_sha`
     must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
     Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
     for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
@@ -1079,14 +1107,23 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         raise ToolError("validate_only cannot be combined with batch_id.")  # noqa: TRY003
     if body_overrides is not None and batch_id is None:
         raise ToolError("body_overrides can only be used with batch_id.")  # noqa: TRY003
+    if indices is not None and batch_id is None:
+        raise ToolError("indices can only be used with batch_id.")  # noqa: TRY003
 
+    selected_indices = list(range(len(notes or [])))
     if batch_id is not None:
         cached_batch = get_review_batch_cache(ctx).claim(batch_id, project, iid, head_sha)
-        notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
+        cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
+        notes, selected_indices = _select_review_notes(cached_notes, indices)
     if notes is None:
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
     result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only)
+    result = result.model_copy(
+        update={
+            "results": [row.model_copy(update={"index": selected_indices[row.index]}) for row in result.results],
+        }
+    )
     if not validate_only:
         result = await _add_people_after_posts(ctx, project, iid, result, add_reviewers, add_assignees)
     if compact:

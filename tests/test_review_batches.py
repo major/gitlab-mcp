@@ -232,6 +232,123 @@ async def test_batch_body_override_keeps_coordinates_and_resolves_fresh_position
 
 
 @respx.mock
+async def test_batch_indices_post_in_supplied_order_and_keep_original_result_indices(review_client: Client) -> None:
+    """A noncontiguous subset posts in caller order and reports full-batch indices."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"file": "src.py", "line": line, "body": f"note {line}"} for line in (1, 2, 3)]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+
+    # Act
+    posted = await call_review(
+        review_client,
+        **note_args(batch_id=prepared.structured_content["batch_id"], indices=[2, 0]),
+    )
+
+    # Assert
+    assert not posted.is_error
+    assert [(row["index"], row["status"]) for row in posted.structured_content["results"]] == [
+        (2, "posted"),
+        (0, "posted"),
+    ]
+    requests = [json.loads(call.request.content) for call in post_route.calls]
+    assert [request["body"] for request in requests] == ["note 3", "note 1"]
+
+
+@pytest.mark.parametrize(
+    "indices",
+    [
+        pytest.param([], id="empty"),
+        pytest.param([0, 0], id="duplicate"),
+        pytest.param([-1], id="negative"),
+        pytest.param([2], id="out-of-range"),
+    ],
+)
+@respx.mock
+async def test_invalid_batch_indices_are_rejected_without_gitlab_writes(
+    review_client: Client,
+    indices: list[int],
+) -> None:
+    """Empty, duplicate, negative, or out-of-range selection indices cannot post notes."""
+    # Arrange
+    mr_route, diff_route = add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(
+        review_client,
+        **note_args(
+            notes=[
+                {"file": "src.py", "line": 1, "body": "first"},
+                {"file": "src.py", "line": 2, "body": "second"},
+            ],
+            validate_only=True,
+        ),
+    )
+    before = (len(mr_route.calls), len(diff_route.calls), len(post_route.calls))
+
+    # Act
+    rejected = await call_review(
+        review_client,
+        **note_args(batch_id=prepared.structured_content["batch_id"], indices=indices),
+    )
+
+    # Assert
+    assert_rejected(rejected)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == before
+
+
+@respx.mock
+async def test_subset_applies_original_index_override_then_adds_people(review_client: Client) -> None:
+    """Overrides use original indices and people changes follow every selected note post."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    def answer_people(request: httpx.Request) -> httpx.Response:
+        """Return known users and successful reviewer or assignee mutations."""
+        query = json.loads(request.content)["query"]
+        if "users(" in query:
+            return response({"data": {"users": {"nodes": [{"username": "alice"}, {"username": "bob"}]}}})
+        mutation = "mergeRequestSetReviewers" if "mergeRequestSetReviewers" in query else "mergeRequestSetAssignees"
+        return response({"data": {mutation: {"errors": []}}})
+
+    people_route = respx.post(GRAPHQL).mock(side_effect=answer_people)
+    notes = [{"file": "src.py", "line": line, "body": f"original {line}"} for line in (1, 2, 3)]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+
+    # Act
+    posted = await call_review(
+        review_client,
+        **note_args(
+            batch_id=prepared.structured_content["batch_id"],
+            indices=[2, 0],
+            body_overrides=[{"index": 2, "body": "replacement third"}],
+            add_reviewers=["alice"],
+            add_assignees=["bob"],
+        ),
+    )
+
+    # Assert
+    assert not posted.is_error
+    assert [(row["index"], row["status"]) for row in posted.structured_content["results"]] == [
+        (2, "posted"),
+        (0, "posted"),
+    ]
+    assert posted.structured_content["people"]["applied"] == ["add_reviewers", "add_assignees"]
+    assert [json.loads(call.request.content)["body"] for call in post_route.calls] == [
+        "replacement third",
+        "original 1",
+    ]
+    request_order = [
+        "discussion" if "query" not in json.loads(call.request.content) else "people"
+        for call in respx.calls
+        if call.request.method == "POST"
+    ]
+    assert request_order == ["discussion", "discussion", "people", "people", "people"]
+    assert len(people_route.calls) == PEOPLE_REQUESTS
+
+
+@respx.mock
 async def test_batch_body_path_override_reads_replacement_body(review_client: Client, tmp_path: Path) -> None:
     """A cached note body can be replaced by a server-local body path."""
     # Arrange
@@ -419,6 +536,10 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
                 "body_overrides": [{"index": 0, "body": "replacement"}],
             },
             id="overrides-with-notes",
+        ),
+        pytest.param(
+            {"notes": [{"file": "src.py", "line": 1, "body": "review"}], "indices": [0]},
+            id="indices-without-batch",
         ),
         pytest.param({"body_overrides": [{"index": 0, "body": "replacement"}]}, id="overrides-without-batch"),
         pytest.param(
