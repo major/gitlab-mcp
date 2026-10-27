@@ -62,9 +62,10 @@ mcp = FastMCP(
         "GitLab. Call get_current_user first to learn who you are acting as. "
         "For merge request lifecycle work, push the branch before create_merge_request; "
         "use list_labels(search=...) to find labels, "
-        'get_merge_request_threads(state="open") to triage, reply_to_thread(resolve=true) to respond or resolve, '
-        "resolve_open_threads to close every open thread, and "
-        "edit_merge_request_description to update the description. "
+        'get_merge_request_threads(state="open") to triage, reply_to_thread(resolve=true) to respond or resolve; '
+        "use reply_to_threads for batched replies and post-write approval and auto-merge summaries; "
+        "use resolve_open_threads to close every open thread, and "
+        "use edit_merge_request_description to update the description. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
         "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "
         "get_merge_request_threads(include_mr_status=false) to avoid duplicate data. For re-reviews, start with "

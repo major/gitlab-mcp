@@ -223,6 +223,12 @@ When reading both tools together, set `include_threads=false` on `get_merge_requ
 
 For another issue-key format, pass `issue_key_pattern`, such as `(?i)task-[0-9]+|REF#[0-9]+`. It replaces the default pattern and cannot be combined with `issue_key_prefixes`. Full matches preserve case, ignore empty matches, and are deduplicated in source order. Patterns are limited to 256 characters; custom extraction scans at most 65,536 characters, keeps at most 100 unique keys, and skips matches longer than 256 characters. `issue_keys_truncated=true` signals any of these extraction limits. Matching has a 50 ms timeout and raises an error instead of returning partial results on timeout. Patterns are caller-authored configuration: matching against GitLab text is bounded, but arbitrary hostile pattern compilation is not sandboxed.
 
+## Batched thread replies 💬
+
+Call `reply_to_threads` with `replies` containing 1-20 items with `iid`, `thread_id`, optional `body`, and optional `resolve`, in write order. The tool runs writes sequentially; a failed item does not stop later writes, and writes are never retried. Get user approval before posting or resolving.
+
+After all writes, the result includes one best-effort `merge_requests` summary per distinct IID with `iid`, `open_threads`, `approved`, `approvals_left`, `auto_merge_strategy`, and `warning`. A combined status and thread-count query normally runs once per IID, with no per-reply reads. On GitLab CE, an explicit unsupported `approvalsLeft` field error triggers one read-only fallback without that field. Unknown optional values are omitted, but `approved=false`, `approvals_left=0`, and an empty `auto_merge_strategy` are retained. Read failures add a warning without changing write results. The last requested resolve item per IID also keeps its `open_threads` value when that resolution and the count read succeed.
+
 ## Merge request review notes 📝
 
 `post_review_notes` accepts general, file-level, and inline notes in one batch. Omit `file`, `line`, and `old_line` for a general merge-request discussion. Set only `file` for a file-level discussion, or set `file` and one line coordinate for an inline discussion. General-only batches skip diff reads, but still verify the supplied `head_sha` against the merge request twice. Mixed batches validate every diff note before posting any note. Use `validate_only=true` to check the batch without writing.

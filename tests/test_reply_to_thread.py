@@ -28,6 +28,25 @@ def count_response(resolvable: int, resolved: int) -> httpx.Response:
     return httpx.Response(200, json={"data": {"project": {"mergeRequest": node}}})
 
 
+def reply_status_response(
+    resolvable: int,
+    resolved: int,
+    *,
+    approved: bool | None = True,
+    approvals_left: int | None = 0,
+    auto_merge_strategy: str | None = None,
+) -> httpx.Response:
+    """Return the compact GraphQL envelope used for reply-batch status summaries."""
+    node = {
+        "resolvableDiscussionsCount": resolvable,
+        "resolvedDiscussionsCount": resolved,
+        "approved": approved,
+        "approvalsLeft": approvals_left,
+        "autoMergeStrategy": auto_merge_strategy,
+    }
+    return httpx.Response(200, json={"data": {"project": {"mergeRequest": node}}})
+
+
 def sent_variables(route: respx.Route) -> dict[str, Any]:
     """Return the GraphQL variables from the last request the route received."""
     return json.loads(route.calls.last.request.content)["variables"]
@@ -352,6 +371,7 @@ async def test_batch_continues_after_success_failure_and_unknown_write(gitlab_en
             (2190, 201, {"id": 44}),
         ]
     ]
+    respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
     replies = [{"iid": iid, "thread_id": "thread", "body": f"reply {iid}"} for iid in (2187, 2188, 2189, 2190)]
 
     # Act
@@ -372,14 +392,15 @@ async def test_batch_continues_after_success_failure_and_unknown_write(gitlab_en
 
 @respx.mock
 async def test_batch_keeps_cross_merge_request_writes_in_input_order(gitlab_env):
-    """Each MR reply and resolve pair runs before the next input item."""
+    """Writes keep input order, then deduplicated status reads run in first-request order."""
     # Arrange
     calls: list[tuple[str, int]] = []
     replies = [
         {"iid": 2187, "thread_id": "first", "body": "first", "resolve": True},
         {"iid": 2188, "thread_id": "second", "body": "second", "resolve": True},
+        {"iid": 2187, "thread_id": "third", "body": "third", "resolve": True},
     ]
-    for iid, thread_id in ((2187, "first"), (2188, "second")):
+    for iid, thread_id in ((2187, "first"), (2188, "second"), (2187, "third")):
         path = API + f"/projects/group%2Fproject/merge_requests/{iid}/discussions/{thread_id}"
         respx.post(path + "/notes").mock(
             side_effect=lambda request, requested_iid=iid: (
@@ -394,16 +415,45 @@ async def test_batch_keeps_cross_merge_request_writes_in_input_order(gitlab_env)
             )[1]
         )
 
-    respx.post(GRAPHQL).mock(return_value=count_response(1, 1))
+    def serve_status(request: httpx.Request) -> httpx.Response:
+        """Record each post-write summary request and return its MR status."""
+        requested_iid = int(json.loads(request.content)["variables"]["iid"])
+        calls.append(("status", requested_iid))
+        return reply_status_response(2, 2, approved=requested_iid == IID, approvals_left=0)
+
+    statuses = respx.post(GRAPHQL).mock(side_effect=serve_status)
 
     # Act
     result = await call_reply_batch(replies)
 
     # Assert
-    assert calls == [("reply", 2187), ("resolve", 2187), ("reply", 2188), ("resolve", 2188)]
-    assert [row["status"] for row in result["results"]] == ["applied", "applied"]
-    assert [row["resolved"] for row in result["results"]] == [True, True]
-    assert [row["open_threads"] for row in result["results"]] == [0, 0]
+    assert calls == [
+        ("reply", 2187),
+        ("resolve", 2187),
+        ("reply", 2188),
+        ("resolve", 2188),
+        ("reply", 2187),
+        ("resolve", 2187),
+        ("status", 2187),
+        ("status", 2188),
+    ]
+    assert [row["status"] for row in result["results"]] == ["applied"] * 3
+    assert [row["resolved"] for row in result["results"]] == [True] * 3
+    assert [row.get("open_threads") for row in result["results"]] == [None, 0, 0]
+    assert [row["iid"] for row in result["merge_requests"]] == [2187, 2188]
+    assert [row["approved"] for row in result["merge_requests"]] == [True, False]
+    assert [json.loads(call.request.content)["variables"]["iid"] for call in statuses.calls] == ["2187", "2188"]
+    query = json.loads(statuses.calls[0].request.content)["query"]
+    assert all(
+        field in query
+        for field in (
+            "approved",
+            "approvalsLeft",
+            "autoMergeStrategy",
+            "resolvableDiscussionsCount",
+            "resolvedDiscussionsCount",
+        )
+    )
 
 
 @pytest.mark.parametrize("count", [0, 21])
@@ -449,6 +499,7 @@ async def test_batch_connection_error_is_unknown_and_later_items_continue(gitlab
     success = respx.post(API + "/projects/group%2Fproject/merge_requests/2188/discussions/thread/notes").mock(
         return_value=httpx.Response(201, json={"id": 12})
     )
+    respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
 
     # Act
     result = await call_reply_batch(
@@ -470,6 +521,7 @@ async def test_batch_resolution_5xx_is_unknown_not_failed(gitlab_env):
     # Arrange
     note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
     resolve = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(503, json={"message": "Server error"}))
+    respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
 
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply", "resolve": True}])
@@ -482,7 +534,7 @@ async def test_batch_resolution_5xx_is_unknown_not_failed(gitlab_env):
 
 @respx.mock
 async def test_batch_reads_open_threads_once_per_merge_request_after_its_last_resolve(gitlab_env):
-    """Each MR gets one count, read after its last resolve item, and each count stays with its own MR."""
+    """Legacy open counts reuse each post-write summary without adding another read."""
     # Arrange
     open_counts = {"2187": (2, 2), "2188": (3, 1)}  # (resolvable, resolved): 0 open for 2187, 2 open for 2188.
     for iid, thread_id in ((2187, "a"), (2188, "b"), (2187, "c")):
@@ -491,9 +543,9 @@ async def test_batch_reads_open_threads_once_per_merge_request_after_its_last_re
         respx.put(path).mock(return_value=httpx.Response(200, json={"resolved": True}))
 
     def serve_counts(request: httpx.Request) -> httpx.Response:
-        """Return the totals for the merge request named in the GraphQL variables."""
+        """Return the status totals for the merge request named in the GraphQL variables."""
         iid = json.loads(request.content)["variables"]["iid"]
-        return count_response(*open_counts[iid])
+        return reply_status_response(*open_counts[iid])
 
     counts = respx.post(GRAPHQL).mock(side_effect=serve_counts)
 
@@ -507,21 +559,22 @@ async def test_batch_reads_open_threads_once_per_merge_request_after_its_last_re
     )
 
     # Assert
-    assert [json.loads(call.request.content)["variables"]["iid"] for call in counts.calls] == ["2188", "2187"]
+    assert [json.loads(call.request.content)["variables"]["iid"] for call in counts.calls] == ["2187", "2188"]
     assert "open_threads" not in result["results"][0]
     assert [row["open_threads"] for row in result["results"][1:]] == [2, 0]
+    assert [row["open_threads"] for row in result["merge_requests"]] == [0, 2]
 
 
 @respx.mock
 async def test_batch_omits_open_threads_when_the_last_resolution_fails(gitlab_env):
-    """An earlier successful resolve gets no count when the MR's last resolve item failed."""
+    """A failed final resolve gets no legacy count while the post-write MR summary is still read."""
     # Arrange
     path = API + "/projects/group%2Fproject/merge_requests/2187/discussions/"
     respx.post(path + "a/notes").mock(return_value=httpx.Response(201, json={"id": 1}))
     respx.put(path + "a").mock(return_value=httpx.Response(200, json={"resolved": True}))
     respx.post(path + "b/notes").mock(return_value=httpx.Response(201, json={"id": 2}))
     respx.put(path + "b").mock(return_value=httpx.Response(403, json={"message": "Cannot resolve"}))
-    counts = respx.post(GRAPHQL).mock(return_value=count_response(1, 1))
+    counts = respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 1))
 
     # Act
     result = await call_reply_batch(
@@ -534,4 +587,338 @@ async def test_batch_omits_open_threads_when_the_last_resolution_fails(gitlab_en
     # Assert
     assert [row["status"] for row in result["results"]] == ["applied", "partial"]
     assert all("open_threads" not in row for row in result["results"])
-    assert counts.call_count == 0
+    assert counts.call_count == 1
+    assert result["merge_requests"] == [
+        {
+            "iid": IID,
+            "open_threads": 0,
+            "approved": True,
+            "approvals_left": 0,
+            "auto_merge_strategy": "",
+        }
+    ]
+
+
+@respx.mock
+async def test_batch_includes_false_zero_and_cleared_auto_merge_status(gitlab_env):
+    """False approval and zero remaining approvals stay visible, and null strategy means cleared."""
+    # Arrange
+    respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    status = respx.post(GRAPHQL).mock(
+        return_value=reply_status_response(1, 0, approved=False, approvals_left=0, auto_merge_strategy=None)
+    )
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert status.call_count == 1
+    assert result["merge_requests"] == [
+        {
+            "iid": IID,
+            "open_threads": 1,
+            "approved": False,
+            "approvals_left": 0,
+            "auto_merge_strategy": "",
+        }
+    ]
+
+
+@respx.mock
+async def test_batch_omits_nullable_approvals_left(gitlab_env):
+    """A null approvalsLeft value remains unknown and is omitted, not changed to zero."""
+    # Arrange
+    respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0, approvals_left=None))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert result["merge_requests"] == [{"iid": IID, "open_threads": 1, "approved": True, "auto_merge_strategy": ""}]
+
+
+@respx.mock
+async def test_ce_unsupported_approvals_left_falls_back_for_status(gitlab_env):
+    """An explicit unsupported-field error retries the status read without approvalsLeft only."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={"errors": [{"message": "Field 'approvalsLeft' doesn't exist on type 'MergeRequest'"}]},
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "project": {
+                            "mergeRequest": {
+                                "approved": False,
+                                "autoMergeStrategy": "MERGE",
+                                "resolvableDiscussionsCount": 3,
+                                "resolvedDiscussionsCount": 1,
+                            }
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    status = respx.post(GRAPHQL).mock(side_effect=lambda request: next(responses))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert note.call_count == 1
+    assert result["results"][0]["status"] == "applied"
+    queries = [json.loads(call.request.content)["query"] for call in status.calls]
+    assert "approvalsLeft" in queries[0]
+    assert "approvalsLeft" not in queries[1]
+    assert result["merge_requests"] == [
+        {
+            "iid": IID,
+            "open_threads": 2,
+            "approved": False,
+            "auto_merge_strategy": "MERGE",
+            "warning": "This GitLab schema does not support approvalsLeft; approvals_left is unknown.",
+        }
+    ]
+
+
+@respx.mock
+async def test_arbitrary_graphql_error_does_not_retry_status_query(gitlab_env):
+    """GraphQL errors other than the approvalsLeft schema mismatch do not trigger fallback."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    status = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"errors": [{"message": "Access denied"}]}))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert note.call_count == 1
+    assert status.call_count == 1
+    assert result["results"][0]["status"] == "applied"
+    assert set(result["merge_requests"][0]) == {"iid", "warning"}
+    assert "Access denied" in result["merge_requests"][0]["warning"]
+
+
+@respx.mock
+async def test_fallback_read_failure_keeps_successful_write(gitlab_env):
+    """A failed CE fallback preserves the successful write and returns only an IID and warning."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={"errors": [{"message": "Cannot query field 'approvalsLeft' on type 'MergeRequest'."}]},
+            ),
+            httpx.Response(403, json={"message": "Status unavailable"}),
+        ]
+    )
+    respx.post(GRAPHQL).mock(side_effect=lambda request: next(responses))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert note.call_count == 1
+    assert result["results"][0]["status"] == "applied"
+    assert set(result["merge_requests"][0]) == {"iid", "warning"}
+    assert "HTTP 403" in result["merge_requests"][0]["warning"]
+
+
+@respx.mock
+async def test_missing_auto_merge_strategy_is_omitted_not_cleared(gitlab_env):
+    """A missing autoMergeStrategy means unknown, while only an explicit null means cleared."""
+    # Arrange
+    respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "project": {
+                        "mergeRequest": {
+                            "approved": True,
+                            "approvalsLeft": None,
+                            "resolvableDiscussionsCount": 1,
+                            "resolvedDiscussionsCount": 0,
+                        }
+                    }
+                }
+            },
+        )
+    )
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert result["merge_requests"] == [{"iid": IID, "open_threads": 1, "approved": True}]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "omitted_field", "warning"),
+    [
+        ("approved", "yes", "approved", "invalid approval status"),
+        ("approvalsLeft", True, "approvals_left", "invalid approvals-left value"),
+        ("autoMergeStrategy", 123, "auto_merge_strategy", "invalid auto-merge strategy"),
+        ("approved", None, "approved", None),
+    ],
+    ids=["invalid-approval", "bool-approvals-left", "invalid-auto-merge", "unknown-approval"],
+)
+@respx.mock
+async def test_invalid_status_values_are_omitted_without_changing_write_result(
+    gitlab_env, field, value, omitted_field, warning
+):
+    """Invalid or unknown optional status fields are omitted while valid status and write results remain."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    node: dict[str, Any] = {
+        "approved": True,
+        "approvalsLeft": 0,
+        "autoMergeStrategy": "MERGE",
+        "resolvableDiscussionsCount": 2,
+        "resolvedDiscussionsCount": 1,
+    }
+    node[field] = value
+    status = respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(200, json={"data": {"project": {"mergeRequest": node}}})
+    )
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert note.call_count == status.call_count == 1
+    assert result["results"] == [{"iid": IID, "thread_id": "thread-1", "status": "applied", "resolved": None}]
+    summary = result["merge_requests"][0]
+    expected_summary: dict[str, Any] = {
+        "iid": IID,
+        "open_threads": 1,
+        "approved": True,
+        "approvals_left": 0,
+        "auto_merge_strategy": "MERGE",
+    }
+    expected_summary.pop(omitted_field)
+    assert {key: value for key, value in summary.items() if key != "warning"} == expected_summary
+    if warning is None:
+        assert "warning" not in summary
+    else:
+        assert warning in summary["warning"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["status-read-error", "missing-counts", "invalid-counts"],
+    ids=["status-read-error", "missing-counts", "invalid-counts"],
+)
+@respx.mock
+async def test_batch_status_or_count_read_failures_keep_successful_writes(gitlab_env, failure):
+    """A failed status request or invalid counts add a warning without changing a successful write."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    if failure == "missing-counts":
+        response = httpx.Response(
+            200,
+            json={"data": {"project": {"mergeRequest": {"approved": True, "approvalsLeft": 2}}}},
+        )
+    elif failure == "invalid-counts":
+        response = httpx.Response(
+            200,
+            json={
+                "data": {
+                    "project": {
+                        "mergeRequest": {
+                            "resolvableDiscussionsCount": "1",
+                            "resolvedDiscussionsCount": 0,
+                            "approved": True,
+                            "approvalsLeft": 2,
+                        }
+                    }
+                }
+            },
+        )
+    else:
+        response = httpx.Response(403, json={"message": "Status not available"})
+    status = respx.post(GRAPHQL).mock(return_value=response)
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert note.call_count == 1
+    assert status.call_count == 1
+    assert result["results"][0]["status"] == "applied"
+    summary = result["merge_requests"][0]
+    assert summary["iid"] == IID
+    assert "open_threads" not in summary
+    assert "warning" in summary
+    if failure in {"missing-counts", "invalid-counts"}:
+        assert summary["approved"] is True
+        assert "discussion counts" in summary["warning"]
+    else:
+        assert set(summary) == {"iid", "warning"}
+
+
+@respx.mock
+async def test_plain_reply_still_reads_merge_request_summary(gitlab_env):
+    """A reply without resolution still returns one post-write MR summary."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    status = respx.post(GRAPHQL).mock(return_value=reply_status_response(4, 1, auto_merge_strategy="MERGE"))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
+
+    # Assert
+    assert note.call_count == status.call_count == 1
+    assert "open_threads" not in result["results"][0]
+    assert result["merge_requests"] == [
+        {
+            "iid": IID,
+            "open_threads": 3,
+            "approved": True,
+            "approvals_left": 0,
+            "auto_merge_strategy": "MERGE",
+        }
+    ]
+
+
+@respx.mock
+async def test_all_failed_batch_still_returns_each_requested_summary(gitlab_env):
+    """A batch with no successful writes still reads one summary per distinct requested IID."""
+    # Arrange
+    paths = [API + f"/projects/group%2Fproject/merge_requests/{iid}/discussions/thread/notes" for iid in (2187, 2188)]
+    writes = [
+        respx.post(path).mock(return_value=httpx.Response(403, json={"message": "Not allowed"})) for path in paths
+    ]
+    reads: list[int] = []
+
+    def serve_status(request: httpx.Request) -> httpx.Response:
+        """Return a successful status summary and record the requested IID."""
+        requested_iid = int(json.loads(request.content)["variables"]["iid"])
+        reads.append(requested_iid)
+        return reply_status_response(0, 0)
+
+    status = respx.post(GRAPHQL).mock(side_effect=serve_status)
+
+    # Act
+    result = await call_reply_batch(
+        [
+            {"iid": 2187, "thread_id": "thread", "body": "first"},
+            {"iid": 2188, "thread_id": "thread", "body": "second"},
+        ]
+    )
+
+    # Assert
+    assert [write.call_count for write in writes] == [1, 1]
+    assert [row["status"] for row in result["results"]] == ["failed", "failed"]
+    assert status.call_count == len(reads)
+    assert reads == [2187, 2188]
+    assert [row["iid"] for row in result["merge_requests"]] == reads

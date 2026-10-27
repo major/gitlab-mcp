@@ -12,7 +12,7 @@ lazy from fastmcp import Context
 
 from gitlab_mcp import findings as _findings
 from gitlab_mcp.app import get_client, mcp
-from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
+from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError, GitLabGraphQLError
 from gitlab_mcp.common import (
     HTTP_REQUEST_TIMEOUT,
     HTTP_SERVER_ERROR,
@@ -84,6 +84,35 @@ THREAD_COUNTS_QUERY = """
 query($fullPath: ID!, $iid: String!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
+      resolvableDiscussionsCount
+      resolvedDiscussionsCount
+    }
+  }
+}
+"""
+
+# Compact approval, auto-merge, and discussion status for a reply batch. 📊
+THREAD_REPLY_STATUS_QUERY = """
+query($fullPath: ID!, $iid: String!) {
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) {
+      approved
+      approvalsLeft
+      autoMergeStrategy
+      resolvableDiscussionsCount
+      resolvedDiscussionsCount
+    }
+  }
+}
+"""
+
+# CE does not expose approvalsLeft on MergeRequest. Use only after its explicit unknown-field error. 🧩
+THREAD_REPLY_STATUS_WITHOUT_APPROVALS_QUERY = """
+query($fullPath: ID!, $iid: String!) {
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) {
+      approved
+      autoMergeStrategy
       resolvableDiscussionsCount
       resolvedDiscussionsCount
     }
@@ -244,10 +273,22 @@ class ThreadReplyBatchItem(BaseModel):
     warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
+class MergeRequestReplyStatus(BaseModel):
+    """Best-effort status summary for one merge request after a reply batch."""
+
+    iid: int
+    open_threads: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    approved: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    approvals_left: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    auto_merge_strategy: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    warning: str = Field(default="", exclude_if=lambda value: not value)
+
+
 class ThreadReplyBatchResult(BaseModel):
-    """Ordered outcomes for a batch of thread replies."""
+    """Ordered write outcomes and post-write status summaries for a reply batch."""
 
     results: list[ThreadReplyBatchItem]
+    merge_requests: list[MergeRequestReplyStatus]
 
 
 class ResolveOpenThreadsResult(BaseModel):
@@ -700,6 +741,78 @@ async def _read_open_threads(client: GitLabClient, project: str, iid: int) -> in
         return None
 
 
+def _is_unknown_approvals_left_field(error: GitLabGraphQLError) -> bool:
+    """Return True only for known GraphQL wording that says MergeRequest lacks approvalsLeft."""
+    message = str(error)
+    return (
+        "Field 'approvalsLeft' doesn't exist on type 'MergeRequest'" in message
+        or "Cannot query field 'approvalsLeft' on type 'MergeRequest'" in message
+    )
+
+
+async def _read_thread_reply_status(  # noqa: C901 - fallback and optional status fields have distinct recovery paths.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+) -> MergeRequestReplyStatus:
+    """Read one MR's post-write approval, auto-merge, and exact thread status without failing successful writes."""
+    approvals_left_supported = True
+    try:
+        try:
+            node = await fetch_merge_request(client, THREAD_REPLY_STATUS_QUERY, project, iid)
+        except GitLabGraphQLError as exc:
+            if not _is_unknown_approvals_left_field(exc):
+                raise
+            approvals_left_supported = False
+            node = await fetch_merge_request(client, THREAD_REPLY_STATUS_WITHOUT_APPROVALS_QUERY, project, iid)
+    except ToolError as exc:
+        return MergeRequestReplyStatus(iid=iid, warning=f"Could not read status for merge request !{iid}: {exc}")
+
+    warnings: list[str] = []
+    if not approvals_left_supported:
+        warnings.append("This GitLab schema does not support approvalsLeft; approvals_left is unknown.")
+    try:
+        open_threads = _to_thread_counts(node, iid).open
+    except ToolError as exc:
+        open_threads = None
+        warnings.append(str(exc))
+
+    approved_value = node.get("approved")
+    approved = approved_value if isinstance(approved_value, bool) else None
+    if approved_value is not None and approved is None:
+        warnings.append(f"GitLab returned an invalid approval status for merge request !{iid}.")
+
+    approvals_left: int | None = None
+    if approvals_left_supported:
+        approvals_left_value = node.get("approvalsLeft")
+        approvals_left = (
+            approvals_left_value
+            if isinstance(approvals_left_value, int) and not isinstance(approvals_left_value, bool)
+            else None
+        )
+        if approvals_left_value is not None and approvals_left is None:
+            warnings.append(f"GitLab returned an invalid approvals-left value for merge request !{iid}.")
+
+    if "autoMergeStrategy" not in node:
+        auto_merge_strategy = None
+    elif node["autoMergeStrategy"] is None:
+        auto_merge_strategy = ""
+    elif isinstance(node["autoMergeStrategy"], str):
+        auto_merge_strategy = node["autoMergeStrategy"]
+    else:
+        auto_merge_strategy = None
+        warnings.append(f"GitLab returned an invalid auto-merge strategy for merge request !{iid}.")
+
+    return MergeRequestReplyStatus(
+        iid=iid,
+        open_threads=open_threads,
+        approved=approved,
+        approvals_left=approvals_left,
+        auto_merge_strategy=auto_merge_strategy,
+        warning=" ".join(warnings),
+    )
+
+
 def _last_resolve_positions(replies: list[ThreadReplyRequest]) -> dict[int, int]:
     """Map each MR IID to the position of its last item that asks for a resolve.
 
@@ -853,12 +966,18 @@ async def reply_to_threads(
     deciding what to do next, especially when an outcome is unknown.
 
     After a successful `resolve=true`, `open_threads` is sent once per merge request, on that MR's last item with
-    `resolve=true`. It is left out if that count cannot be read or if that last resolution failed.
+    `resolve=true`. It is left out if that count cannot be read or if that last resolution failed. The top-level
+    `merge_requests` list contains one best-effort post-write summary per distinct IID, in first-request order, read
+    only after all writes finish. It includes `open_threads` when exact counts are available, `approved`, nullable
+    `approvals_left`, and `auto_merge_strategy` (an empty string means auto-merge is cleared). Unknown optional values
+    are omitted. A `warning` is included when status or count reads fail; these read failures do not change write
+    results. On GitLab CE, an explicit unknown `approvalsLeft` field error triggers one read-only fallback without
+    that field; writes are never retried.
     """
     client = get_client(ctx)
     last_resolve = _last_resolve_positions(replies)
     results: list[ThreadReplyBatchItem] = []
-    for position, reply in enumerate(replies):
+    for reply in replies:
         thread_id = bare_id(reply.thread_id)
         try:
             outcome = await _write_thread_reply(
@@ -884,20 +1003,26 @@ async def reply_to_threads(
             status = "partial"
         else:
             status = "applied"
-        open_threads = None
-        if outcome.resolved and last_resolve.get(reply.iid) == position:
-            open_threads = await _read_open_threads(client, project, reply.iid)
         results.append(
             ThreadReplyBatchItem(
                 iid=reply.iid,
                 thread_id=outcome.thread_id,
                 status=status,
                 resolved=outcome.resolved,
-                open_threads=open_threads,
                 warning=warning,
             )
         )
-    return ThreadReplyBatchResult(results=results)
+
+    merge_requests = [
+        await _read_thread_reply_status(client, project, requested_iid)
+        for requested_iid in dict.fromkeys(reply.iid for reply in replies)
+    ]
+    status_by_iid = {summary.iid: summary for summary in merge_requests}
+    for iid, position in last_resolve.items():
+        if results[position].resolved is True:
+            results[position].open_threads = status_by_iid[iid].open_threads
+
+    return ThreadReplyBatchResult(results=results, merge_requests=merge_requests)
 
 
 async def _open_thread_ids(client: GitLabClient, project: str, iid: int) -> tuple[list[str], bool]:
