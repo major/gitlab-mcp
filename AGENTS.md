@@ -38,7 +38,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 - (b) Move a helper to `common.py`, `mr_common.py`, or `errors.py` only when a second module needs it. Tool modules should not import each other. The exception: `mr_create.py` and `mr_update.py` import `validate_project_labels` from `tools/labels.py`.
 - (c) Add `tests/test_<tool>.py` that calls the tool through `tests/mcp_helpers.py`.
 - (d) Add the tool name to `READ_ONLY_TOOLS` or `WRITE_TOOLS` in `tests/test_tool_inventory.py`.
-- (e) Add a row to the README `Tools` table.
+- (e) Keep the README `Tools` table in sync whenever a tool is added, renamed, removed, or its purpose changes. Include one concise row per tool, and put detailed usage in tool docstrings rather than README walkthroughs.
 
 ## Tool design rules
 
