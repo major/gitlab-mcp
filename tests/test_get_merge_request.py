@@ -137,6 +137,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "iid": str(IID),
         "includeDescription": True,
         "includeLabels": False,
+        "includeThreads": True,
     }
     assert data == {
         "iid": IID,
@@ -167,6 +168,42 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
             "index_complete": True,
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "include_threads", "expects_threads"),
+    [
+        ({}, True, True),
+        ({"include_threads": False}, False, False),
+    ],
+    ids=["default-includes-threads", "opt-out-skips-threads"],
+)
+@respx.mock
+async def test_include_threads_controls_graphql_fetch_and_output(
+    gitlab_env, arguments, include_threads, expects_threads
+):
+    """Thread output is the default, and opting out skips its GraphQL data and conversion."""
+    # Arrange
+    node = make_mr(
+        resolvableDiscussionsCount=1,
+        discussions=make_discussions(make_discussion("open-1", note=make_note(position=POSITION))),
+    )
+    if not include_threads:
+        del node["discussions"]
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(**arguments)
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert request["variables"]["includeThreads"] is include_threads
+    assert "discussions(first: 100) @include(if: $includeThreads)" in request["query"]
+    assert ("threads" in data) is expects_threads
+    if expects_threads:
+        assert data["threads"]["open"] == [
+            {"id": "open-1", "by": "mhayden", "notes": 1, "path": "docs/sop.md", "line": 212},
+        ]
 
 
 def blockers_response(visible: list[int], hidden: int = 0) -> httpx.Response:
@@ -655,6 +692,7 @@ async def test_description_obeys_requested_limit(
         "iid": str(IID),
         "includeDescription": True,
         "includeLabels": False,
+        "includeThreads": True,
     }
     assert len(data["description"]) == expected_length
     assert ("description_truncated" in data) is expected_truncated
@@ -709,6 +747,7 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
         "iid": str(IID),
         "includeDescription": False,
         "includeLabels": False,
+        "includeThreads": True,
     }
     assert {"description", "description_truncated"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"

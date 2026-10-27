@@ -39,13 +39,13 @@ from gitlab_mcp.mr_common import (
 
 # One page of discussions with their notes, for get_merge_request_threads. 🧵
 THREADS_QUERY = """
-query($fullPath: ID!, $iid: String!, $after: String) {
+query($fullPath: ID!, $iid: String!, $after: String, $includeMrStatus: Boolean!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
-      sourceBranch
-      diffRefs { headSha }
-      detailedMergeStatus
-      headPipeline { status }
+      sourceBranch @include(if: $includeMrStatus)
+      diffRefs @include(if: $includeMrStatus) { headSha }
+      detailedMergeStatus @include(if: $includeMrStatus)
+      headPipeline @include(if: $includeMrStatus) { status }
       discussions(first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
@@ -420,12 +420,13 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     start: tuple[str | None, int],
     max_body_chars: int = NOTE_CAP,
     view: ThreadView = "full",
+    include_mr_status: bool = True,
 ) -> tuple[list[Thread | ThreadHeading], str, set[str], dict[str, str]]:
     """Read discussion pages from `start` and collect the matching threads.
 
     The scan stops at the budget, at `MAX_PAGES`, or at the last page. Returns
     the threads, the cursor to resume from (empty when every page was read),
-    every discussion ID that was read, matching or not, and compact MR status.
+    every discussion ID that was read, matching or not, and compact MR status when requested.
     """
     after, skip = start
     threads: list[Thread | ThreadHeading] = []
@@ -434,8 +435,15 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     full_view = view in {"full", "finding"}
     output_size = 2 if view == "headings" else 0  # Count the serialized list brackets.
     for _ in range(MAX_PAGES):
-        node = await fetch_merge_request(client, THREADS_QUERY, project, iid, after=after)
-        mr_headers = _thread_mr_headers(node)
+        node = await fetch_merge_request(
+            client,
+            THREADS_QUERY,
+            project,
+            iid,
+            after=after,
+            includeMrStatus=include_mr_status,
+        )
+        mr_headers = _thread_mr_headers(node) if include_mr_status else {}
         connection = node["discussions"]
         nodes = connection["nodes"]
         for index in range(skip, len(nodes)):
@@ -542,6 +550,10 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
         ThreadView,
         Field(description="`full` notes, compact root-note `headings`, or bot finding bodies in `finding` view."),
     ] = "full",
+    include_mr_status: Annotated[
+        bool,
+        Field(description="Include MR head SHA, source branch, merge status, and pipeline status in the result."),
+    ] = True,
     max_body_chars: Annotated[
         int,
         Field(ge=0, le=NOTE_CAP, description="Maximum body characters per note. Zero omits bodies."),
@@ -573,7 +585,8 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - `ids` can only be used with a single `iid`. It is rejected with `iids` because a thread ID can match multiple
       merge requests in a batch.
     - Results include the head SHA, source branch, merge status, and pipeline status when available. Use
-      `get_merge_request` when you need a description, approvals, or jobs.
+      `include_mr_status=false` to omit and skip querying those fields. Use it when also fetching MR details with
+      `get_merge_request`, which returns status and detail fields.
     - Pass exactly one of `iid` or `iids`. Batch `iids` are deduplicated in request order and allow at most 20
       unique positive values. Missing merge requests appear in `missing_iids`.
     - System notes and threads with no human notes are skipped.
@@ -621,6 +634,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
             start,
             max_body_chars,
             view,
+            include_mr_status,
         )
         # A resumed call did not read the first page, so it cannot prove an ID is missing.
         not_found_ids: list[str] = []
@@ -656,6 +670,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
                 (None, 0),
                 max_body_chars,
                 view,
+                include_mr_status,
             )
         except MergeRequestNotFoundError:
             missing_iids.append(requested_iid)

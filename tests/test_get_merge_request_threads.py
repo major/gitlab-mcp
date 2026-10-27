@@ -385,7 +385,7 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
     data = await call_tool()
 
     # Assert
-    assert sent_variables(route) == [{"fullPath": PROJECT, "iid": str(IID), "after": None}]
+    assert sent_variables(route) == [{"fullPath": PROJECT, "iid": str(IID), "after": None, "includeMrStatus": True}]
     assert data == {
         "threads": [
             {
@@ -466,10 +466,87 @@ async def test_returns_single_merge_request_triage_headers_with_headings(gitlab_
     assert data["threads"][0]["heading"] == "Fix the parser"
     assert route.call_count == 1
     query = json.loads(route.calls[0].request.content)["query"]
-    assert "sourceBranch" in query
-    assert "diffRefs { headSha }" in query
-    assert "detailedMergeStatus" in query
-    assert "headPipeline { status }" in query
+    assert "sourceBranch @include(if: $includeMrStatus)" in query
+    assert "diffRefs @include(if: $includeMrStatus) { headSha }" in query
+    assert "detailedMergeStatus @include(if: $includeMrStatus)" in query
+    assert "headPipeline @include(if: $includeMrStatus) { status }" in query
+    assert "@include(if: $includeMrStatus)" in query
+
+
+@pytest.mark.parametrize(
+    ("discussions", "expected_ids"),
+    [((), []), ((make_discussion("t1"),), ["t1"])],
+    ids=["zero-threads", "one-thread"],
+)
+@respx.mock
+async def test_status_can_be_omitted_for_empty_or_single_thread_results(gitlab_env, discussions, expected_ids):
+    """Disabling MR status keeps empty and nonempty thread results free of status fields."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
+
+    # Act
+    data = await call_tool(include_mr_status=False)
+
+    # Assert
+    assert thread_ids(data) == expected_ids
+    assert not {"head_sha", "source_branch", "merge_status", "pipeline_status"} & data.keys()
+    assert sent_variables(route) == [{"fullPath": PROJECT, "iid": str(IID), "after": None, "includeMrStatus": False}]
+    query = json.loads(route.calls[0].request.content)["query"]
+    conditional_status_fields = (
+        "sourceBranch @include(if: $includeMrStatus)",
+        "diffRefs @include(if: $includeMrStatus) { headSha }",
+        "detailedMergeStatus @include(if: $includeMrStatus)",
+        "headPipeline @include(if: $includeMrStatus) { status }",
+    )
+    for field_selection in conditional_status_fields:
+        assert field_selection in query
+
+
+@respx.mock
+async def test_status_remains_omitted_when_resuming_across_discussion_pages(gitlab_env):
+    """A resumed call keeps status disabled on each requested discussion page."""
+    # Arrange
+    large_threads = [make_discussion(f"t{index}", *(make_note("x" * NOTE_CAP) for _ in range(3))) for index in range(3)]
+    route = respx.post(GRAPHQL).mock(
+        side_effect=serve(
+            {
+                None: page(*large_threads, has_next=True, end_cursor="c1"),
+                "c1": page(make_discussion("t3")),
+            },
+        ),
+    )
+
+    # Act
+    first = await call_tool(include_mr_status=False)
+    second = await call_tool(include_mr_status=False, cursor=first["next_cursor"])
+
+    # Assert
+    assert thread_ids(first) == ["t0", "t1"]
+    assert thread_ids(second) == ["t2", "t3"]
+    assert all(
+        not {"head_sha", "source_branch", "merge_status", "pipeline_status"} & result.keys()
+        for result in (first, second)
+    )
+    assert requested_afters(route) == [None, None, "c1"]
+    assert [variables["includeMrStatus"] for variables in sent_variables(route)] == [False, False, False]
+
+
+@respx.mock
+async def test_status_can_be_omitted_for_every_batch_merge_request(gitlab_env):
+    """Batch scans pass the status choice to each request and omit status from every entry."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1"))))
+
+    # Act
+    data = await call_tool(iids=[5, 8], include_mr_status=False)
+
+    # Assert
+    assert [thread_ids(result) for result in data["merge_requests"]] == [["t1"], ["t1"]]
+    assert all(
+        not {"head_sha", "source_branch", "merge_status", "pipeline_status"} & result.keys()
+        for result in data["merge_requests"]
+    )
+    assert [variables["includeMrStatus"] for variables in sent_variables(route)] == [False, False]
 
 
 @respx.mock
