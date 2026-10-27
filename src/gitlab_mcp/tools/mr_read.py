@@ -252,6 +252,7 @@ class MergeRequestDetail(BaseModel):
     head_sha: str = Field(default="", exclude_if=lambda v: not v)
     description: str = Field(default="", exclude_if=lambda v: not v)
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
+    next_description_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys_truncated: bool | None = Field(
         default=None,
@@ -631,6 +632,17 @@ def _cap_description(description: str | None, limit: int = DESCRIPTION_CAP) -> t
     return description[:limit], len(description) > limit
 
 
+def _page_description(description: str | None, limit: int, offset: int) -> tuple[str, bool, int | None]:
+    """Return one description page, whether more text follows, and its next character offset."""
+    if not description or offset >= len(description):
+        return "", False, None
+    end = min(offset + limit, len(description))
+    page = description[offset:end]
+    if end == len(description):
+        return page, False, None
+    return page, True, end
+
+
 def _extract_issue_keys(
     title: str,
     description: str | None,
@@ -786,6 +798,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     include_threads: bool,
     issue_key_prefixes: list[str] | None,
     description_limit: int,
+    description_offset: int,
     custom_issue_key_pattern: Any | None = None,
 ) -> MergeRequestDetail:
     """Convert one GraphQL merge request node into the detail shape.
@@ -800,9 +813,10 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         numeric_gid(pipeline.get("id"), {"Ci::Pipeline"}) if pipeline and pipeline.get("id") is not None else None
     )
     merged_at, merged_by = _merged_metadata(node)
-    description, description_truncated = _cap_description(
+    description, description_truncated, next_description_offset = _page_description(
         node.get("description") if include_description else None,
         description_limit,
+        description_offset,
     )
     label_connection = node.get("labels") if include_labels else None
     issue_keys, issue_keys_truncated = _extract_issue_keys(
@@ -827,6 +841,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         head_sha=diff_refs_head_sha(node["diffRefs"]),
         description=description,
         description_truncated=description_truncated,
+        next_description_offset=next_description_offset,
         issue_keys=issue_keys or None,
         issue_keys_truncated=issue_keys_truncated or None,
         merge_status=lower_or_empty(node["detailedMergeStatus"]),
@@ -971,8 +986,12 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     ] = None,
     description_limit: Annotated[
         int,
-        Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description length in characters, from 0 to 4000."),
+        Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description page length in characters, from 0 to 4000."),
     ] = DESCRIPTION_CAP,
+    description_offset: Annotated[
+        int,
+        Field(ge=0, description="Character offset for the description page. Use next_description_offset to continue."),
+    ] = 0,
     include_commits_behind: Annotated[
         bool,
         Field(
@@ -1004,12 +1023,19 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       `issue_keys_truncated=true` means a result, scan, or match-length limit excluded content.
     - `description_limit` controls description length when the description is included. Zero skips it; the default is
       4000 characters.
+    - `description_offset` starts a description page at that character offset. When `next_description_offset` is
+      returned, call again with that value to continue. Each page is capped at 4000 characters. Descriptions can
+      change between calls, so restart paging if the merge request is edited.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
       the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
     - Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are not visible to the token.
     - `commits_behind` (with `include_commits_behind=true`) counts target branch commits missing from the source
       branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
     """
+    if description_offset > 0 and (not include_description or description_limit == 0):
+        raise ToolError(  # noqa: TRY003 - name both incompatible options for an actionable error.
+            "description_offset must be 0 unless include_description is true and description_limit is greater than 0."
+        )
     include_description = include_description and description_limit > 0
     custom_issue_key_pattern = _compile_issue_key_pattern(issue_key_pattern, issue_key_prefixes)
     client = get_client(ctx)
@@ -1029,6 +1055,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         include_threads=include_threads,
         issue_key_prefixes=issue_key_prefixes,
         description_limit=description_limit,
+        description_offset=description_offset,
         custom_issue_key_pattern=custom_issue_key_pattern,
     )
     await _add_blockers(client, project, [detail])
