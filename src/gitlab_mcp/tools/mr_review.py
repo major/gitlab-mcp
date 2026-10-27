@@ -74,6 +74,21 @@ class ReviewNote(BaseModel):
         return self
 
 
+class ReviewNoteBodyOverride(BaseModel):
+    """Replace the body source for one cached note index."""
+
+    index: Annotated[int, Field(strict=True, ge=0)] = Field(description="Zero-based index in the cached review batch.")
+    body: str | None = Field(default=None, description="Replacement inline note text.")
+    body_path: str | None = Field(default=None, description="Absolute server-local replacement note file.")
+
+    @model_validator(mode="after")
+    def validate_body_source(self) -> ReviewNoteBodyOverride:
+        """Require exactly one replacement body source."""
+        if (self.body is None) == (self.body_path is None):
+            raise_review_preflight_error("Set exactly one of body or body_path")
+        return self
+
+
 ReviewNoteStatus = Literal["validated", "posted", "failed", "unknown", "unverified", "unattempted"]
 
 
@@ -528,10 +543,8 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
     blob_cache: dict[tuple[str, str], tuple[bytes | None, str]],
 ) -> _CheckedNote:
     """Add a GitLab position to a note whose body is usable, or record why its diff position fails."""
-    if check.reason:
-        return check
     if note.file is None:
-        return _CheckedNote(reason=_note_reason("file is required for a diff position"))
+        return check if check.reason else _CheckedNote(reason=_note_reason("file is required for a diff position"))
     file = note.file
     line_note = note.line is not None or note.old_line is not None
     try:
@@ -539,12 +552,12 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
             message = f"Diff preflight could not find {file!r} within {MAX_PAGES} pages"
             if line_note:
                 message = _line_failure_reason(message, "Nearest line hints are unavailable; use a file-level note.")
-            return _CheckedNote(reason=_note_reason(message))
+            return _CheckedNote(position=check.position, reason=check.reason or _note_reason(message))
         if len(matches) != 1:
             message = f"Diff preflight found ambiguous path {file!r}"
             if line_note:
                 message = _line_failure_reason(message, "Nearest line hints are unavailable; use a file-level note.")
-            return _CheckedNote(reason=_note_reason(message))
+            return _CheckedNote(position=check.position, reason=check.reason or _note_reason(message))
 
         raw = matches[0]
         old_path, new_path = _diff_paths(raw, file)
@@ -555,7 +568,7 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
                 "old_path": old_path,
                 "new_path": new_path,
             }
-            return _CheckedNote(body=check.body, position=position)
+            return _CheckedNote(body=check.body, position=position, reason=check.reason)
 
         parsed = _parsed_diff_for_note(raw, note, parsed_cache)
         matched = _matching_lines(parsed, note)
@@ -568,7 +581,7 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
                 "old_line": old_line,
                 "new_line": new_line,
             }
-            return _CheckedNote(body=check.body, position=position)
+            return _CheckedNote(body=check.body, position=position, reason=check.reason)
 
         side = "new" if note.line is not None else "old"
         target = note.line if note.line is not None else note.old_line
@@ -576,14 +589,16 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
             reason = _line_failure_reason(
                 "line coordinate is missing", "Nearest line hints are unavailable; use a file-level note."
             )
-            return _CheckedNote(reason=_note_reason(reason))
+            return _CheckedNote(position=check.position, reason=check.reason or _note_reason(reason))
         if matched:
             message = f"line {target} on the {side} side is ambiguous in {file!r}"
-            return _CheckedNote(reason=_line_failure_reason(message, _nearest_line_hint(parsed, side, target)))
+            reason = _line_failure_reason(message, _nearest_line_hint(parsed, side, target))
+            return _CheckedNote(position=check.position, reason=check.reason or reason)
 
         base_reason = f"line {target} on the {side} side is not a usable diff line in {file!r}"
         if _line_in_hunk(parsed, side, target):
-            return _CheckedNote(reason=_line_failure_reason(base_reason, _nearest_line_hint(parsed, side, target)))
+            reason = _line_failure_reason(base_reason, _nearest_line_hint(parsed, side, target))
+            return _CheckedNote(position=check.position, reason=check.reason or reason)
 
         hint = _nearest_line_hint(parsed, side, target)
         old_line, new_line, fallback_error = await _unchanged_line_position(
@@ -599,7 +614,8 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
         )
         if fallback_error:
             message = f"line {target} on the {side} side in {file!r}; fallback rejected: {fallback_error}"
-            return _CheckedNote(reason=_line_failure_reason(message, hint))
+            reason = _line_failure_reason(message, hint)
+            return _CheckedNote(position=check.position, reason=check.reason or reason)
         position = {
             "position_type": "text",
             "old_path": old_path,
@@ -607,12 +623,12 @@ async def _check_note_position(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR091
             "old_line": old_line,
             "new_line": new_line,
         }
-        return _CheckedNote(body=check.body, position=position)
+        return _CheckedNote(body=check.body, position=position, reason=check.reason)
     except ValueError as exc:
         message = str(exc)
         if line_note:
             message = _line_failure_reason(message, "Nearest line hints are unavailable; use a file-level note.")
-        return _CheckedNote(reason=_note_reason(message))
+        return _CheckedNote(position=check.position, reason=check.reason or _note_reason(message))
 
 
 async def _prepare_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the preflight contract.
@@ -727,6 +743,7 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
     position: dict[str, str | int | None],
 ) -> tuple[ReviewNotePostResult, str]:
     """Post one note and verify its position when it is a diff discussion."""
+    requested_position = _review_response_position(position)
     try:
         payload: dict[str, Any] = {"body": body}
         if position:
@@ -737,27 +754,52 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
             json=payload,
         )
     except GitLabAPIError as exc:
+        detail = f": {exc.detail}" if exc.detail else ""
         if exc.status >= 500 or exc.status == 408:  # noqa: PLR2004 - these statuses can hide a committed write.
+            reason = f"The post outcome is unknown after HTTP {exc.status}{detail}. Check GitLab before retrying."
             return (
-                ReviewNotePostResult(index=index, status="unknown"),
-                f"The post outcome is unknown: {exc} Check GitLab before retrying.",
+                ReviewNotePostResult(
+                    index=index,
+                    status="unknown",
+                    position=requested_position,
+                    reason=_note_reason(reason),
+                ),
+                reason,
             )
+        reason = f"GitLab rejected the post with HTTP {exc.status}{detail}. Check the item before retrying."
         return (
-            ReviewNotePostResult(index=index, status="failed"),
-            f"GitLab rejected the post: {exc} Check the item before retrying.",
+            ReviewNotePostResult(
+                index=index,
+                status="failed",
+                position=requested_position,
+                reason=_note_reason(reason),
+            ),
+            reason,
         )
     except GitLabConnectionError as exc:
+        reason = f"The post outcome is unknown: {exc} Check GitLab before retrying."
         return (
-            ReviewNotePostResult(index=index, status="unknown"),
-            f"The post outcome is unknown: {exc} Check GitLab before retrying.",
+            ReviewNotePostResult(
+                index=index,
+                status="unknown",
+                position=requested_position,
+                reason=_note_reason(reason),
+            ),
+            reason,
         )
     except (TypeError, ValueError) as exc:
+        reason = (
+            f"GitLab may have created the note, but its response could not be verified: {exc} Check GitLab "
+            "before retrying."
+        )
         return (
-            ReviewNotePostResult(index=index, status="unverified"),
-            (
-                f"GitLab may have created the note, but its response could not be verified: {exc} Check GitLab "
-                "before retrying."
+            ReviewNotePostResult(
+                index=index,
+                status="unverified",
+                position=requested_position,
+                reason=_note_reason(reason),
             ),
+            reason,
         )
 
     discussion_id, note_id, actual_position = _review_response_ids(response)
@@ -768,16 +810,19 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
         reason = "GitLab's returned position did not match the request."
     else:
         reason = ""
-    return (
-        ReviewNotePostResult(
-            index=index,
-            status="unverified" if reason else "posted",
-            note_id=note_id,
-            discussion_id=discussion_id,
-            position=compact_position,
-        ),
-        f"The post may have succeeded. {reason} Check GitLab before retrying." if reason else "",
-    )
+    if reason:
+        return (
+            ReviewNotePostResult(
+                index=index,
+                status="unverified",
+                note_id=note_id,
+                discussion_id=discussion_id,
+                position=compact_position or requested_position,
+                reason=_note_reason(reason),
+            ),
+            f"The post may have succeeded. {reason} Check GitLab before retrying.",
+        )
+    return ReviewNotePostResult(index=index, status="posted", discussion_id=discussion_id), ""
 
 
 def _review_preflight_result(checks: list[_CheckedNote]) -> PostReviewNotesResult:
@@ -786,7 +831,12 @@ def _review_preflight_result(checks: list[_CheckedNote]) -> PostReviewNotesResul
     The warning appears only when at least one note failed, and it says that nothing was posted.
     """
     results = [
-        ReviewNotePostResult(index=index, status="failed", reason=check.reason)
+        ReviewNotePostResult(
+            index=index,
+            status="failed",
+            reason=check.reason,
+            position=_review_response_position(check.position),
+        )
         if check.reason
         else ReviewNotePostResult(index=index, status="validated", position=_review_response_position(check.position))
         for index, check in enumerate(checks)
@@ -827,6 +877,34 @@ async def _post_review_note_batch(
             )
             break
     return PostReviewNotesResult(results=results, warning=warning[:500])
+
+
+def _cached_review_notes_with_overrides(
+    cached_notes: tuple[CachedReviewNote, ...],
+    body_overrides: list[ReviewNoteBodyOverride] | None,
+) -> list[ReviewNote]:
+    """Validate sparse override indices and rebuild notes from cached coordinates and final body sources."""
+    overrides = body_overrides or []
+    override_indices = [override.index for override in overrides]
+    if len(set(override_indices)) != len(override_indices):
+        raise ToolError("body_overrides indices must be unique.")  # noqa: TRY003
+    if any(index < 0 or index >= len(cached_notes) for index in override_indices):
+        raise ToolError("body_overrides index is outside the cached batch.")  # noqa: TRY003
+
+    overrides_by_index = {override.index: override for override in overrides}
+    notes = []
+    for index, cached_note in enumerate(cached_notes):
+        override = overrides_by_index.get(index)
+        notes.append(
+            ReviewNote(
+                body=override.body if override is not None else cached_note.body,
+                body_path=override.body_path if override is not None else None,
+                file=cached_note.file,
+                line=cached_note.line,
+                old_line=cached_note.old_line,
+            )
+        )
+    return notes
 
 
 async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the batch request.
@@ -916,7 +994,10 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         str,
         Field(description="Full 40-character head SHA from get_merge_request or get_merge_request_diff."),
     ],
-    notes: Annotated[list[ReviewNote] | None, Field(min_length=1, max_length=20)] = None,
+    notes: Annotated[
+        list[ReviewNote] | None,
+        Field(min_length=1, max_length=20, description="Notes to validate or post. Required unless batch_id is set."),
+    ] = None,
     add_reviewers: Annotated[
         list[str] | None,
         Field(description="Reviewer usernames to add after every note posts."),
@@ -938,7 +1019,22 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         Field(
             min_length=1,
             max_length=200,
-            description="Single-use handle from a successful validate_only call. Provide this instead of notes.",
+            description=(
+                "Single-use handle from a successful validate_only call. Provide this instead of notes. It is claimed "
+                "before body_overrides indices are checked, so an invalid index consumes the handle."
+            ),
+        ),
+    ] = None,
+    body_overrides: Annotated[
+        list[ReviewNoteBodyOverride] | None,
+        Field(
+            min_length=1,
+            max_length=20,
+            description=(
+                "Sparse replacements for a claimed batch, using zero-based unique in-range indices and exactly one "
+                "of body or body_path per entry. Requires batch_id; omitted indices keep their cached body snapshots. "
+                "Show the final replacement text to the user and get approval before posting."
+            ),
         ),
     ] = None,
 ) -> PostReviewNotesResult:
@@ -949,10 +1045,15 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     Provide exactly one of `notes` or `batch_id`. `validate_only` cannot be combined with `batch_id`. Set
     `validate_only` to true to run all body, path, line, and SHA checks without writing; validation does not need the
     user's `APPROVE`. A successful validation returns a single-use `batch_id` with the resolved note bodies and
-    locations. After the user's explicit `APPROVE`, call this tool with that `batch_id` instead of `notes`; the tool
-    reruns preflight checks before the first write. The handle is opaque, is not approval, expires after 30 minutes,
+    locations. Show the final note text to the user and wait for explicit `APPROVE`; approval of placeholder drafts
+    alone is not enough. Then call this tool with that `batch_id` instead of `notes`. Optional `body_overrides` entries
+    use `{index, body}` or `{index, body_path}` to replace cached bodies at zero-based indices. Each index must be
+    unique and in range, each entry must set exactly one body source, and omitted indices keep their cached snapshots.
+    Overrides require `batch_id`. The tool checks every final body and reruns fresh SHA, path, and position checks
+    before the first write. The handle is opaque, is not approval, expires after 30 minutes,
     may be evicted earlier when the bounded cache is full, and is invalidated by a server restart. It is consumed on
-    any posting attempt, including failed preflight or writes. If it is unavailable, send the notes again. `head_sha`
+    any posting attempt, including failed preflight or writes. An invalid override index is checked after the handle
+    is claimed and therefore consumes it. If it is unavailable, send the notes again. `head_sha`
     must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
     Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
     for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
@@ -964,8 +1065,9 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
     and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check every result
     before deciding what to do next.
-    `add_reviewers` and `add_assignees` add people only after every note posts, in the same call. They are ignored
-    when `validate_only` is true.
+    Normal posted rows contain only `index`, `status`, and `discussion_id`. Failed, unknown, and unverified rows
+    include a `reason` and any available `position`. `add_reviewers` and `add_assignees` add people only after every
+    note posts, in the same call. They are ignored when `validate_only` is true.
     Set `compact` to true to omit verified posted rows and return their count. All other result rows and batch details
     remain unchanged.
     """
@@ -975,18 +1077,12 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         raise ToolError("batch_id must not be blank.")  # noqa: TRY003
     if validate_only and batch_id is not None:
         raise ToolError("validate_only cannot be combined with batch_id.")  # noqa: TRY003
+    if body_overrides is not None and batch_id is None:
+        raise ToolError("body_overrides can only be used with batch_id.")  # noqa: TRY003
 
     if batch_id is not None:
         cached_batch = get_review_batch_cache(ctx).claim(batch_id, project, iid, head_sha)
-        notes = [
-            ReviewNote(
-                body=cached_note.body,
-                file=cached_note.file,
-                line=cached_note.line,
-                old_line=cached_note.old_line,
-            )
-            for cached_note in cached_batch.notes
-        ]
+        notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
     if notes is None:
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
