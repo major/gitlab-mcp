@@ -127,10 +127,18 @@ class PostReviewNotesResult(BaseModel):
     """One bounded result per requested note and a reason when the batch stops."""
 
     results: list[ReviewNotePostResult]
+    posted_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda value: not value)
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+def _compact_review_result(result: PostReviewNotesResult) -> PostReviewNotesResult:
+    """Count verified posts and omit only their rows from the returned batch."""
+    posted_count = sum(row.status == "posted" for row in result.results)
+    remaining_results = [row for row in result.results if row.status != "posted"]
+    return result.model_copy(update={"results": remaining_results, "posted_count": posted_count})
 
 
 def _unattempted_review_notes(
@@ -921,6 +929,10 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         bool,
         Field(description="Run all preflight checks and return positions without posting any notes."),
     ] = False,
+    compact: Annotated[
+        bool,
+        Field(description="Omit verified posted rows and return their count, while keeping all other outcomes."),
+    ] = False,
     batch_id: Annotated[
         str | None,
         Field(
@@ -954,6 +966,8 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     before deciding what to do next.
     `add_reviewers` and `add_assignees` add people only after every note posts, in the same call. They are ignored
     when `validate_only` is true.
+    Set `compact` to true to omit verified posted rows and return their count. All other result rows and batch details
+    remain unchanged.
     """
     if (notes is None) == (batch_id is None):
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
@@ -977,6 +991,8 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
     result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only)
-    if validate_only:
-        return result
-    return await _add_people_after_posts(ctx, project, iid, result, add_reviewers, add_assignees)
+    if not validate_only:
+        result = await _add_people_after_posts(ctx, project, iid, result, add_reviewers, add_assignees)
+    if compact:
+        result = _compact_review_result(result)
+    return result

@@ -7,7 +7,9 @@ from urllib.parse import quote
 import httpx
 import pytest
 import respx
+from fastmcp import Client
 
+from gitlab_mcp import mcp
 from gitlab_mcp.common import MAX_PAGES
 from mcp_helpers import call_tool_result as call_mcp_tool_result
 
@@ -22,6 +24,7 @@ POSTED_NOTE_ID = 101
 RESPONSE_NOTE_ID = 909
 MISMATCHED_LINE = 99
 TWO_POSTS = 2
+FOUR_PREFLIGHT_REQUESTS = 4
 THREE_PAGES = 3
 REASON_CAP = 200
 BLOB_CAP = 131_072
@@ -393,6 +396,7 @@ async def test_file_level_post_sends_file_position_and_verifies_echo(gitlab_env,
             "position": {"path": "new.py", "old_path": "old.py"},
         },
     ]
+    assert "posted_count" not in data
     assert len(post_route.calls) == 1
 
 
@@ -1437,6 +1441,219 @@ async def test_general_note_validation_skips_diff_scan(gitlab_env):
     assert len(mr_route.calls) == TWO_POSTS
     assert not diff_route.called
     assert not post_route.called
+
+
+@respx.mock
+async def test_compact_success_counts_posted_notes_after_people_changes(gitlab_env):
+    """Compact output removes posted rows only after reviewer changes use the full result."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+
+    # Act
+    data = await call_tool(
+        notes=[{"file": "src.py", "body": "Review this file."}],
+        compact=True,
+        add_reviewers=["Alice"],
+    )
+
+    # Assert
+    assert data == {"results": [], "posted_count": 1, "people": {"applied": ["add_reviewers"]}}
+    assert len(post_route.calls) == 1
+    assert json.loads(post_route.calls[0].request.content) == {
+        "body": "Review this file.",
+        "position": {
+            "position_type": "file",
+            "old_path": "src.py",
+            "new_path": "src.py",
+            "base_sha": BASE_SHA,
+            "start_sha": START_SHA,
+            "head_sha": HEAD,
+        },
+    }
+    assert write_order() == ["discussion", "users(", "mergeRequestSetReviewers"]
+    assert graphql_variables(graphql_route, "mergeRequestSetReviewers") == [
+        {"projectPath": PROJECT, "iid": str(IID), "usernames": ["alice"], "mode": "APPEND"}
+    ]
+
+
+@respx.mock
+async def test_compact_mixed_failure_keeps_failure_and_unattempted_rows(gitlab_env):
+    """A rejected note keeps failure details and later unattempted rows, while posted rows are counted."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post_count = 0
+
+    def reject_second_post(request: httpx.Request) -> httpx.Response:
+        """Create the first note, then reject the second request."""
+        nonlocal post_count
+        post_count += 1
+        if post_count == TWO_POSTS:
+            return response({"message": "bad position"}, status=422)
+        return create_response(request)
+
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=reject_second_post)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
+    notes = [{"file": "src.py", "body": f"Review {index}."} for index in range(3)]
+
+    # Act
+    data = await call_tool(notes=notes, compact=True, add_reviewers=["alice"])
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == ["failed", "unattempted"]
+    assert [item["index"] for item in data["results"]] == [1, 2]
+    assert data["posted_count"] == 1
+    assert "note index 1" in data["warning"]
+    assert data["warning"].endswith("Reviewers and assignees were not changed because not every note posted.")
+    assert len(post_route.calls) == TWO_POSTS
+    assert not graphql_route.called
+
+
+@respx.mock
+async def test_compact_preflight_keeps_validated_and_failed_details(gitlab_env):
+    """A preflight failure preserves both its reason and the validated row, with no posts counted."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [review_note("src.py", 1), review_note("missing.py", 1)]
+
+    # Act
+    data = await call_tool(notes=notes, compact=True)
+
+    # Assert
+    assert data["results"] == [
+        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}},
+        {
+            "index": 1,
+            "status": "failed",
+            "reason": (
+                f"Diff preflight could not find 'missing.py' within {MAX_PAGES} pages. "
+                "Nearest line hints are unavailable; use a file-level note."
+            ),
+        },
+    ]
+    assert data["posted_count"] == 0
+    assert data["warning"] == "1 of 2 notes failed preflight. No notes were posted."
+    assert not post_route.called
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "unverified"], ids=["unknown", "unverified"])
+@respx.mock
+async def test_compact_preserves_unknown_or_unverified_and_unattempted_rows(gitlab_env, outcome):
+    """Uncertain outcomes and later unattempted rows remain visible in compact mode."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+
+    def uncertain_response(request: httpx.Request) -> httpx.Response:
+        """Return either an ambiguous server error or a successful response with the wrong position."""
+        if outcome == "unknown":
+            return response({"message": "upstream response lost"}, status=503)
+        payload = json.loads(request.content)
+        position = {**payload["position"], "new_line": MISMATCHED_LINE}
+        return response({"id": "discussion-9", "notes": [{"id": RESPONSE_NOTE_ID, "position": position}]}, status=201)
+
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=uncertain_response)
+    notes = [{"file": "src.py", "body": f"Review {index}."} for index in range(2)]
+
+    # Act
+    data = await call_tool(notes=notes, compact=True)
+
+    # Assert
+    assert [item["status"] for item in data["results"]] == [outcome, "unattempted"]
+    assert data["posted_count"] == 0
+    assert "note index 0" in data["warning"]
+    assert len(post_route.calls) == 1
+
+
+@respx.mock
+async def test_compact_stale_sha_keeps_current_head_and_unattempted_results(gitlab_env):
+    """Compaction does not remove stale-SHA details or unattempted note rows."""
+    # Arrange
+    mr_route, diff_route = add_preflight(
+        [([diff_file("src.py")], None)],
+        merge_requests=[merge_request()],
+    )
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], head_sha="d" * 40, compact=True)
+
+    # Assert
+    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["posted_count"] == 0
+    assert data["current_head_sha"] == HEAD
+    assert "stale" in data["warning"]
+    assert len(mr_route.calls) == 1
+    assert not diff_route.called
+    assert not post_route.called
+
+
+@respx.mock
+async def test_compact_validation_keeps_batch_id_and_reposting_counts_success(gitlab_env):
+    """Validation keeps all rows and its batch handle, then compact posting returns the count."""
+    # Arrange
+    mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
+    diff_route = respx.get(DIFF_URL).mock(return_value=response([diff_file("src.py")]))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    note = review_note("src.py", 1)
+
+    # Act
+    async with Client(mcp) as client:
+        validated_result = await client.call_tool(
+            "post_review_notes",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "head_sha": HEAD,
+                "notes": [note],
+                "validate_only": True,
+                "compact": True,
+            },
+            raise_on_error=False,
+        )
+        validated = validated_result.structured_content
+        posted = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": validated["batch_id"], "compact": True},
+            raise_on_error=False,
+        )
+        posted_data = posted.structured_content
+
+    # Assert
+    assert validated["results"] == [{"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}}]
+    assert validated["posted_count"] == 0
+    assert validated["batch_id"]
+    assert posted_data == {"results": [], "posted_count": 1}
+    assert len(mr_route.calls) == FOUR_PREFLIGHT_REQUESTS
+    assert len(diff_route.calls) == TWO_POSTS
+    assert len(post_route.calls) == 1
+    assert json.loads(post_route.calls[0].request.content)["body"] == "Please check this."
+
+
+@respx.mock
+async def test_compact_preserves_people_write_failure(gitlab_env):
+    """A failed people update remains visible after successful note rows are compacted."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    graphql_route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            response({"data": {"users": {"nodes": [{"username": "alice"}]}}}),
+            response({"message": "Boom"}, status=500),
+        ]
+    )
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)], compact=True, add_reviewers=["alice"])
+
+    # Assert
+    assert data["results"] == []
+    assert data["posted_count"] == 1
+    assert data["people"]["applied"] == []
+    assert "HTTP 500" in data["people"]["failed"]["add_reviewers"]
+    assert len(post_route.calls) == 1
+    assert len(graphql_route.calls) == TWO_POSTS
 
 
 @respx.mock
