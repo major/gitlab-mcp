@@ -30,6 +30,7 @@ MR_CALLS_FOR_VALIDATE_AND_POST = 4
 MR_CALLS_PER_PREFLIGHT = 2
 DIFF_CALLS_FOR_VALIDATE_AND_POST = 2
 SECOND_WRITE = 2
+SECOND_CACHED_NOTE_NEW_LINE = 2
 PEOPLE_REQUESTS = 3
 
 
@@ -176,6 +177,163 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
 
 
 @respx.mock
+async def test_batch_body_override_keeps_coordinates_and_resolves_fresh_position(review_client: Client) -> None:
+    """A sparse body override keeps cached coordinates and resolves positions during posting preflight."""
+    # Arrange
+    current_patch = "@@ -1,3 +1,3 @@\n one\n two\n three"
+
+    def current_diff(_: httpx.Request) -> httpx.Response:
+        """Return the current patch while keeping the merge-request SHA bound."""
+        return response([diff_file(patch=current_patch)])
+
+    mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
+    diff_route = respx.get(DIFF_URL).mock(side_effect=current_diff)
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(
+        review_client,
+        **note_args(
+            notes=[
+                {"file": "src.py", "line": 1, "body": "original first"},
+                {"file": "src.py", "line": 2, "body": "original second"},
+            ],
+            validate_only=True,
+        ),
+    )
+    batch_id = prepared.structured_content["batch_id"]
+    current_patch = "@@ -1,2 +1,3 @@\n+ inserted\n one\n two"
+
+    # Act
+    posted = await call_review(
+        review_client,
+        **note_args(
+            batch_id=batch_id,
+            body_overrides=[{"index": 0, "body": "updated first"}],
+        ),
+    )
+
+    # Assert
+    assert not posted.is_error
+    requests = [json.loads(call.request.content) for call in post_route.calls]
+    assert [request["body"] for request in requests] == ["updated first", "original second"]
+    assert requests[0]["position"] == {
+        "position_type": "text",
+        "old_path": "src.py",
+        "new_path": "src.py",
+        "base_sha": BASE_SHA,
+        "start_sha": START_SHA,
+        "head_sha": HEAD,
+        "old_line": None,
+        "new_line": 1,
+    }
+    assert requests[1]["position"]["old_line"] == 1
+    assert requests[1]["position"]["new_line"] == SECOND_CACHED_NOTE_NEW_LINE
+    assert len(mr_route.calls) == MR_CALLS_FOR_VALIDATE_AND_POST
+    assert len(diff_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
+
+
+@respx.mock
+async def test_batch_body_path_override_reads_replacement_body(review_client: Client, tmp_path: Path) -> None:
+    """A cached note body can be replaced by a server-local body path."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    body_path = tmp_path / "replacement.txt"
+    body_path.write_text("replacement from path", encoding="utf-8")
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"file": "src.py", "line": 1, "body": "cached body"}], validate_only=True),
+    )
+
+    # Act
+    posted = await call_review(
+        review_client,
+        **note_args(
+            batch_id=prepared.structured_content["batch_id"],
+            body_overrides=[{"index": 0, "body_path": str(body_path)}],
+        ),
+    )
+
+    # Assert
+    assert not posted.is_error
+    assert json.loads(post_route.calls[0].request.content)["body"] == "replacement from path"
+
+
+@respx.mock
+async def test_stale_head_with_body_override_has_no_writes(review_client: Client) -> None:
+    """Overrides do not bypass the fresh SHA check or trigger discussion writes on stale batches."""
+    # Arrange
+    live_sha = HEAD
+
+    def current_mr(_: httpx.Request) -> httpx.Response:
+        """Return the live SHA for each preflight check."""
+        return response(merge_request(sha=live_sha))
+
+    mr_route = respx.get(MR_URL).mock(side_effect=current_mr)
+    diff_route = respx.get(DIFF_URL).mock(return_value=response([diff_file()]))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"file": "src.py", "line": 1, "body": "cached"}], validate_only=True),
+    )
+    live_sha = "d" * 40
+    prior_reads = (len(mr_route.calls), len(diff_route.calls))
+
+    # Act
+    stale = await call_review(
+        review_client,
+        **note_args(
+            batch_id=prepared.structured_content["batch_id"],
+            body_overrides=[{"index": 0, "body": "replacement"}],
+        ),
+    )
+
+    # Assert
+    assert not stale.is_error
+    assert "stale" in stale.structured_content["warning"].lower()
+    assert (len(mr_route.calls), len(diff_route.calls)) == (prior_reads[0] + 1, prior_reads[1])
+    assert not post_route.called
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param([{"index": -1, "body": "bad"}], id="negative-index"),
+        pytest.param([{"index": 1, "body": "out of range"}], id="out-of-range-index"),
+        pytest.param([{"index": 0}], id="missing-body-source"),
+        pytest.param([{"index": 0, "body": "text", "body_path": "/server/note.txt"}], id="multiple-body-sources"),
+        pytest.param(
+            [{"index": 0, "body": "first"}, {"index": 0, "body": "duplicate"}],
+            id="duplicate-index",
+        ),
+    ],
+)
+@respx.mock
+async def test_invalid_body_overrides_have_no_gitlab_writes(
+    review_client: Client,
+    overrides: list[dict[str, Any]],
+) -> None:
+    """Negative, duplicate, or out-of-range override indices are rejected before GitLab writes."""
+    # Arrange
+    mr_route, diff_route = add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"file": "src.py", "line": 1, "body": "cached"}], validate_only=True),
+    )
+    prior = (len(mr_route.calls), len(diff_route.calls), len(post_route.calls))
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(batch_id=prepared.structured_content["batch_id"], body_overrides=overrides),
+    )
+
+    # Assert
+    assert_rejected(result)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == prior
+
+
+@respx.mock
 async def test_stale_live_head_consumes_token_without_writes(review_client: Client) -> None:
     """Posting reruns preflight and refuses a token if the live merge-request head changed."""
     # Arrange
@@ -255,6 +413,18 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
             id="both-inputs",
         ),
         pytest.param({"batch_id": "token", "validate_only": True}, id="validate-token"),
+        pytest.param(
+            {
+                "notes": [{"file": "src.py", "line": 1, "body": "review"}],
+                "body_overrides": [{"index": 0, "body": "replacement"}],
+            },
+            id="overrides-with-notes",
+        ),
+        pytest.param({"body_overrides": [{"index": 0, "body": "replacement"}]}, id="overrides-without-batch"),
+        pytest.param(
+            {"batch_id": "token", "validate_only": True, "body_overrides": [{"index": 0, "body": "replacement"}]},
+            id="overrides-with-validation",
+        ),
     ],
 )
 @respx.mock
