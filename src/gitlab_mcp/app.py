@@ -69,8 +69,10 @@ mcp = FastMCP(
         "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "
         "get_merge_request_threads(include_mr_status=false) to avoid duplicate data. For re-reviews, start with "
         'view="headings" and use view="full" only for selected thread IDs. '
-        "Use get_merge_request for approvals and jobs (add include_description=true for the description), "
-        "and get_merge_request_diff for patches. "
+        "Use get_merge_request for approvals and jobs (add include_description=true for the description). "
+        "For long descriptions, pass the returned next offset as description_offset with include_description=true; "
+        "restart if the merge request is edited. "
+        "Use get_merge_request_diff for patches. "
         "For CI triage, use list_pipelines to find a pipeline, get_pipeline to inspect its jobs, then get_job_log "
         "to read a job's log; use get_job for runner-job metadata. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval, then keep the "
@@ -82,7 +84,7 @@ mcp = FastMCP(
         "push with --force-with-lease. "
         # 🔍 Main arguments, so one tool search is enough. Client searches often cut long signatures.
         "Main arguments: "
-        "get_merge_request(project, iid, include_threads); "
+        "get_merge_request(project, iid, include_threads, include_description, description_limit, description_offset); "
         "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, "
         "view=full|headings|finding, include_mr_status, count_only, cursor); "
         "post_review_notes(project, iid, head_sha, notes=[{file, line or old_line (neither for a file-level note), "

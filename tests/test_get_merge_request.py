@@ -667,19 +667,18 @@ async def test_auto_merge_strategy_is_returned_raw(gitlab_env, strategy):
 
 
 @pytest.mark.parametrize(
-    ("description_limit", "length", "expected_length", "expected_truncated"),
+    ("description_limit", "length", "expected"),
     [
-        (1, 1, 1, False),
-        (1, 2, 1, True),
-        (DESCRIPTION_CAP, DESCRIPTION_CAP, DESCRIPTION_CAP, False),
-        (DESCRIPTION_CAP, DESCRIPTION_CAP + 1, DESCRIPTION_CAP, True),
+        (1, 1, (1, False, None)),
+        (1, 2, (1, True, 1)),
+        (DESCRIPTION_CAP, DESCRIPTION_CAP, (DESCRIPTION_CAP, False, None)),
+        (DESCRIPTION_CAP, DESCRIPTION_CAP + 1, (DESCRIPTION_CAP, True, DESCRIPTION_CAP)),
     ],
 )
 @respx.mock
-async def test_description_obeys_requested_limit(
-    gitlab_env, description_limit, length, expected_length, expected_truncated
-):
-    """Descriptions stop at the requested limit and report whether text was cut."""
+async def test_description_obeys_requested_limit(gitlab_env, description_limit, length, expected):
+    """Descriptions stop at the requested limit and report whether more text can be fetched."""
+    expected_length, expected_truncated, next_offset = expected
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description="d" * length)))
 
@@ -696,8 +695,132 @@ async def test_description_obeys_requested_limit(
     }
     assert len(data["description"]) == expected_length
     assert ("description_truncated" in data) is expected_truncated
+    assert data.get("next_description_offset") == next_offset
+    assert ("next_description_offset" in data) is (next_offset is not None)
     request = json.loads(route.calls.last.request.content)
     assert "description @include(if: $includeDescription)" in request["query"]
+
+
+@respx.mock
+async def test_description_pages_reconstruct_unicode_text_without_gaps_or_overlaps(gitlab_env):
+    """Character offsets page Unicode descriptions in order with no gaps or repeated characters."""
+    # Arrange
+    description = "A😀e\u0301BCdéFG"
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+    pages = []
+    offset = 0
+
+    # Act
+    while True:
+        data = await call_tool(include_description=True, description_limit=3, description_offset=offset)
+        pages.append(data["description"])
+        next_offset = data.get("next_description_offset")
+        if next_offset is None:
+            break
+        assert next_offset == offset + len(data["description"])
+        offset = next_offset
+
+    # Assert
+    assert "".join(pages) == description
+    assert pages == [description[0:3], description[3:6], description[6:9], description[9:12]]
+    assert route.call_count == len(pages)
+    assert all(json.loads(call.request.content)["variables"]["includeDescription"] is True for call in route.calls)
+
+
+@respx.mock
+async def test_default_description_cap_pages_reconstruct_long_text(gitlab_env):
+    """Default-sized pages reconstruct descriptions longer than 8000 characters in exactly three calls."""
+    # Arrange
+    description = "a" * DESCRIPTION_CAP + "b" * DESCRIPTION_CAP + "c"
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    first = await call_tool(include_description=True)
+    second = await call_tool(include_description=True, description_offset=first["next_description_offset"])
+    third = await call_tool(include_description=True, description_offset=second["next_description_offset"])
+    pages = [first["description"], second["description"], third["description"]]
+
+    # Assert
+    assert route.call_count == len(pages)
+    assert [len(page) for page in pages] == [DESCRIPTION_CAP, DESCRIPTION_CAP, 1]
+    assert first["next_description_offset"] == DESCRIPTION_CAP
+    assert second["next_description_offset"] == DESCRIPTION_CAP * 2
+    assert {"description_truncated", "next_description_offset"}.isdisjoint(third)
+    assert "".join(pages) == description
+
+
+@respx.mock
+async def test_description_offset_pages_custom_limit_and_issue_keys_scan_full_text(gitlab_env):
+    """A page starts at its character offset while issue-key extraction still scans the full description."""
+    # Arrange
+    node = make_mr(title="TITLE-1", description="prefix body KEY-89 suffix")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+    page_start = len("prefix ")
+    page_end = page_start + len("body")
+
+    # Act
+    data = await call_tool(
+        include_description=True,
+        description_limit=4,
+        description_offset=page_start,
+    )
+
+    # Assert
+    assert route.call_count == 1
+    assert data["description"] == "body"
+    assert data["description_truncated"] is True
+    assert data["next_description_offset"] == page_end
+    assert data["issue_keys"] == ["TITLE-1", "KEY-89"]
+
+
+@pytest.mark.parametrize("extra_offset", [0, 5], ids=["at-end", "past-end"])
+@respx.mock
+async def test_description_offset_at_or_beyond_end_omits_description_and_continuation(gitlab_env, extra_offset):
+    """An offset at the end returns no description page or continuation offset."""
+    # Arrange
+    description = "short KEY-2"
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, description_offset=len(description) + extra_offset)
+
+    # Assert
+    assert route.call_count == 1
+    assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
+    assert data["issue_keys"] == ["KEY-2"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"description_offset": 1},
+        {"include_description": False, "description_offset": 1},
+        {"include_description": True, "description_limit": 0, "description_offset": 1},
+    ],
+    ids=["omitted-description", "explicit-false", "zero-limit"],
+)
+@respx.mock
+async def test_description_offset_requires_included_description_and_positive_limit(gitlab_env, arguments):
+    """A nonzero offset requires an included description and a positive description limit."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"description_offset.*include_description.*description_limit"):
+        await call_tool(**arguments)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_negative_description_offset_is_rejected_before_request(gitlab_env):
+    """Negative character offsets are rejected before any GitLab request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(include_description=True, description_offset=-1)
+    assert route.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -722,6 +845,7 @@ async def test_description_is_omitted_by_default_and_included_on_opt_in(gitlab_e
     assert sent_variables(route)["includeDescription"] is expects_description
     assert ("description" in data) is expects_description
     assert ("description_truncated" in data) is False
+    assert "next_description_offset" not in data
     assert data["title"] == "Rebuild support"
 
 
@@ -749,7 +873,7 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
         "includeLabels": False,
         "includeThreads": True,
     }
-    assert {"description", "description_truncated"}.isdisjoint(data)
+    assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"
 
 
