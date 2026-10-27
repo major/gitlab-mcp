@@ -278,6 +278,16 @@ class MergeRequestDetail(BaseModel):
     hidden_blockers: int = Field(default=0, exclude_if=lambda v: not v)  # Blockers the token cannot see.
     commits_behind: int | None = Field(default=None, exclude_if=lambda value: value is None)  # Open MRs, when asked.
     changes: DiffSummary | None = Field(default=None, exclude_if=lambda v: v is None)
+    open_thread_count: int | None = Field(
+        default=None,
+        description="Resolvable discussions minus resolved discussions.",
+        exclude_if=lambda value: value is None,
+    )
+    resolved_thread_count: int | None = Field(
+        default=None,
+        description="GitLab's resolved discussion count.",
+        exclude_if=lambda value: value is None,
+    )
     threads: ThreadIndex | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
@@ -762,20 +772,26 @@ def _to_thread_ref(discussion: dict[str, Any]) -> ThreadRef:
     )
 
 
+def _to_thread_counts(node: dict[str, Any]) -> tuple[int, int]:
+    """Return the open and resolved counts, treating null GraphQL counts as zero."""
+    resolvable = node["resolvableDiscussionsCount"] or 0
+    resolved = node["resolvedDiscussionsCount"] or 0
+    return resolvable - resolved, resolved
+
+
 def _to_thread_index(node: dict[str, Any]) -> ThreadIndex:
     """Build the thread index from the exact counts and the first page of discussions.
 
     Only one page of discussions is read, so `index_complete` is false when
     GitLab has another page.
     """
-    # Null counts mean zero. Only the list below can be partial, never the counts.
-    resolvable = node["resolvableDiscussionsCount"] or 0
-    resolved = node["resolvedDiscussionsCount"] or 0
+    # Only the list below can be partial, never the counts.
+    open_count, resolved_count = _to_thread_counts(node)
     discussions = node["discussions"]
     open_discussions = [discussion for discussion in discussions["nodes"] if _is_open_thread(discussion)]
     return ThreadIndex(
-        open_count=resolvable - resolved,
-        resolved_count=resolved,
+        open_count=open_count,
+        resolved_count=resolved_count,
         open=[_to_thread_ref(discussion) for discussion in open_discussions[:THREAD_INDEX_CAP]],
         index_complete=len(open_discussions) <= THREAD_INDEX_CAP and not discussions["pageInfo"]["hasNextPage"],
     )
@@ -825,6 +841,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         issue_key_prefixes,
         custom_issue_key_pattern,
     )
+    open_thread_count, resolved_thread_count = _to_thread_counts(node) if not include_threads else (None, None)
     return MergeRequestDetail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
@@ -854,6 +871,8 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         latest_pipeline_id=pipeline_id,
         auto_merge_strategy=node["autoMergeStrategy"] or "",
         changes=_to_diff_summary(node["diffStatsSummary"]),
+        open_thread_count=open_thread_count,
+        resolved_thread_count=resolved_thread_count,
         threads=_to_thread_index(node) if include_threads else None,
     )
 
@@ -959,7 +978,12 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     ] = False,
     include_threads: Annotated[
         bool,
-        Field(description="Include the first page of open thread refs. Defaults to true; false skips discussion data."),
+        Field(
+            description=(
+                "Include the first page of open thread refs. Defaults to true; false skips discussion data but returns "
+                "open_thread_count and resolved_thread_count."
+            ),
+        ),
     ] = True,
     issue_key_prefixes: Annotated[
         list[str] | None,
@@ -1008,7 +1032,9 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `approved`: Free means one approval. Premium and Ultimate mean all approval rules pass.
     - `auto_merge_strategy`: `merge_when_checks_pass`, `merge_train`, `add_to_merge_train_when_checks_pass` (waiting).
     - `threads.open` IDs go to get_merge_request_threads. `index_complete` false means some are missing.
-      Set `include_threads=false` to omit this index. For discussion details across several MRs, use the batch mode of
+      Set `include_threads=false` to omit the index while keeping `open_thread_count` and `resolved_thread_count`.
+      `open_thread_count` is resolvable discussions minus resolved discussions; `resolved_thread_count` is GitLab's
+      resolved discussion count. For discussion details across several MRs, use the batch mode of
       `get_merge_request_threads` instead.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.

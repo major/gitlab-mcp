@@ -200,10 +200,51 @@ async def test_include_threads_controls_graphql_fetch_and_output(
     assert request["variables"]["includeThreads"] is include_threads
     assert "discussions(first: 100) @include(if: $includeThreads)" in request["query"]
     assert ("threads" in data) is expects_threads
+    assert ("open_thread_count" in data) is not expects_threads
+    assert ("resolved_thread_count" in data) is not expects_threads
     if expects_threads:
         assert data["threads"]["open"] == [
             {"id": "open-1", "by": "mhayden", "notes": 1, "path": "docs/sop.md", "line": 212},
         ]
+
+
+@pytest.mark.parametrize(
+    ("resolvable_count", "resolved_count", "expected_open", "expected_resolved"),
+    [
+        (0, 0, 0, 0),
+        (6, 2, 4, 2),
+        (None, None, 0, 0),
+    ],
+    ids=["zero-counts", "nonzero-counts", "null-counts"],
+)
+@respx.mock
+async def test_thread_counts_are_returned_when_thread_index_is_skipped(
+    gitlab_env,
+    resolvable_count,
+    resolved_count,
+    expected_open,
+    expected_resolved,
+):
+    """Thread counts remain available without fetching or returning discussion details."""
+    # Arrange
+    node = make_mr(
+        resolvableDiscussionsCount=resolvable_count,
+        resolvedDiscussionsCount=resolved_count,
+    )
+    del node["discussions"]
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(include_threads=False)
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert route.call_count == 1
+    assert request["variables"]["includeThreads"] is False
+    assert "discussions(first: 100) @include(if: $includeThreads)" in request["query"]
+    assert data["open_thread_count"] == expected_open
+    assert data["resolved_thread_count"] == expected_resolved
+    assert "threads" not in data
 
 
 def blockers_response(visible: list[int], hidden: int = 0) -> httpx.Response:
