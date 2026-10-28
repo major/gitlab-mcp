@@ -43,7 +43,7 @@ MERGE_REQUESTS_QUERY = """
 query(
   $fullPath: ID!, $state: MergeRequestState, $authorUsername: String, $search: String,
   $createdAfter: Time, $updatedAfter: Time, $targetBranches: [String!],
-  $includeSourceBranch: Boolean!, $includeTargetBranch: Boolean!, $includeLabels: Boolean!,
+  $includeSourceBranch: Boolean!, $includeTargetBranch: Boolean!, $includeLabels: Boolean!, $includeCreatedAt: Boolean!,
   $first: Int!, $after: String
 ) {
   project(fullPath: $fullPath) {
@@ -55,6 +55,7 @@ query(
       pageInfo { hasNextPage endCursor }
       nodes {
         iid title state draft updatedAt
+        createdAt @include(if: $includeCreatedAt)
         sourceBranch @include(if: $includeSourceBranch)
         targetBranch @include(if: $includeTargetBranch)
         labels(first: 100) @include(if: $includeLabels) {
@@ -78,7 +79,7 @@ query(
 ) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
-      iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
+      iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch createdAt
       labels(first: 100) @include(if: $includeLabels) {
         nodes { title }
         pageInfo { hasNextPage }
@@ -198,6 +199,7 @@ class MergeRequestSummary(BaseModel):
     approved_by: list[str]
     open_threads: int
     updated: str  # Date only, YYYY-MM-DD.
+    created_at: str | None = None  # Date only, YYYY-MM-DD, when requested.
 
 
 class MergeRequestList(BaseModel):
@@ -208,8 +210,8 @@ class MergeRequestList(BaseModel):
         description=(
             "TSV with a header row. Columns: iid, title, author, state, draft, approved, "
             "approved_by, open_threads, updated. approved_by is comma-separated usernames. "
-            "An empty cell means none. Booleans are true/false. source_branch, target_branch, and labels are appended "
-            "only when asked; "
+            "An empty cell means none. Booleans are true/false. source_branch, target_branch, labels, and created_at "
+            "are appended only when asked, in that order. created_at is a date in YYYY-MM-DD format; "
             "labels is a JSON array in one cell, and labels_complete reports whether all returned labels were included."
         ),
     )
@@ -256,6 +258,11 @@ class MergeRequestDetail(BaseModel):
     author_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
     labels: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     labels_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    created_at: str | None = Field(
+        default=None,
+        description="Creation date in YYYY-MM-DD format, when available.",
+        exclude_if=lambda value: value is None,
+    )
     merged_at: str | None = Field(default=None, exclude_if=lambda value: value is None)
     merged_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
     source_branch: str
@@ -377,6 +384,7 @@ def _to_tsv(
     include_source_branch: bool = False,
     include_target_branch: bool = False,
     include_labels: bool = False,
+    include_created_at: bool = False,
 ) -> str:
     """Render merge requests as TSV, appending optional data columns when requested."""
     columns = list(TSV_COLUMNS)
@@ -386,6 +394,8 @@ def _to_tsv(
         columns.append("target_branch")
     if include_labels:
         columns.append("labels")
+    if include_created_at:
+        columns.append("created_at")
     lines = ["\t".join(columns)]
     for mr in mrs:
         values = [_cell(getattr(mr, column)) for column in TSV_COLUMNS]
@@ -396,6 +406,8 @@ def _to_tsv(
         if include_labels:
             # JSON escaping keeps tabs and newlines inside one TSV cell.
             values.append(json.dumps(mr.labels, ensure_ascii=False, separators=(",", ":")))
+        if include_created_at:
+            values.append(_cell(mr.created_at))
         lines.append("\t".join(values))
     return "\n".join(lines)
 
@@ -406,11 +418,13 @@ def _to_summary(
     include_source_branch: bool = False,
     include_target_branch: bool = False,
     include_labels: bool = False,
+    include_created_at: bool = False,
 ) -> MergeRequestSummary:
     """Convert one GraphQL merge request node into a summary."""
     # A deleted or banned author comes back as null.
     author = node["author"]
     label_connection = node.get("labels") if include_labels else None
+    created_at = node.get("createdAt") if include_created_at else None
     return MergeRequestSummary(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
@@ -425,6 +439,7 @@ def _to_summary(
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
         open_threads=(node["resolvableDiscussionsCount"] or 0) - (node["resolvedDiscussionsCount"] or 0),
         updated=node["updatedAt"][:10],  # ISO 8601 timestamp, keep the date part.
+        created_at=created_at[:10] if created_at else None,
     )
 
 
@@ -513,6 +528,10 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         Field(description="Append labels as a JSON array in one TSV cell. Defaults to false."),
     ] = False,
     limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    include_created_at: Annotated[
+        bool,
+        Field(description="Append the creation date in YYYY-MM-DD format as the last TSV column. Defaults to false."),
+    ] = False,
 ) -> MergeRequestList:
     """List merge requests in a project, newest-updated first.
 
@@ -527,9 +546,10 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
     `search` uses GitLab's `Project.mergeRequests(search:)` filter, which matches
     text in the title or description.
     `created_after` and `updated_after` accept timezone-aware ISO 8601 datetimes.
-    `target_branch` filters by target branch. `include_source_branch`, `include_target_branch`, and
-    `include_labels` append columns only when requested, in that order. Labels are JSON arrays inside a TSV cell;
-    `labels_complete` is false when any returned label list exceeds its first 100 labels.
+    `target_branch` filters by target branch. `include_source_branch`, `include_target_branch`, `include_labels`, and
+    `include_created_at` append columns only when requested, in that order. `created_at` is a YYYY-MM-DD date and is
+    always the last column when included. Labels are JSON arrays inside a TSV cell; `labels_complete` is false when
+    any returned label list exceeds its first 100 labels.
     `approved` and `has_open_threads` are filtered after fetching, so the tool
     scans at most 5 pages. If `has_more` is true but fewer than `limit` MRs
     came back, the scan stopped early and more matches may exist.
@@ -550,6 +570,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         "includeSourceBranch": include_source_branch,
         "includeTargetBranch": include_target_branch,
         "includeLabels": include_labels,
+        "includeCreatedAt": include_created_at,
         "after": None,
         "first": 100 if filtered else limit,
     }
@@ -567,6 +588,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
                 include_source_branch=include_source_branch,
                 include_target_branch=include_target_branch,
                 include_labels=include_labels,
+                include_created_at=include_created_at,
             )
             for node in connection["nodes"]
         ]
@@ -585,6 +607,7 @@ async def list_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
             include_source_branch=include_source_branch,
             include_target_branch=include_target_branch,
             include_labels=include_labels,
+            include_created_at=include_created_at,
         ),
         has_more=len(collected) > limit or has_next,
         labels_complete=not any(mr.labels_truncated for mr in displayed) if include_labels else None,
@@ -882,6 +905,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     pipeline_id = (
         numeric_gid(pipeline.get("id"), {"Ci::Pipeline"}) if pipeline and pipeline.get("id") is not None else None
     )
+    created_at = node.get("createdAt")
     merged_at, merged_by = _merged_metadata(node)
     description, description_truncated, next_description_offset = _page_description(
         node.get("description") if include_description else None,
@@ -900,6 +924,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
         state=node["state"],
+        created_at=created_at[:10] if created_at else None,
         merged_at=merged_at,
         merged_by=merged_by,
         draft=node["draft"],
@@ -1118,6 +1143,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       `get_merge_request_threads` instead.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
+    - `created_at` is the creation date in YYYY-MM-DD format when available.
     - The description is skipped by default. Set `include_description=true` to read it when you need it.
     - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
     - `latest_pipeline_id` is the numeric ID of the head pipeline when one is attached, even when jobs are not

@@ -306,7 +306,14 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         (
             "list_merge_requests",
             set(),
-            {"created_after", "updated_after", "target_branch", "include_source_branch", "include_labels"},
+            {
+                "created_after",
+                "updated_after",
+                "target_branch",
+                "include_source_branch",
+                "include_labels",
+                "include_created_at",
+            },
         ),
         (
             "list_pipelines",

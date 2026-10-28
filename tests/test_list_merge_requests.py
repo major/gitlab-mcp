@@ -111,6 +111,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "includeSourceBranch": False,
         "includeTargetBranch": False,
         "includeLabels": False,
+        "includeCreatedAt": False,
         "after": None,
         "first": 5,
     }
@@ -159,6 +160,7 @@ async def test_filters_and_optional_columns(gitlab_env):
         "includeSourceBranch": True,
         "includeTargetBranch": False,
         "includeLabels": True,
+        "includeCreatedAt": False,
         "after": None,
         "first": 1,
     }
@@ -173,6 +175,116 @@ async def test_filters_and_optional_columns(gitlab_env):
     assert row["source_branch"] == "feature line break"
     assert row["labels"] == json.dumps(["Group::One", "path\tname"], ensure_ascii=False, separators=(",", ":"))
     assert data["labels_complete"] is False
+
+
+@pytest.mark.parametrize("arguments", [{}, {"include_created_at": False}], ids=["default", "explicit-false"])
+@respx.mock
+async def test_creation_date_is_omitted_unless_requested(gitlab_env, arguments):
+    """An unrequested creation date does not change the existing TSV output."""
+    # Arrange
+    node = make_node(1, createdAt="2025-06-17T12:34:56Z")
+    route = respx.post(GRAPHQL).mock(return_value=make_page(node))
+
+    # Act
+    data = await call_tool(arguments)
+
+    # Assert
+    assert sent_variables(route)["includeCreatedAt"] is False
+    assert data == {
+        "web_url_prefix": WEB_URL_PREFIX,
+        "merge_requests": f"{HEADER}\n1\tMR 1\tjdoe\topened\tfalse\tfalse\t\t0\t2026-10-20",
+        "has_more": False,
+    }
+
+
+@respx.mock
+async def test_creation_date_is_appended_when_requested(gitlab_env):
+    """The opt-in query returns a date-only creation column after the default columns."""
+    # Arrange
+    node = make_node(1, createdAt="2025-06-17T12:34:56Z")
+    route = respx.post(GRAPHQL).mock(return_value=make_page(node))
+
+    # Act
+    data = await call_tool({"include_created_at": True})
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert request["variables"]["includeCreatedAt"] is True
+    assert "$includeCreatedAt: Boolean!" in request["query"]
+    assert "createdAt @include(if: $includeCreatedAt)" in request["query"]
+    assert data["merge_requests"] == (
+        f"{HEADER}\tcreated_at\n1\tMR 1\tjdoe\topened\tfalse\tfalse\t\t0\t2026-10-20\t2025-06-17"
+    )
+
+
+@respx.mock
+async def test_creation_date_follows_all_optional_columns(gitlab_env):
+    """All optional columns keep their order and every row has the same number of cells."""
+    # Arrange
+    nodes = [
+        make_node(
+            1,
+            sourceBranch="feature/x",
+            targetBranch="main",
+            labels={"nodes": [{"title": "backend"}], "pageInfo": {"hasNextPage": False}},
+            createdAt="2025-06-17T12:34:56Z",
+        ),
+        make_node(2, sourceBranch=None, targetBranch=None, createdAt=None),
+    ]
+    route = respx.post(GRAPHQL).mock(return_value=make_page(*nodes))
+
+    # Act
+    data = await call_tool(
+        {
+            "include_source_branch": True,
+            "include_target_branch": True,
+            "include_labels": True,
+            "include_created_at": True,
+        },
+    )
+
+    # Assert
+    variables = sent_variables(route)
+    assert all(
+        variables[name] is True
+        for name in ("includeSourceBranch", "includeTargetBranch", "includeLabels", "includeCreatedAt")
+    )
+    header, *lines = data["merge_requests"].split("\n")
+    assert header.split("\t") == [*HEADER.split("\t"), "source_branch", "target_branch", "labels", "created_at"]
+    assert all(len(line.split("\t")) == len(header.split("\t")) for line in lines)
+    assert [line.split("\t")[-4:] for line in lines] == [
+        ["feature/x", "main", '["backend"]', "2025-06-17"],
+        ["", "", "[]", ""],
+    ]
+    assert data["labels_complete"] is True
+
+
+@pytest.mark.parametrize("overrides", [{}, {"createdAt": None}, {"createdAt": ""}], ids=["missing", "null", "empty"])
+@respx.mock
+async def test_missing_creation_date_is_an_empty_cell(gitlab_env, overrides):
+    """A missing creation timestamp keeps an empty final cell when the column is requested."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=make_page(make_node(1, **overrides)))
+
+    # Act
+    data = await call_tool({"include_created_at": True})
+
+    # Assert
+    assert data["merge_requests"] == (f"{HEADER}\tcreated_at\n1\tMR 1\tjdoe\topened\tfalse\tfalse\t\t0\t2026-10-20\t")
+
+
+@respx.mock
+async def test_empty_list_has_requested_creation_date_header(gitlab_env):
+    """The optional creation date column is present even when the list is empty."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=make_page())
+
+    # Act
+    data = await call_tool({"include_created_at": True})
+
+    # Assert
+    assert sent_variables(route)["includeCreatedAt"] is True
+    assert data["merge_requests"] == f"{HEADER}\tcreated_at"
 
 
 @pytest.mark.parametrize(
@@ -245,6 +357,7 @@ async def test_defaults_list_open_mrs_by_any_author(gitlab_env):
         "includeSourceBranch": False,
         "includeTargetBranch": False,
         "includeLabels": False,
+        "includeCreatedAt": False,
         "after": None,
         "first": 20,
     }
@@ -506,6 +619,7 @@ async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
             "includeSourceBranch": False,
             "includeTargetBranch": False,
             "includeLabels": False,
+            "includeCreatedAt": False,
             "after": None,
             "first": FULL_PAGE,
         },
@@ -520,6 +634,7 @@ async def test_search_is_sent_across_pages_with_other_filters(gitlab_env):
             "includeSourceBranch": False,
             "includeTargetBranch": False,
             "includeLabels": False,
+            "includeCreatedAt": False,
             "after": "c1",
             "first": FULL_PAGE,
         },
