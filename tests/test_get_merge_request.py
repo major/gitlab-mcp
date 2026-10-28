@@ -1017,6 +1017,66 @@ async def test_issue_keys_deduplicate_in_source_order_before_description_truncat
 
 
 @pytest.mark.parametrize(
+    ("title", "description", "arguments", "expected"),
+    [
+        ("Fix CVE-2024-12345", "", {}, []),
+        ("Security fixes", "Fix CVE-2023-9876", {"include_description": True}, []),
+        (
+            "JIRA-42 fixes CVE-2024-12345",
+            "CVE-2023-9876 and JIRA-43.",
+            {"include_description": True},
+            ["JIRA-42", "JIRA-43"],
+        ),
+        ("Fix JIRA-42.", "", {}, ["JIRA-42"]),
+        ("CVE-123 and CVE-2024", "", {}, ["CVE-123", "CVE-2024"]),
+        ("CVE-2024-12345 and CVE-2024", "", {}, ["CVE-2024"]),
+        ("CVE-2024 and CVE-2024-12345", "", {}, ["CVE-2024"]),
+        ("CVE-123-456 and JIRA-123-456", "", {}, ["CVE-123", "JIRA-123"]),
+        ("CVE-20240-123 and CVE-2024-abc", "", {}, ["CVE-20240", "CVE-2024"]),
+        ("CVE-2024-123abc", "", {}, ["CVE-2024"]),
+        (
+            "CVE-2024-12345 and JIRA-42",
+            "CVE-2023-9876",
+            {"include_description": True, "issue_key_prefixes": ["CVE"]},
+            ["CVE-2024", "CVE-2023"],
+        ),
+        ("CVE-2024-12345", "", {"issue_key_pattern": r"CVE-[0-9]+"}, ["CVE-2024"]),
+        ("CVE-2024-12345", "", {"issue_key_pattern": r"CVE-[0-9]+-[0-9]+"}, ["CVE-2024-12345"]),
+    ],
+    ids=[
+        "cve-in-title",
+        "cve-in-description",
+        "jira-keys-next-to-cves",
+        "jira-at-sentence-end",
+        "bare-cve-keys",
+        "full-cve-before-bare-key",
+        "bare-key-before-full-cve",
+        "other-hyphenated-keys",
+        "non-cve-year-or-suffix",
+        "suffix-with-letters",
+        "explicit-cve-prefix",
+        "custom-partial-cve-pattern",
+        "custom-full-cve-pattern",
+    ],
+)
+@respx.mock
+async def test_issue_key_extraction_handles_cve_identifiers(gitlab_env, title, description, arguments, expected):
+    """Default extraction skips full CVEs while preserving caller-selected issue key behavior."""
+    # Arrange
+    node = make_mr(title=title, description=description)
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool(**arguments)
+
+    # Assert
+    assert route.call_count == 1
+    assert data.get("issue_keys", []) == expected
+    assert ("issue_keys" in data) is bool(expected)
+    assert "issue_keys_truncated" not in data
+
+
+@pytest.mark.parametrize(
     ("prefixes", "expected"),
     [
         (None, ["ALPHA-1", "BETA_2-4"]),
