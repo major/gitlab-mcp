@@ -386,6 +386,7 @@ async def test_batch_continues_after_success_failure_and_unknown_write(gitlab_en
         (2189, "thread", "unknown", None),
         (2190, "thread", "applied", None),
     ]
+    assert [row.get("note_id") for row in result["results"]] == [11, None, None, 44]
     assert "unknown" not in result["results"][1]["warning"].lower()
     assert "outcome is unknown" in result["results"][2]["warning"].lower()
 
@@ -529,7 +530,45 @@ async def test_batch_resolution_5xx_is_unknown_not_failed(gitlab_env):
     # Assert
     assert note.calls.call_count == resolve.calls.call_count == 1
     assert result["results"][0]["status"] == "unknown"
+    assert result["results"][0]["note_id"] == NOTE_ID
     assert "resolution outcome is unknown" in result["results"][0]["warning"].lower()
+
+
+@respx.mock
+async def test_batch_retains_reply_id_after_resolution_connection_error(gitlab_env):
+    """An unknown resolution still exposes the confirmed reply ID without retrying either write."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    resolve = respx.put(DISCUSSION_URL).mock(side_effect=httpx.ConnectError("connection reset"))
+    status = respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply", "resolve": True}])
+
+    # Assert
+    assert result["results"][0]["status"] == "unknown"
+    assert result["results"][0]["note_id"] == NOTE_ID
+    assert "do not repost" in result["results"][0]["warning"].lower()
+    assert note.call_count == resolve.call_count == status.call_count == 1
+
+
+@respx.mock
+async def test_batch_resolve_only_omits_note_id(gitlab_env):
+    """A resolve-only batch item does not create or claim a note identity."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    resolve = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"resolved": True}))
+    status = respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 1))
+
+    # Act
+    result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "resolve": True}])
+
+    # Assert
+    assert result["results"] == [
+        {"iid": IID, "thread_id": "thread-1", "status": "applied", "resolved": True, "open_threads": 0}
+    ]
+    assert note.call_count == 0
+    assert resolve.call_count == status.call_count == 1
 
 
 @respx.mock
@@ -586,6 +625,7 @@ async def test_batch_omits_open_threads_when_the_last_resolution_fails(gitlab_en
 
     # Assert
     assert [row["status"] for row in result["results"]] == ["applied", "partial"]
+    assert [row["note_id"] for row in result["results"]] == [1, 2]
     assert all("open_threads" not in row for row in result["results"])
     assert counts.call_count == 1
     assert result["merge_requests"] == [
@@ -796,7 +836,9 @@ async def test_invalid_status_values_are_omitted_without_changing_write_result(
 
     # Assert
     assert note.call_count == status.call_count == 1
-    assert result["results"] == [{"iid": IID, "thread_id": "thread-1", "status": "applied", "resolved": None}]
+    assert result["results"] == [
+        {"iid": IID, "thread_id": "thread-1", "status": "applied", "resolved": None, "note_id": NOTE_ID}
+    ]
     summary = result["merge_requests"][0]
     expected_summary: dict[str, Any] = {
         "iid": IID,

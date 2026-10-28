@@ -1,5 +1,6 @@
 """Merge request review thread tools: read, count, and reply to threads 🧵."""
 
+import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -53,7 +54,7 @@ query($fullPath: ID!, $iid: String!, $after: String, $includeMrStatus: Boolean!)
           notes(first: 50) {
             pageInfo { hasNextPage }
             nodes {
-              system body createdAt
+              id system body createdAt
               author { username bot name id }
               position { oldPath newPath oldLine newLine }
             }
@@ -126,7 +127,7 @@ NOTE_CAP = 4000
 THREAD_CUT_MARKER = " [truncated]"
 # Do not let a malformed marker consume a later HTML comment.
 REVIEW_BOT_FINDING_PATTERN = re.compile(r"<!-- review-bot:finding\s(?:(?!-->|<!--).)*-->\s*$", re.DOTALL)
-# Total characters of note bodies that one thread call may return. Keeps one tool result small.
+# Serialized character budget for full and finding thread results.
 THREAD_BODY_BUDGET = 30000
 # Serialized character budget for compact heading results.
 THREAD_HEADING_BUDGET = 30000
@@ -150,6 +151,8 @@ STATE_STATUSES: dict[ThreadState, frozenset[ThreadStatus]] = {
 class Note(BaseModel):
     """One human note."""
 
+    note_id: int  # REST-compatible note ID.
+    body_hash: str  # SHA-256 of the untouched UTF-8 body.
     by: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the author was deleted or banned.
     body: str  # Cut at the requested max_body_chars, then marked with THREAD_CUT_MARKER.
     at: str  # Date only, YYYY-MM-DD.
@@ -268,6 +271,7 @@ class ThreadReplyBatchItem(BaseModel):
     thread_id: str
     status: ThreadReplyBatchStatus
     resolved: bool | None
+    note_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
     # Sent once per MR, on its last item with resolve=true, when that resolution succeeded.
     open_threads: int | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda value: not value)
@@ -361,13 +365,28 @@ def _thread_heading(body: str) -> str:
     return next((line.strip()[:THREAD_HEADING_CAP] for line in body.splitlines() if line.strip()), "")
 
 
+def _note_id(value: Any) -> int:
+    """Convert a valid GitLab Note or DiffNote GID to its positive REST ID."""
+    match = re.fullmatch(r"gid://gitlab/(?:Note|DiffNote)/([0-9]+)", value) if isinstance(value, str) else None
+    try:
+        note_id = int(match.group(1)) if match else 0
+    except ValueError:
+        note_id = 0
+    if note_id <= 0:
+        raise ToolError("GitLab returned an invalid note ID.")  # noqa: TRY003
+    return note_id
+
+
 def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP, compact_findings: bool = False) -> Note:
     """Convert one GraphQL note into a note with a capped body and a date-only timestamp."""
     author = node["author"]  # A deleted or banned author comes back as null.
     body = node["body"]
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if compact_findings and author is not None and author.get("bot") is True:
         body = _findings.compact_finding_body(body)
     return Note(
+        note_id=_note_id(node.get("id")),
+        body_hash=body_hash,
         by=author_display(author),
         body=_cap_note_body(body, max_body_chars=max_body_chars),
         at=node["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
@@ -474,7 +493,7 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     seen: set[str] = set()
     mr_headers: dict[str, str] = {}
     full_view = view in {"full", "finding"}
-    output_size = 2 if view == "headings" else 0  # Count the serialized list brackets.
+    output_size = 2  # Count the serialized list brackets.
     for _ in range(MAX_PAGES):
         node = await fetch_merge_request(
             client,
@@ -497,11 +516,7 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
             if thread is None or not thread_filter.matches(thread, nodes[index]):
                 continue
             output_thread = thread if full_view else _to_thread_heading(nodes[index], thread)
-            size = (
-                sum(len(note.body) for note in thread.notes)
-                if full_view
-                else len(output_thread.model_dump_json()) + (1 if threads else 0)
-            )
+            size = len(output_thread.model_dump_json()) + (1 if threads else 0)
             budget = THREAD_BODY_BUDGET if full_view else THREAD_HEADING_BUDGET
             # Always return at least one thread, even when that thread alone is over budget.
             if threads and output_size + size > budget:
@@ -634,6 +649,8 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - `notes_truncated` means the notes page has another page. Heading `note_count`, `last_by`, and `last_at` only
       cover fetched human notes when this is true, and the `author` filter can miss a late reply.
+    - Full and finding notes include a REST-compatible `note_id` and `body_hash`, the SHA-256 hex digest of the full,
+      untouched UTF-8 body before removing markers, compacting findings, or truncating text.
     - Trailing `review-bot:finding` comments are removed.
     - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
       the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
@@ -643,7 +660,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
       scenario", and "How to fix" sections, including their code and diagrams. A bold-heading action-bullet format
       loses its introductory paragraph. Human notes and unrecognized formats remain unchanged.
     - In full and finding views, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits
-      body text. A call returns about 30000 body characters. Headings view returns about 30000 serialized characters.
+      body text. Each view returns about 30000 serialized thread characters, unless the first thread exceeds the budget.
       Continue with `next_cursor` using the same filters, `view`, and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
     - Each batch result includes its own `iid`, `threads`, `next_cursor`, and `not_found_ids`. Batch cursors are not
@@ -965,6 +982,9 @@ async def reply_to_threads(
     stop later items or roll back successful writes. Writes are never retried. Check each status and warning before
     deciding what to do next, especially when an outcome is unknown.
 
+    Each result includes `note_id` when a reply was posted, including when a later resolution fails or is unknown.
+    Resolve-only results do not include a note ID.
+
     After a successful `resolve=true`, `open_threads` is sent once per merge request, on that MR's last item with
     `resolve=true`. It is left out if that count cannot be read or if that last resolution failed. The top-level
     `merge_requests` list contains one best-effort post-write summary per distinct IID, in first-request order, read
@@ -1009,6 +1029,7 @@ async def reply_to_threads(
                 thread_id=outcome.thread_id,
                 status=status,
                 resolved=outcome.resolved,
+                note_id=outcome.note_id,
                 warning=warning,
             )
         )
