@@ -138,7 +138,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_job` | Read a runner job's status, timing, failure reason, and runner metadata. |
 | `get_job_artifact` | Read a bounded UTF-8 text prefix from a known job artifact path. |
 | `get_job_log` | Read a bounded job log view, such as its tail, search results, or failure markers. |
-| `get_merge_request` | Read merge request status, reviewers, approvals, CI, and optional details. |
+| `get_merge_request` | Read merge request status, reviewers, approvals, CI status and tested commit, and optional details. |
 | `get_merge_request_diff` | List changed files or read selected merge request patches, optionally compared with an earlier version. |
 | `get_merge_request_threads` | Read review threads, note IDs, body hashes, and status for one or more merge requests. |
 | `get_merge_requests` | Read compact status for up to 20 merge requests. |
