@@ -127,7 +127,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | Tool | Purpose |
 | --- | --- |
 | `api_get` | Read selected fields from allowlisted project, member, merge request commit, or repository file resources. |
-| `create_issue` | Create an issue in a project. |
+| `create_issue` | Create an issue with an optional inline or server-local file description. |
 | `create_merge_request` | Create a merge request from existing branches with optional labels, assignees, and blockers. |
 | `create_pipeline` | Create a pipeline for a ref after checking its expected commit SHA. |
 | `edit_merge_request_description` | Replace one unique exact-text match in a merge request description. |
