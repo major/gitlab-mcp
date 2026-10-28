@@ -268,7 +268,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"include_threads", "include_description", "description_limit", "description_offset"},
         ),
         ("get_merge_request_threads", {"project"}, {"iid", "iids", "include_mr_status"}),
-        ("get_work_item", {"project", "iid"}, {"scope", "include_description", "description_limit", "cursor"}),
+        (
+            "get_work_item",
+            {"project", "iid"},
+            {"scope", "include_description", "description_limit", "description_offset", "cursor"},
+        ),
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
         (
             "edit_work_item_description",
