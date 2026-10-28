@@ -127,6 +127,8 @@ NOTE_CAP = 4000
 THREAD_CUT_MARKER = " [truncated]"
 # Do not let a malformed marker consume a later HTML comment.
 REVIEW_BOT_FINDING_PATTERN = re.compile(r"<!-- review-bot:finding\s(?:(?!-->|<!--).)*-->\s*$", re.DOTALL)
+# Note, DiffNote, and DiscussionNote GIDs. Group 1 is the REST note ID.
+NOTE_GID_PATTERN = re.compile(r"gid://gitlab/(?:Note|DiffNote|DiscussionNote)/([0-9]+)")
 # Serialized character budget for full and finding thread results.
 THREAD_BODY_BUDGET = 30000
 # Serialized character budget for compact heading results.
@@ -366,11 +368,12 @@ def _thread_heading(body: str) -> str:
 
 
 def _note_id(value: Any) -> int:
-    """Convert a valid GitLab Note or DiffNote GID to its positive REST ID."""
-    match = re.fullmatch(r"gid://gitlab/(?:Note|DiffNote)/([0-9]+)", value) if isinstance(value, str) else None
+    """Convert a valid GitLab Note, DiffNote, or DiscussionNote GID to its positive REST ID."""
+    match = NOTE_GID_PATTERN.fullmatch(value) if isinstance(value, str) else None
     try:
         note_id = int(match.group(1)) if match else 0
     except ValueError:
+        # Python refuses to convert very long digit strings, so treat them as invalid IDs.
         note_id = 0
     if note_id <= 0:
         raise ToolError("GitLab returned an invalid note ID.")  # noqa: TRY003

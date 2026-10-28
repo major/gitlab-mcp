@@ -697,15 +697,16 @@ async def test_general_threaded_discussion_notes_have_stable_kind(gitlab_env, ch
     assert write.call_count == 1
 
 
+@pytest.mark.parametrize("note_type", ["Note", "DiffNote", "DiscussionNote"])
 @respx.mock
-async def test_read_then_edit_uses_hash_of_raw_body_not_transformed_preview(gitlab_env):
+async def test_read_then_edit_uses_hash_of_raw_body_not_transformed_preview(gitlab_env, note_type):
     """Discovery provides the raw hash, so an exact diagram edit preserves hidden suffix and marker."""
     # Arrange
     expected_note_id = 7
     raw = "Input -> Output\nUnseen suffix stays here\n<!-- review-bot:finding hidden -->"
     saved = raw.replace("Input -> Output", "Input → Output")
     graphql_note = {
-        "id": "gid://gitlab/Note/7",
+        "id": f"gid://gitlab/{note_type}/7",
         "system": False,
         "body": raw,
         "createdAt": "2026-10-20T19:43:02Z",

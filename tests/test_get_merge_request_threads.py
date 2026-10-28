@@ -418,14 +418,18 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
     }
 
 
+@pytest.mark.parametrize(
+    ("root_type", "reply_type"),
+    [("Note", "DiffNote"), ("DiffNote", "DiscussionNote"), ("DiscussionNote", "Note")],
+)
 @respx.mock
-async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env):
-    """Note and DiffNote GIDs become distinct REST IDs with hashes of the untouched UTF-8 bodies."""
+async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env, root_type, reply_type):
+    """Supported note GIDs become REST IDs with hashes of the untouched UTF-8 bodies in every view."""
     # Arrange
     root_body = "Résumé 🧪\n\n<!-- review-bot:finding hidden -->\n"
     reply_body = "Reply with trailing space  "
-    root = make_note(root_body, author="alice") | {"id": "gid://gitlab/DiffNote/123"}
-    reply = make_note(reply_body, author="bob") | {"id": "gid://gitlab/Note/456"}
+    root = make_note(root_body, author="alice") | {"id": f"gid://gitlab/{root_type}/123"}
+    reply = make_note(reply_body, author="bob") | {"id": f"gid://gitlab/{reply_type}/456"}
     route = respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", root, reply))))
 
     # Act
@@ -453,6 +457,30 @@ async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env):
     assert "id system body createdAt" in json.loads(route.calls[0].request.content)["query"]
 
 
+@pytest.mark.parametrize("view", ["full", "headings", "finding"])
+@pytest.mark.parametrize("selected", ["general", "inline"])
+@respx.mock
+async def test_discussion_note_in_unselected_thread_does_not_break_filtered_read(gitlab_env, view, selected):
+    """Filtering runs after parsing, so a valid DiscussionNote in any thread must parse even when filtered out."""
+    # Arrange
+    general = make_note("General feedback", note_id=123) | {"id": "gid://gitlab/DiscussionNote/123"}
+    inline = make_note("Inline feedback", note_id=456) | {"id": "gid://gitlab/DiffNote/456"}
+    route = respx.post(GRAPHQL).mock(
+        return_value=respond(page(make_discussion("general", general), make_discussion("inline", inline))),
+    )
+
+    # Act
+    data = await call_tool(view=view, ids=[selected])
+
+    # Assert
+    assert thread_ids(data) == [selected]
+    if view == "headings":
+        assert "notes" not in data["threads"][0]
+    else:
+        assert data["threads"][0]["notes"][0]["note_id"] == (123 if selected == "general" else 456)
+    assert route.call_count == 1
+
+
 @pytest.mark.parametrize(
     "bad_id",
     [
@@ -462,6 +490,7 @@ async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env):
         123,
         "123",
         "gid://gitlab/User/123",
+        "gid://gitlab/Discussion/123",
         "gid://other/Note/123",
         "gid://gitlab/Note/0",
         "gid://gitlab/Note/-1",
@@ -476,6 +505,7 @@ async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env):
         "integer",
         "bare",
         "wrong-type",
+        "discussion-gid",
         "wrong-host",
         "zero",
         "negative",
