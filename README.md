@@ -146,6 +146,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_pipeline_failures` | List failed runner and build jobs with optional log tails. |
 | `get_pipeline_test_report` | Read pipeline test suite summaries or failed and errored test cases. |
 | `get_work_item` | Read a project or group work item and selected description content. |
+| `get_work_item_note` | Read a scoped human note body in bounded pages with a full-body hash. |
 | `land_merge_request` | Merge one merge request or cancel its queued merge. |
 | `land_merge_requests` | Merge or cancel up to 20 merge requests in order. |
 | `list_job_artifacts` | List one page of a job's artifact tree. |
@@ -154,7 +155,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `list_merge_train` | List active merge train entries. |
 | `list_pipeline_schedules` | List one page of a project's pipeline schedules. |
 | `list_pipelines` | List one page of project, merge request, or schedule pipelines. |
-| `list_work_item_notes` | Read a bounded page of human notes for a work item. |
+| `list_work_item_notes` | Read a bounded page of human notes and their IDs for a work item. |
 | `post_review_notes` | Validate or post a batch of general, file-level, or inline merge request review notes. |
 | `reply_to_thread` | Reply to or resolve one merge request review thread. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads in order. |

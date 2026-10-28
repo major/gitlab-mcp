@@ -989,12 +989,14 @@ async def test_edit_source_rejects_mismatched_iid_and_invalid_description(gitlab
 def note(
     body: str,
     *,
+    note_id: str = "gid://gitlab/Note/101",
     system: bool = False,
     username: str | None = "mhayden",
     created_at: str = "2026-10-21T10:00:00Z",
 ) -> dict[str, Any]:
     """Build one note node, including null authors and system notes."""
     return {
+        "id": note_id,
         "system": system,
         "body": body,
         "createdAt": created_at,
@@ -1040,7 +1042,7 @@ async def test_notes_filter_system_notes_cap_bodies_and_paginate_discussions(git
                         "nodes": [
                             note("automated", system=True),
                             note("x" * 20, username=None),
-                            note("short", created_at="2026-10-22T11:00:00Z"),
+                            note("short", note_id="gid://gitlab/Note/102", created_at="2026-10-22T11:00:00Z"),
                         ],
                         "pageInfo": {"hasNextPage": False},
                     },
@@ -1063,9 +1065,10 @@ async def test_notes_filter_system_notes_cap_bodies_and_paginate_discussions(git
     assert "scopeNamespace: project(fullPath: $fullPath)" in query
     assert "namespace(fullPath: $fullPath)" in query
     assert "workItem(iid: $iid) {\n      iid" in query
+    assert "nodes { id system body createdAt author { username } }" in query
     assert result["notes"] == [
-        {"body": "xxxxx", "at": "2026-10-21", "body_truncated": True},
-        {"by": "mhayden", "body": "short", "at": "2026-10-22"},
+        {"note_id": "gid://gitlab/Note/101", "body": "xxxxx", "at": "2026-10-21", "body_truncated": True},
+        {"note_id": "gid://gitlab/Note/102", "by": "mhayden", "body": "short", "at": "2026-10-22"},
     ]
     assert result["discussions_complete"] is False
     assert result["notes_truncated"] is True
@@ -1291,6 +1294,9 @@ async def test_invalid_nested_note_pages_are_reported(gitlab_env, discussion, me
     ("note_node", "message"),
     [
         (None, "invalid work-item note"),
+        (note("body") | {"id": None}, "invalid work-item note global ID"),
+        (note("body") | {"id": "gid://gitlab/Issue/101"}, "invalid work-item note global ID"),
+        (note("body") | {"id": "gid://gitlab/Note/01"}, "invalid work-item note global ID"),
         (note("body") | {"body": 7}, "invalid work-item note body"),
         (note("body") | {"createdAt": 7}, "invalid work-item note timestamp"),
     ],
@@ -1316,12 +1322,13 @@ async def test_notes_allow_null_authors_and_missing_timestamps(gitlab_env):
     # Arrange
     notes = [
         {
+            "id": "gid://gitlab/Note/101",
             "system": False,
             "body": "body",
             "createdAt": "2026-10-21T10:00:00Z",
             "author": {"username": 123},
         },
-        {"system": False, "body": "", "author": None},
+        {"id": "gid://gitlab/Note/102", "system": False, "body": "", "author": None},
     ]
     route = respx.post(
         GRAPHQL,
@@ -1333,5 +1340,8 @@ async def test_notes_allow_null_authors_and_missing_timestamps(gitlab_env):
     result = await call_tool("list_work_item_notes", {"project": PROJECT, "iid": IID})
 
     # Assert
-    assert result["notes"] == [{"body": "body", "at": "2026-10-21"}, {"body": "", "at": ""}]
+    assert result["notes"] == [
+        {"note_id": "gid://gitlab/Note/101", "body": "body", "at": "2026-10-21"},
+        {"note_id": "gid://gitlab/Note/102", "body": "", "at": ""},
+    ]
     assert route.call_count == 1

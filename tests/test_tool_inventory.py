@@ -12,6 +12,7 @@ PIPELINE_TEST_REPORT_MAX_BUILDS = 20
 PIPELINE_TEST_REPORT_DEFAULT_LIMIT = 20
 PIPELINE_TEST_REPORT_MAX_LIMIT = 100
 REVIEW_NOTE_MAX_NOTES = 20
+WORK_ITEM_NOTE_BODY_CAP = 4000
 
 # One name per line, alphabetical, so a new tool is a one-line change.
 READ_ONLY_TOOLS = {
@@ -28,6 +29,7 @@ READ_ONLY_TOOLS = {
     "get_pipeline_failures",
     "get_pipeline_test_report",
     "get_work_item",
+    "get_work_item_note",
     "list_job_artifacts",
     "list_labels",
     "list_merge_requests",
@@ -292,6 +294,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"scope", "include_description", "description_limit", "description_offset", "cursor"},
         ),
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
+        ("get_work_item_note", {"project", "iid", "note_id"}, {"scope", "body_offset", "body_limit"}),
         ("create_work_item_note", {"project", "iid"}, {"body", "body_file", "scope", "validate_only"}),
         (
             "edit_work_item_description",
@@ -397,6 +400,26 @@ async def test_create_work_item_note_schema_and_annotations(tools):
     assert annotations.destructive_hint is False
 
 
+async def test_get_work_item_note_schema_and_annotations(tools):
+    """Note reads require a stable ID and advertise bounded, read-only body paging."""
+    # Arrange
+    tool = tools["get_work_item_note"]
+    schema = tool.input_schema
+    properties = schema["properties"]
+
+    # Act / Assert
+    assert set(schema["required"]) == {"project", "iid", "note_id"}
+    assert set(properties) == {"project", "iid", "note_id", "scope", "body_offset", "body_limit"}
+    assert properties["scope"]["default"] == "project"
+    assert properties["body_offset"]["default"] == 0
+    assert properties["body_offset"]["minimum"] == 0
+    assert properties["body_limit"]["default"] == WORK_ITEM_NOTE_BODY_CAP
+    assert properties["body_limit"]["minimum"] == 1
+    assert properties["body_limit"]["maximum"] == WORK_ITEM_NOTE_BODY_CAP
+    assert tool.annotations.read_only_hint is True
+    assert tool.annotations.open_world_hint is True
+
+
 async def test_edit_merge_request_note_schema_and_annotations(tools):
     """Guarded edits require the target and hash and advertise destructive non-idempotent writes."""
     # Arrange
@@ -457,6 +480,7 @@ async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
     ("name", "expected_description"),
     [
         ("get_work_item", "Work item (issue) number."),
+        ("get_work_item_note", "Work item (issue) number."),
         ("list_work_item_notes", "Work item (issue) number."),
         ("edit_work_item_description", "Work item (issue) number."),
         ("edit_merge_request_description", "MR number."),
