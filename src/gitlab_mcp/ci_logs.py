@@ -67,6 +67,14 @@ _FAILURE_PATTERNS = (
 )
 _PYTEST_SUMMARY_HEADER_PATTERN = re.compile(r"(?i)^={3,}.*\bshort test summary info\b.*={3,}\s*$")
 _PYTEST_SUMMARY_FOOTER_PATTERN = re.compile(r"^={3,}")
+_PYTEST_COUNTS_PATTERN = re.compile(
+    r"^\s*(?:=+\s*)?\d+ (?:failed|passed|errors?|skipped|xfailed|xpassed|warnings?|deselected|reruns?)"
+    r"(?:,\s*\d+ (?:failed|passed|errors?|skipped|xfailed|xpassed|warnings?|deselected|reruns?))*"
+    r" in \d+(?:\.\d+)?s(?:\s*\([^\n]*\))?\s*(?:=+)?\s*$",
+    re.IGNORECASE,
+)
+_RUNNER_FAILURE_PATTERN = re.compile(r"^\s*ERROR:\s*Job failed\b", re.IGNORECASE)
+_OTHER_CAUSE_PATTERN = re.compile(r"(?i)\b(?:fatal|exception):")
 _GLPAT_PATTERN = re.compile(r"(?i)(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
 _BEARER_PATTERN = re.compile(r"(?i)(?<![A-Za-z0-9_-])(Bearer[ \t]+)[-A-Za-z0-9._~+/]+={0,}")
 _JWT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
@@ -109,6 +117,7 @@ class JobLog(BaseModel):
         ),
         exclude_if=lambda value: value is None,
     )
+    hint: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class _SummaryParser(HTMLParser):
@@ -173,6 +182,23 @@ def clean_log_text(text: str, *, preserve_sections: bool = False) -> str:
     return _TOKEN_PARAMETER_PATTERN.sub(r"\1" + _REDACTED, text)
 
 
+def make_failure_line(line: str) -> bool:
+    """Return whether a line names a failed make target."""
+    return bool(_FAILURE_PATTERNS[0].search(line))
+
+
+def pytest_result_line(line: str) -> bool:
+    """Return whether a line is a pytest final result count."""
+    return bool(_PYTEST_COUNTS_PATTERN.fullmatch(line))
+
+
+def actionable_failure_line(line: str) -> bool:
+    """Recognize diagnostic causes, excluding generic make and runner failure footers."""
+    if make_failure_line(line) or _RUNNER_FAILURE_PATTERN.search(line) or pytest_result_line(line):
+        return False
+    return any(pattern.search(line) for pattern in _FAILURE_PATTERNS[1:]) or bool(_OTHER_CAUSE_PATTERN.search(line))
+
+
 def _trace_path(project: str, job_id: int) -> str:
     """Return the REST path of one job's raw trace, with the project path encoded as one segment."""
     return f"/projects/{quote(project, safe='')}/jobs/{job_id}/trace"
@@ -225,7 +251,7 @@ def _complete_raw_lines(raw: bytes) -> bytes:
     return raw[: delimiter + 1] if delimiter >= 0 else b""
 
 
-async def _scan_text(
+async def scan_trace_text(
     client: GitLabClient,
     project: str,
     job_id: int,
@@ -301,7 +327,7 @@ def _failure_selection(text: str, context: int) -> tuple[str, bool]:
 
 
 def _summary_selection(text: str) -> tuple[str, bool]:
-    """Select make targets, pytest's short summary block, and recognized terminal error lines."""
+    """Select make targets, pytest failures and totals, and recognized terminal error lines."""
     lines = text.splitlines(keepends=True)
     selected: set[int] = set()
     in_pytest_summary = False
@@ -317,10 +343,20 @@ def _summary_selection(text: str) -> tuple[str, bool]:
             else:
                 selected.add(index)
 
-        if _FAILURE_PATTERNS[0].search(line) or any(pattern.search(line) for pattern in _FAILURE_PATTERNS[2:]):
+        if any(pattern.search(line) for pattern in _FAILURE_PATTERNS) or pytest_result_line(marker_line):
             selected.add(index)
 
     return "".join(lines[index] for index in sorted(selected)), bool(selected)
+
+
+def _summary_hint(text: str) -> str | None:
+    """Suggest an earlier scan when the displayed evidence is only a generic failure."""
+    lines = text.splitlines()
+    generic = any(make_failure_line(line) or _RUNNER_FAILURE_PATTERN.search(line) for line in lines)
+    actionable = any(actionable_failure_line(line) for line in lines)
+    if generic and not actionable:
+        return "Earlier diagnostics may be outside this 100-line window; try view=failures or search"
+    return None
 
 
 def _section_selection(text: str, section: str) -> tuple[str, bool, bool]:
@@ -431,7 +467,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
 
     `max_chars` is 1 to 16000. `tail` and `summary` read the GraphQL HTML summary, which holds only the last 100
     lines, so earlier failures can be missing even when `truncated` is false. `summary` selects make target failures,
-    pytest's short summary block, and recognized terminal errors. No marker means none was found in this window, not
+    pytest failures and totals, and recognized terminal errors. No marker means none was found in this window, not
     that the job succeeded. `head` reads only the first 32 KiB of the raw trace. `search` finds cleaned lines
     containing a case-insensitive literal pattern, or any pattern in a list of 1 to 10 literals. List
     matches are prefixed with their 1-based pattern indices. `failures` finds common make errors, pytest `FAILED`
@@ -473,6 +509,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
     scan_truncated = None
     found = None
     next_offset = None
+    hint = None
     unclosed_section = False
     if view in {"tail", "summary"}:
         name, status, raw_text = await _tail_text(client, project, job_id)
@@ -489,7 +526,7 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
         raw_text, byte_cut = await _head_text(client, project, job_id)
     elif view in {"search", "section", "failures"}:
         scan_offset = effective_byte_offset if view in {"search", "failures"} else 0
-        raw_text, scanned_bytes, scan_truncated, consumed_bytes = await _scan_text(
+        raw_text, scanned_bytes, scan_truncated, consumed_bytes = await scan_trace_text(
             client,
             project,
             job_id,
@@ -514,6 +551,8 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
         byte_cut = scan_truncated
 
     text = raw_text[-max_chars:] if view in {"tail", "summary"} else raw_text[:max_chars]
+    if view == "summary":
+        hint = _summary_hint(text)
     truncated = byte_cut or len(raw_text) > max_chars or (view == "section" and unclosed_section)
     return JobLog(
         job_id=job_id,
@@ -532,4 +571,5 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
         scan_truncated=scan_truncated,
         found=found,
         next_offset=next_offset,
+        hint=hint,
     )

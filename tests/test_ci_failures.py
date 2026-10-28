@@ -89,7 +89,7 @@ async def test_multi_job_page_uses_rest_order_and_one_batched_graphql_request():
             rest_job(13, status="success"),
         ),
     )
-    graphql = graphql_route(graph_jobs("first log", "second log"))
+    graphql = graphql_route(graph_jobs("error: first log", "error: second log"))
 
     # Act
     data = await call_tool("get_pipeline_failures", {"project": PROJECT, "pipeline_id": PIPELINE_ID})
@@ -117,7 +117,7 @@ async def test_multi_job_page_uses_rest_order_and_one_batched_graphql_request():
         "12\tjob 12\ttest\tfailed\tfalse\trunner_system_failure\t12"
     )
     assert [entry["job_id"] for entry in data["logs"]] == [11, 12]
-    assert [entry["text"] for entry in data["logs"]] == ["first log", "second log"]
+    assert [entry["text"] for entry in data["logs"]] == ["error: first log", "error: second log"]
     assert "safety_note" in data
 
 
@@ -175,7 +175,7 @@ async def test_uncut_log_summary_does_not_claim_full_trace_completeness():
     """An uncut summary is still explicitly limited to GitLab's last 100 lines."""
     # Arrange
     respx.get(JOBS_URL).mock(return_value=jobs_response(rest_job(11)))
-    graphql_route(graph_jobs("latest summary output"))
+    graphql_route(graph_jobs("error: latest summary output"))
 
     # Act
     data = await call_tool("get_pipeline_failures", {"project": PROJECT, "pipeline_id": PIPELINE_ID})
@@ -233,6 +233,12 @@ async def test_null_summaries_are_unavailable_but_empty_summary_is_available():
             },
         ),
     )
+    trace_routes = [
+        respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/{number}/trace").mock(
+            return_value=httpx.Response(404),
+        )
+        for number in range(1, 5)
+    ]
 
     # Act
     data = await call_tool("get_pipeline_failures", {"project": PROJECT, "pipeline_id": PIPELINE_ID})
@@ -242,6 +248,8 @@ async def test_null_summaries_are_unavailable_but_empty_summary_is_available():
     assert [log["available"] for log in data["logs"]] == [False, False, False, True]
     assert [log["text"] for log in data["logs"]] == ["", "", "", ""]
     assert [log["chars"] for log in data["logs"]] == [0, 0, 0, 0]
+    assert all(route.call_count == 1 for route in trace_routes)
+    assert len(respx.calls) == TWO_HTTP_REQUESTS + len(trace_routes)
 
 
 @pytest.mark.parametrize(
@@ -259,6 +267,10 @@ async def test_graphql_error_keeps_rest_rows_and_marks_logs_unavailable(response
     jobs = [rest_job(11), rest_job(12)]
     rest_route = respx.get(JOBS_URL).mock(return_value=jobs_response(*jobs))
     graphql = respx.post(GRAPHQL).mock(return_value=response)
+    for job_id in (11, 12):
+        respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/{job_id}/trace").mock(
+            return_value=httpx.Response(404),
+        )
 
     # Act
     data = await call_tool("get_pipeline_failures", {"project": PROJECT, "pipeline_id": PIPELINE_ID})
@@ -269,6 +281,7 @@ async def test_graphql_error_keeps_rest_rows_and_marks_logs_unavailable(response
     assert data["warning"]
     assert len(data["warning"]) <= WARNING_CAP
     assert [log["available"] for log in data["logs"]] == [False, False]
+    assert len(respx.calls) == TWO_HTTP_REQUESTS + len(jobs)
 
 
 @respx.mock
@@ -291,6 +304,9 @@ async def test_html_cleanup_redaction_and_tail_cut_happen_before_log_character_c
     # Arrange
     respx.get(JOBS_URL).mock(return_value=jobs_response(rest_job(11)))
     graphql_route(graph_jobs("<span>before</span><br>token=secretXYZ after"))
+    trace_route = respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/11/trace").mock(
+        return_value=httpx.Response(200, text="ordinary output\n"),
+    )
 
     # Act
     data = await call_tool(
@@ -300,13 +316,13 @@ async def test_html_cleanup_redaction_and_tail_cut_happen_before_log_character_c
 
     # Assert
     log = data["logs"][0]
-    assert log == {
-        "job_id": 11,
-        "text": "ken=[REDACTED] after",
-        "chars": 20,
-        "truncated": True,
-        "available": True,
-    }
+    assert log["text"] == "ken=[REDACTED] after"
+    assert log["chars"] == LOG_CHAR_LIMIT
+    assert log["truncated"] is True
+    assert log["available"] is True
+    assert log["source"] == "summary"
+    assert log["scan_truncated"] is False
+    assert trace_route.call_count == 1
     assert "secretXYZ" not in log["text"]
     assert len(log["text"]) <= LOG_CHAR_LIMIT
 
@@ -317,7 +333,7 @@ async def test_ten_job_batch_stays_within_total_log_character_bound():
     # Arrange
     jobs = [rest_job(number) for number in range(1, 11)]
     respx.get(JOBS_URL).mock(return_value=jobs_response(*jobs))
-    graphql_route(graph_jobs(*(f"<span>{'x' * 1000}</span>" for _ in jobs)))
+    graphql_route(graph_jobs(*(f"<span>error: {'x' * 993}</span>" for _ in jobs)))
 
     # Act
     data = await call_tool(
