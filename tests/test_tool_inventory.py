@@ -40,6 +40,7 @@ WRITE_TOOLS = {
     "create_issue",
     "create_merge_request",
     "create_pipeline",
+    "create_work_item_note",
     "edit_merge_request_description",
     "edit_work_item_description",
     "land_merge_request",
@@ -280,6 +281,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
             {"scope", "include_description", "description_limit", "description_offset", "cursor"},
         ),
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
+        ("create_work_item_note", {"project", "iid"}, {"body", "body_file", "scope", "validate_only"}),
         (
             "edit_work_item_description",
             {"project", "iid"},
@@ -356,6 +358,27 @@ async def test_new_and_extended_options_are_in_the_schema(tools, name, required,
     # Assert
     assert required <= required_fields
     assert required | optional <= properties
+
+
+async def test_create_work_item_note_schema_and_annotations(tools):
+    """Comment posting requires its target and advertises optional content and write annotations."""
+    # Arrange
+    tool = tools["create_work_item_note"]
+    schema = tool.input_schema
+    properties = schema["properties"]
+    annotations = tool.annotations
+
+    # Act / Assert
+    assert set(schema["required"]) == {"project", "iid"}
+    assert set(properties) == {"project", "iid", "body", "body_file", "scope", "validate_only"}
+    assert properties["body"]["default"] is None
+    assert properties["body_file"]["default"] is None
+    assert properties["scope"]["default"] == "project"
+    assert properties["validate_only"]["default"] is False
+    assert annotations.read_only_hint is False
+    assert annotations.idempotent_hint is False
+    assert annotations.open_world_hint is True
+    assert annotations.destructive_hint is False
 
 
 async def test_get_merge_request_has_unwrapped_object_output_schema(tools):

@@ -1,4 +1,4 @@
-"""GraphQL readers for GitLab work items and their notes 🧩."""
+"""GraphQL helpers for GitLab work items and their notes 🧩."""
 
 import base64
 import binascii
@@ -11,6 +11,8 @@ from urllib.parse import quote
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
+from gitlab_mcp.client import GitLabAPIError, GitLabConnectionError, GitLabGraphQLError
+from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR, REVIEW_NOTE_BODY_CAP, read_server_local_utf8_file
 lazy from gitlab_mcp.client import GitLabClient
 
 WorkItemScope = Literal["project", "group"]
@@ -86,6 +88,25 @@ query($fullPath: ID!, $iid: String!) {
   namespace(fullPath: $fullPath) {
     __typename fullPath
     workItem(iid: $iid) { id iid description }
+  }
+}
+"""
+
+_NOTE_TARGET_QUERY = """
+query($fullPath: ID!, $iid: String!) {
+  __SCOPE_LOOKUP__
+  namespace(fullPath: $fullPath) {
+    __typename fullPath
+    workItem(iid: $iid) { id iid }
+  }
+}
+"""
+
+_CREATE_NOTE_MUTATION = """
+mutation($noteableId: NoteableID!, $body: String!) {
+  createNote(input: {noteableId: $noteableId, body: $body}) {
+    note { id discussion { id } }
+    errors
   }
 }
 """
@@ -205,6 +226,15 @@ class WorkItemNotes(BaseModel):
     next_cursor: str = Field(default="", exclude_if=lambda value: not value)
     discussions_complete: bool
     notes_truncated: bool = False
+
+
+class WorkItemNoteCreateResult(BaseModel):
+    """The confirmed, validated, or uncertain outcome of creating one note."""
+
+    status: Literal["validated", "created", "unknown"]
+    note_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    discussion_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    message: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class WorkItemNotFoundError(ToolError):
@@ -872,6 +902,92 @@ async def read_work_item_for_edit(
     elif not isinstance(description, str):
         _raise_data_error("GitLab returned an invalid full work item description.")
     return WorkItemEditSource(id=_required_string(item, "id"), description=description)
+
+
+def _note_body(body: str | None, body_file: str | None) -> str:
+    """Validate and read exactly one note body source before any GitLab request."""
+    if (body is None) == (body_file is None):
+        _raise_tool_error("Provide exactly one of body or body_file.")
+    if body_file is not None:
+        try:
+            body = read_server_local_utf8_file(
+                body_file, path_field="body_file", size_field="body", byte_limit=REVIEW_NOTE_BODY_CAP
+            )
+        except OSError:
+            _raise_tool_error("body_file could not be read as a server-local file.")
+        except ValueError as exc:
+            _raise_tool_error(str(exc))
+    if body is None or not body.strip():
+        _raise_tool_error("body must not be blank.")
+    try:
+        size = len(body.encode("utf-8"))
+    except UnicodeEncodeError:
+        _raise_tool_error("body must be valid UTF-8.")
+    if size > REVIEW_NOTE_BODY_CAP:
+        _raise_tool_error(f"body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes.")
+    return body
+
+
+def _valid_global_id(value: Any, typename: str) -> bool:
+    """Check that an ID is a positive numeric GitLab GID of the expected type."""
+    return isinstance(value, str) and re.fullmatch(rf"gid://gitlab/{typename}/[1-9][0-9]*", value) is not None
+
+
+def _note_mutation_result(data: Any) -> WorkItemNoteCreateResult:
+    """Classify a mutation payload without returning body or server-provided error text."""
+    unknown = WorkItemNoteCreateResult(status="unknown", message="Check GitLab before retrying.")
+    if not isinstance(data, dict) or not isinstance(data.get("createNote"), dict):
+        return unknown
+    payload = data["createNote"]
+    errors = payload.get("errors")
+    note = payload.get("note")
+    if "note" not in payload or not isinstance(errors, list) or any(not isinstance(error, str) for error in errors):
+        return unknown
+    if errors:
+        if note is None:
+            _raise_tool_error("GitLab rejected the note creation.")
+        return unknown
+    # A null note can mean a quick action ran without saving a note.
+    if not isinstance(note, dict) or not _valid_global_id(note.get("id"), "Note"):
+        return unknown
+    discussion = note.get("discussion")
+    discussion_id = discussion.get("id") if isinstance(discussion, dict) else None
+    if not isinstance(discussion_id, str) or not discussion_id.strip():
+        discussion_id = None
+    return WorkItemNoteCreateResult(status="created", note_id=note["id"], discussion_id=discussion_id)
+
+
+async def post_work_item_note(  # noqa: PLR0913, PLR0917 - signature mirrors the tool API.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    body: str | None = None,
+    body_file: str | None = None,
+    scope: WorkItemScope = "project",
+    validate_only: bool = False,
+) -> WorkItemNoteCreateResult:
+    """Validate the input and scoped target, then create one note without retrying."""
+    _validate_arguments(project, iid)
+    note_body = _note_body(body, body_file)
+    _, item = await _resolved_item(client, (_NOTE_TARGET_QUERY, {}), scope, project, iid)
+    resolved_iid = item.get("iid")
+    if type(resolved_iid) not in (str, int) or _positive_graphql_iid(resolved_iid) != iid:
+        _raise_data_error("GitLab returned a different work item IID than requested.")
+    item_id = item.get("id")
+    if not _valid_global_id(item_id, "WorkItem"):
+        _raise_data_error("GitLab returned an invalid work item global ID.")
+    if validate_only:
+        return WorkItemNoteCreateResult(status="validated", message="Validation does not guarantee write permission.")
+    try:
+        data = await client.graphql(_CREATE_NOTE_MUTATION, {"noteableId": item_id, "body": note_body})
+    except GitLabAPIError as exc:
+        if exc.status != HTTP_REQUEST_TIMEOUT and exc.status < HTTP_SERVER_ERROR:
+            raise ToolError(f"GitLab rejected the note creation with HTTP {exc.status}.") from None  # noqa: TRY003
+    except GitLabConnectionError, GitLabGraphQLError, KeyError, TypeError, AttributeError, ValueError, RecursionError:
+        pass
+    else:
+        return _note_mutation_result(data)
+    return WorkItemNoteCreateResult(status="unknown", message="Check GitLab before retrying.")
 
 
 def _note_widget(item: dict[str, Any]) -> dict[str, Any]:
