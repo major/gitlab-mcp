@@ -8,6 +8,25 @@ from dataclasses import dataclass
 from fastmcp.exceptions import ToolError
 
 
+class ReviewBatchUnavailableError(ToolError):
+    """The requested batch is not available in this server's cache."""
+
+    def __init__(self) -> None:
+        """Explain that the cache cannot identify why the batch is missing."""
+        super().__init__("Review note batch is unavailable. Its prior use or expiration is unknown.")
+
+
+class ReviewBatchMismatchError(ToolError):
+    """A claimed batch does not match the supplied project, MR, or head SHA."""
+
+    def __init__(self) -> None:
+        """Explain that the mismatched batch was consumed without a GitLab request."""
+        super().__init__(
+            "Review note batch does not match the supplied project, merge request, or head SHA. "
+            "The batch was consumed; no GitLab requests were made by this call."
+        )
+
+
 @dataclass(frozen=True)
 class CachedReviewNote:
     """An immutable review note with its resolved body and requested coordinates."""
@@ -38,7 +57,6 @@ class ReviewBatchCache:
     MAX_CACHE_BYTES = 8 * 1024 * 1024
     NOTE_OVERHEAD_BYTES = 32
     BATCH_OVERHEAD_BYTES = 64
-    _RESEND_ERROR = "Review note batch is unavailable or no longer valid. Send the notes again."
 
     def __init__(self) -> None:
         """Create an empty ordered cache."""
@@ -74,11 +92,11 @@ class ReviewBatchCache:
         self._purge_expired()
         batch = self._batches.pop(batch_id, None)
         if batch is None:
-            raise ToolError(self._RESEND_ERROR)
+            raise ReviewBatchUnavailableError
         self._cache_bytes -= batch.size_bytes
 
         if batch.project != project or batch.iid != iid or batch.head_sha.lower() != head_sha.lower():
-            raise ToolError(self._RESEND_ERROR)
+            raise ReviewBatchMismatchError
         return batch
 
     def _purge_expired(self) -> None:

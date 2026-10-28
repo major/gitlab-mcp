@@ -25,7 +25,7 @@ from gitlab_mcp.mr_common import (
     mr_rest_path,
     set_people,
 )
-from gitlab_mcp.review_batches import CachedReviewNote
+from gitlab_mcp.review_batches import CachedReviewBatch, CachedReviewNote, ReviewBatchUnavailableError
 
 REVIEW_NOTE_REASON_CAP = 200
 REVIEW_NOTE_HINT_CAP = 120
@@ -147,6 +147,12 @@ class PostReviewNotesResult(BaseModel):
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    ttl_seconds: int | None = Field(
+        default=None,
+        description="Upper bound in seconds until a validated batch expires; use, eviction, or restart may shorten it.",
+        exclude_if=lambda value: value is None,
+    )
+    batch_error: Literal["unavailable"] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def _compact_review_result(result: PostReviewNotesResult) -> PostReviewNotesResult:
@@ -154,6 +160,48 @@ def _compact_review_result(result: PostReviewNotesResult) -> PostReviewNotesResu
     posted_count = sum(row.status == "posted" for row in result.results)
     remaining_results = [row for row in result.results if row.status != "posted"]
     return result.model_copy(update={"results": remaining_results, "posted_count": posted_count})
+
+
+def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int, head_sha: str) -> CachedReviewBatch:
+    """Claim synchronously, treating an unconfigured cache as unavailable."""
+    try:
+        cache = get_review_batch_cache(ctx)
+    except ToolError as exc:
+        raise ReviewBatchUnavailableError from exc
+    return cache.claim(batch_id, project, iid, head_sha)
+
+
+async def _unavailable_review_batch(ctx: Context, project: str, iid: int, head_sha: str) -> PostReviewNotesResult:
+    """Diagnose the live head without exposing read errors or assuming earlier writes failed."""
+    current_head_sha = None
+    if not full_sha(head_sha):
+        head_warning = "Head status is unknown: head_sha must be a full 40-character hexadecimal SHA."
+    else:
+        try:
+            # Only the MR source SHA is needed; diff refs can be pending after a push.
+            merge_request = await get_client(ctx).get(mr_rest_path(project, iid))
+            raw_sha = merge_request.get("sha") if isinstance(merge_request, dict) else None
+            if full_sha(raw_sha):
+                current_head_sha = str(raw_sha).lower()
+        except ToolError, OSError, ValueError, KeyError, TypeError, RecursionError:
+            pass  # Diagnostic failures must not leak API errors or prevent recovery guidance.
+        if current_head_sha is None:
+            head_warning = "Head status is unknown."
+        elif current_head_sha == head_sha.lower():
+            head_warning = "The supplied head is current, but cached notes and positions remain unavailable."
+        else:
+            head_warning = "The supplied head is stale."
+    warning = (
+        "Review note batch is unavailable; it may have expired, been evicted, used, or lost on restart. "
+        "This call attempted no writes; prior attempts may have posted. "
+        "Wait for any in-flight attempt to finish. "
+        "Check prior results and GitLab before resubmitting if a previous attempt may have written. "
+        "Check the head and note positions before resubmitting, and get explicit APPROVE for any changed final text. "
+        f"{head_warning}"
+    )
+    return PostReviewNotesResult(
+        results=[], batch_error="unavailable", warning=warning, current_head_sha=current_head_sha
+    )
 
 
 def _unattempted_review_notes(
@@ -958,10 +1006,12 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                 )
                 for note, check in zip(notes, checks, strict=True)
             )
-            batch_id = get_review_batch_cache(ctx).put(project, iid, refs["head_sha"], cached_notes)
+            cache = get_review_batch_cache(ctx)
+            batch_id = cache.put(project, iid, refs["head_sha"], cached_notes)
             result = result.model_copy(
                 update={
                     "batch_id": batch_id,
+                    "ttl_seconds": cache.TTL_SECONDS,
                     "results": [row.model_copy(update={"position": {}}) for row in result.results],
                 }
             )
@@ -1004,7 +1054,7 @@ async def _add_people_after_posts(  # noqa: PLR0913, PLR0917 - each argument is 
         "openWorldHint": True,
     }
 )
-async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing arguments describe the requested batch.
+async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch contract keeps its checks explicit.
     ctx: Context,
     project: Project,
     iid: Iid,
@@ -1070,7 +1120,8 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     Provide exactly one of `notes` or `batch_id`. `validate_only` cannot be combined with `batch_id`. Set
     `validate_only` to true to run all body, path, line, and SHA checks without writing; validation does not need the
     user's `APPROVE`. A successful validation returns a single-use `batch_id` with the resolved note bodies and
-    locations. Show the final note text to the user and wait for explicit `APPROVE`; approval of placeholder drafts
+    locations, and `ttl_seconds`, an upper bound until expiration. Show the final note text to the user and wait for
+    explicit `APPROVE`; approval of placeholder drafts
     alone is not enough. Then call this tool with that `batch_id` instead of `notes`. Optional `body_overrides` entries
     use `{index, body}` or `{index, body_path}` to replace cached bodies at zero-based indices. Each index must be
     unique and in range, each entry must set exactly one body source, and omitted indices keep their cached snapshots.
@@ -1081,8 +1132,14 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     before the first write. The handle is opaque, is not approval, expires after 30 minutes,
     may be evicted earlier when the bounded cache is full, and is invalidated by a server restart. It is consumed on
     any posting attempt, including failed preflight or writes. Invalid override and selection indices are checked
-    after the handle is claimed and therefore consume it. If it is unavailable, send the notes again. `head_sha`
-    must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
+    after the handle is claimed and therefore consume it. A mismatched project, MR, or head consumes the handle and
+    returns an error without GitLab requests. An unavailable handle returns `batch_error="unavailable"` and no rows;
+    this call attempted no writes, but prior attempts may have posted. Check prior results and GitLab before
+    resubmitting if a previous attempt may have written, and wait for any in-flight attempt to finish. Check the head
+    and note positions before resubmitting; show
+    changed final text to the user and obtain explicit `APPROVE` before posting. The warning states whether the
+    supplied head is current, stale, or unknown; even a current head cannot recover the cached notes or positions.
+    `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
     Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
     for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
     `head_sha`, returns `unattempted` for every note and a `warning`.
@@ -1112,7 +1169,11 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
 
     selected_indices = list(range(len(notes or [])))
     if batch_id is not None:
-        cached_batch = get_review_batch_cache(ctx).claim(batch_id, project, iid, head_sha)
+        try:
+            cached_batch = _claim_review_batch(ctx, batch_id, project, iid, head_sha)
+        except ReviewBatchUnavailableError:
+            result = await _unavailable_review_batch(ctx, project, iid, head_sha)
+            return _compact_review_result(result) if compact else result
         cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
         notes, selected_indices = _select_review_notes(cached_notes, indices)
     if notes is None:

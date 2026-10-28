@@ -654,6 +654,21 @@ async def test_review_note_compact_schema_defaults_to_false(tools):
     assert compact["default"] is False
 
 
+async def test_review_note_result_schema_and_recovery_guidance(tools):
+    """Review output exposes bounded lifetime and unavailable-batch recovery guidance."""
+    # Arrange
+    tool = tools["post_review_notes"]
+    properties = tool.output_schema["properties"]
+
+    # Act / Assert
+    assert integer_schema(properties["ttl_seconds"])["type"] == "integer"
+    assert {branch.get("const") for branch in properties["batch_error"]["anyOf"]} == {"unavailable", None}
+    assert "expires_at" not in properties
+    assert "ttl_seconds" in tool.description
+    assert "prior" in tool.description.lower()
+    assert "APPROVE" in tool.description
+
+
 CI_TOOLS = {
     "list_pipelines",
     "get_pipeline",
