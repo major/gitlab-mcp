@@ -10,12 +10,18 @@ lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
-from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR, read_server_local_utf8_file
+from gitlab_mcp.common import (
+    HTTP_REQUEST_TIMEOUT,
+    HTTP_SERVER_ERROR,
+    read_server_local_utf8_file,
+    validate_project_labels,
+)
 
 MAX_PROJECT_PATH_LENGTH = 1024
 MAX_ISSUE_TITLE_LENGTH = 255
 MAX_ISSUE_DESCRIPTION_LENGTH = 100000
 MAX_ISSUE_DESCRIPTION_BYTES = 100000
+MAX_ISSUE_LABELS = 100
 
 ProjectPath = Annotated[
     str,
@@ -52,6 +58,11 @@ class IssueCreateResult(BaseModel):
     iid: int | None = Field(default=None, exclude_if=lambda value: value is None)
     web_url: str | None = Field(default=None, exclude_if=lambda value: value is None)
     message: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    failed: dict[str, str] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+        description="Unapplied labels and their reasons, keyed by labels:<name>.",
+    )
 
 
 def _validate_project_path(project: str) -> str:
@@ -155,11 +166,14 @@ async def _post_issue(
     project_path: str,
     title: str,
     description: str | None,
+    labels: list[str],
 ) -> IssueCreateResult:
     """Post one issue request and report definite or uncertain outcomes without retrying."""
     body: dict[str, str] = {"title": title, "issue_type": "issue"}
     if description is not None:
         body["description"] = description
+    if labels:
+        body["labels"] = ",".join(labels)
     try:
         response = await client.request("POST", f"{project_path}/issues", json=body)
     except GitLabConnectionError:
@@ -185,7 +199,8 @@ async def create_issue(  # noqa: PLR0913, PLR0917 - each argument is a user-faci
     title: IssueTitle,
     description: IssueDescription = None,
     validate_only: Annotated[
-        bool, Field(description="Check local input and project issue settings without creating.")
+        bool,
+        Field(description="Check inputs, issue settings, and labels without creating or checking write permission."),
     ] = False,
     description_file: Annotated[
         str | None,
@@ -197,21 +212,42 @@ async def create_issue(  # noqa: PLR0913, PLR0917 - each argument is a user-faci
             ),
         ),
     ] = None,
+    labels: Annotated[
+        list[str] | None,
+        Field(
+            max_length=MAX_ISSUE_LABELS,
+            description="Up to 100 existing project or ancestor-group labels. Unknown or unchecked labels are omitted.",
+        ),
+    ] = None,
 ) -> IssueCreateResult:
     """Create an ordinary project issue, like `glab issue create`, with a project-settings preflight.
 
     Omit both description sources for no description, or set only one. A description file is read on this server, not
     the client, and must be an absolute regular UTF-8 file no larger than 100000 bytes.
-    `validate_only=True` checks local inputs and reads the project settings, but does not ask GitLab to validate the
-    issue or guarantee that the token can create one. It does not check for duplicates or provide idempotency. A
-    connection error, HTTP 408 or 5xx response, or malformed success response can leave the write outcome unknown.
-    Check GitLab before retrying. This tool does not add labels or assignees.
+    Labels are checked against project and ancestor-group labels. Unknown or unverifiable labels are omitted and
+    reported in `failed` while creation continues. Duplicate labels are removed, preserving the requested order.
+    `validate_only=True` checks local inputs, project settings, and labels, but does not ask GitLab to validate the
+    issue or guarantee write permission. It does not check for duplicate issues or provide idempotency. A connection
+    error, HTTP 408 or 5xx response, or malformed success response can leave the write outcome unknown. Check GitLab
+    before retrying. This tool does not add assignees.
     """
     project_path = _validate_project_path(project)
     description = _issue_description(description, description_file)
     _validate_issue_text(title, description)
     client = get_client(ctx)
     await _check_issue_settings(client, project_path)
+    valid_labels: list[str] = []
+    failures: dict[str, str] = {}
+    requested_labels = list(dict.fromkeys(labels or []))
+    if requested_labels:
+        try:
+            valid_labels, label_failures = await validate_project_labels(client, project, requested_labels)
+        except ValueError:
+            # Malformed JSON or pagination means the helper cannot safely return any verified labels.
+            label_failures = dict.fromkeys(requested_labels, "could not verify label: invalid response")
+        failures = {f"labels:{name}": reason for name, reason in label_failures.items()}
     if validate_only:
-        return IssueCreateResult(status="validated", title=title)
-    return await _post_issue(client, project_path, title, description)
+        return IssueCreateResult(status="validated", title=title, failed=failures)
+    result = await _post_issue(client, project_path, title, description, valid_labels)
+    result.failed = failures
+    return result

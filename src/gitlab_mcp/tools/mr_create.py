@@ -18,8 +18,8 @@ from gitlab_mcp.common import (
     PositiveIid,
     Project,
     read_server_local_utf8_file,
+    validate_project_labels,
 )
-from gitlab_mcp.tools.labels import validate_project_labels
 
 MAX_CREATE_BLOCKERS = 20
 MAX_CREATE_LABELS = 100
