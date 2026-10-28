@@ -548,7 +548,7 @@ async def test_batch_merged_metadata_omits_missing_and_open_values(gitlab_env):
 async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
     """Explicit job lookup returns failed job IDs and names, even for a successful pipeline."""
     # Arrange
-    node = make_mr(headPipeline={"status": "SUCCESS", "id": "gid://gitlab/Ci::Pipeline/123"})
+    node = make_mr(headPipeline={"status": "SUCCESS", "id": "gid://gitlab/Ci::Pipeline/123", "sha": HEAD_SHA})
     graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
     jobs = respx.get(PIPELINE_JOBS).mock(
         return_value=httpx.Response(200, json=[{"id": 456, "name": "unit tests"}]),
@@ -559,8 +559,9 @@ async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
 
     # Assert
     assert dict(jobs.calls.last.request.url.params) == {"scope[]": "failed", "per_page": "100", "page": "1"}
-    assert "headPipeline { status id }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert "headPipeline { status id sha }" in json.loads(graphql.calls.last.request.content)["query"]
     assert data["latest_pipeline_id"] == PIPELINE_ID
+    assert data["pipeline_sha"] == HEAD_SHA
     assert data["failed_jobs"] == "id\tname\n456\tunit tests"
     assert "jobs_complete" not in data
 
@@ -577,11 +578,45 @@ async def test_default_does_not_request_pipeline_jobs(gitlab_env):
     data = await call_tool()
 
     # Assert
-    assert "headPipeline { status id }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert "headPipeline { status id sha }" in json.loads(graphql.calls.last.request.content)["query"]
     assert jobs.call_count == 0
     assert data["latest_pipeline_id"] == PIPELINE_ID
     assert "failed_jobs" not in data
     assert "jobs_complete" not in data
+
+
+@pytest.mark.parametrize("include_threads", [True, False])
+@pytest.mark.parametrize(
+    ("pipeline", "expected_sha"),
+    [
+        ({"status": "RUNNING", "sha": HEAD_SHA}, HEAD_SHA),
+        ({"status": "RUNNING", "sha": "a" * 40}, "a" * 40),
+        (None, None),
+        ({"status": "RUNNING"}, None),
+        ({"status": "RUNNING", "sha": None}, None),
+        ({"status": "RUNNING", "sha": ""}, None),
+    ],
+    ids=["matching", "different", "no-pipeline", "missing-sha", "null-sha", "empty-sha"],
+)
+@respx.mock
+async def test_pipeline_sha_comes_from_existing_query_without_extra_requests(
+    gitlab_env, include_threads, pipeline, expected_sha
+):
+    """Return the head pipeline SHA from the existing query and make no extra requests."""
+    # Arrange
+    graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(headPipeline=pipeline)))
+
+    # Act
+    data = await call_tool(include_threads=include_threads, include_jobs=False)
+
+    # Assert
+    assert data["head_sha"] == HEAD_SHA
+    if expected_sha is None:
+        assert "pipeline_sha" not in data
+    else:
+        assert data["pipeline_sha"] == expected_sha
+    assert "headPipeline { status id sha }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert len(respx.calls) == 1
 
 
 @respx.mock
@@ -597,6 +632,7 @@ async def test_include_jobs_without_pipeline_makes_no_rest_request(gitlab_env):
     # Assert
     assert jobs.call_count == 0
     assert "pipeline_status" not in data
+    assert "pipeline_sha" not in data
     assert "latest_pipeline_id" not in data
     assert "failed_jobs" not in data
     assert "jobs_complete" not in data

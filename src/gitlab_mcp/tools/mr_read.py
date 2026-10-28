@@ -90,7 +90,7 @@ query(
       detailedMergeStatus shouldBeRebased conflicts
       approved approvedBy { nodes { username } }
       reviewers { nodes { username mergeRequestInteraction { reviewState } } }
-      headPipeline { status id }
+      headPipeline { status id sha }
       autoMergeStrategy
       diffStatsSummary { additions deletions fileCount }
       resolvableDiscussionsCount resolvedDiscussionsCount
@@ -285,9 +285,16 @@ class MergeRequestDetail(BaseModel):
     approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     reviewers: list[Reviewer] = Field(default_factory=list, exclude_if=lambda v: not v)
     pipeline_status: str = Field(default="", exclude_if=lambda v: not v)  # Head pipeline, lowercased.
+    pipeline_sha: str = Field(
+        default="",
+        description=(
+            "Commit SHA tested by the head pipeline; merged-results and merge train pipelines may test a merge commit."
+        ),
+        exclude_if=lambda value: not value,
+    )
     latest_pipeline_id: int | None = Field(
         default=None,
-        description="Numeric ID of the latest pipeline attached to the merge request.",
+        description="Numeric ID of the merge request's head pipeline.",
         exclude_if=lambda value: value is None,
     )
     failed_jobs: str = Field(default="", exclude_if=lambda value: not value)
@@ -947,6 +954,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
         reviewers=[_to_reviewer(reviewer) for reviewer in node["reviewers"]["nodes"]],
         pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
+        pipeline_sha=(pipeline.get("sha") or "") if pipeline else "",
         latest_pipeline_id=pipeline_id,
         auto_merge_strategy=node["autoMergeStrategy"] or "",
         changes=_to_diff_summary(node["diffStatsSummary"]),
@@ -1148,6 +1156,11 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
     - `latest_pipeline_id` is the numeric ID of the head pipeline when one is attached, even when jobs are not
       requested.
+    - `pipeline_sha` is the commit tested by that pipeline, omitted when the pipeline or its SHA is unavailable.
+      After a push, first confirm `head_sha` is the SHA you pushed, then compare `pipeline_sha` and check
+      `pipeline_status`. Matching old SHAs do not confirm CI for a new push. Merged-results and merge train pipelines
+      can test a temporary merge commit, so a different SHA alone does not prove the pipeline is stale.
+      A missing SHA means the tested commit is unknown; a missing pipeline may not have been created yet.
     - `issue_keys` lists unique uppercase-prefix-number keys from the title on the first page and from the raw
       description when included, up to 100. By default, partial matches from full CVE identifiers are skipped.
       `issue_key_prefixes` filters by literal prefixes, not regular expressions, and keeps matching CVE partials. Set
