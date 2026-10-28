@@ -18,6 +18,7 @@ API = "https://gitlab.example.com/api/v4"
 PROJECT = "group/project"
 PROJECT_API = f"{API}/projects/group%2Fproject"
 CREATE = f"{PROJECT_API}/issues"
+LABELS = f"{PROJECT_API}/labels"
 CREATED_ID = 4200
 CREATED_IID = 42
 CREATED_URL = f"https://gitlab.example.com/{PROJECT}/-/issues/{CREATED_IID}"
@@ -162,6 +163,51 @@ async def test_validate_only_accepts_description_file_without_creating(gitlab_en
 
 
 @pytest.mark.parametrize("validate_only", [False, True])
+async def test_description_file_and_labels_work_together(gitlab_env, router, tmp_path, validate_only):
+    """A local file and known labels work together in creation and validation modes."""
+    # Arrange
+    description = "Details from a local file 🙂\n"
+    source = tmp_path / "description.md"
+    source.write_text(description, encoding="utf-8")
+    mock_project(router)
+    lookup = router.get(LABELS).mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}, {"name": "group::shared"}])
+    )
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        title="File and labels",
+        description_file=str(source),
+        labels=["group::shared", "bug"],
+        validate_only=validate_only,
+    )
+
+    # Assert
+    assert lookup.call_count == 1
+    if validate_only:
+        assert data == {"status": "validated", "title": "File and labels"}
+        assert create.call_count == 0
+        assert [call.request.method for call in router.calls] == ["GET", "GET"]
+    else:
+        assert data == {
+            "status": "created",
+            "title": "File and labels",
+            "id": CREATED_ID,
+            "iid": CREATED_IID,
+            "web_url": CREATED_URL,
+        }
+        assert create.call_count == 1
+        assert json.loads(create.calls[0].request.content) == {
+            "title": "File and labels",
+            "issue_type": "issue",
+            "description": description,
+            "labels": "group::shared,bug",
+        }
+        assert [call.request.method for call in router.calls] == ["GET", "GET", "POST"]
+
+
+@pytest.mark.parametrize("validate_only", [False, True])
 @pytest.mark.parametrize(
     "file_case",
     [
@@ -236,6 +282,203 @@ async def test_description_file_is_documented_in_tool_schema(gitlab_env):
     assert "regular" in description
     assert "100000" in description
     assert "description" in description
+
+
+async def test_create_issue_checks_labels_and_preserves_requested_order(gitlab_env, router):
+    """Only known project and ancestor labels are sent, with duplicates removed in requested order."""
+    # Arrange
+    project = "group/nested project"
+    project_api = f"{API}/projects/group%2Fnested%20project"
+    router.get(project_api).mock(return_value=httpx.Response(200, json={"issues_enabled": True}))
+    labels = router.get(f"{project_api}/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}, {"name": "group::shared"}]),
+    )
+    create = router.post(f"{project_api}/issues").mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(
+        project=project,
+        title="Labeled issue",
+        labels=["group::shared", "missing", "bug", "group::shared", "missing", "bug"],
+    )
+
+    # Assert
+    assert data == {
+        "status": "created",
+        "title": "Labeled issue",
+        "id": CREATED_ID,
+        "iid": CREATED_IID,
+        "web_url": CREATED_URL,
+        "failed": {"labels:missing": "unknown label"},
+    }
+    assert json.loads(create.calls[0].request.content) == {
+        "title": "Labeled issue",
+        "issue_type": "issue",
+        "labels": "group::shared,bug",
+    }
+    assert dict(labels.calls[0].request.url.params) == {
+        "include_ancestor_groups": "true",
+        "per_page": "100",
+        "page": "1",
+    }
+    assert labels.calls[0].request.url.raw_path.startswith(b"/api/v4/projects/group%2Fnested%20project/labels?")
+    assert [call.request.method for call in router.calls] == ["GET", "GET", "POST"]
+
+
+async def test_known_labels_accept_the_input_limit_without_failure_field(gitlab_env, router):
+    """One hundred requested labels are accepted and repeated known labels are sent once."""
+    # Arrange
+    mock_project(router)
+    router.get(LABELS).mock(return_value=httpx.Response(200, json=[{"name": "bug"}]))
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(title="At the limit", labels=["bug"] * 100)
+
+    # Assert
+    assert json.loads(create.calls[0].request.content)["labels"] == "bug"
+    assert "failed" not in data
+
+
+async def test_partial_label_lookup_failure_keeps_verified_labels(gitlab_env, router):
+    """A later page failing does not discard labels already found on an earlier page."""
+    # Arrange
+    mock_project(router)
+    lookup = router.get(LABELS).mock(
+        side_effect=[
+            httpx.Response(200, json=[{"name": "bug"}], headers={"X-Next-Page": "2"}),
+            httpx.Response(403, json={"message": "Forbidden"}),
+        ],
+    )
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(title="Partial labels", labels=["missing", "bug"])
+
+    # Assert
+    assert data["status"] == "created"
+    assert set(data["failed"]) == {"labels:missing"}
+    assert "HTTP 403" in data["failed"]["labels:missing"]
+    assert json.loads(create.calls[0].request.content)["labels"] == "bug"
+    assert [int(call.request.url.params["page"]) for call in lookup.calls] == [1, 2]
+
+
+@pytest.mark.parametrize("labels", [None, []])
+async def test_no_labels_skip_lookup_and_result_fields(gitlab_env, router, labels):
+    """Missing or empty labels add no lookup, POST field, or failure result."""
+    # Arrange
+    mock_project(router)
+    lookup = router.get(LABELS)
+    create = router.post(CREATE).mock(return_value=create_response())
+    arguments = {} if labels is None else {"labels": labels}
+
+    # Act
+    data = await call_tool(title="No labels", **arguments)
+
+    # Assert
+    assert lookup.call_count == 0
+    assert json.loads(create.calls[0].request.content) == {"title": "No labels", "issue_type": "issue"}
+    assert "failed" not in data
+    assert [call.request.method for call in router.calls] == ["GET", "POST"]
+
+
+async def test_validate_only_checks_labels_without_posting(gitlab_env, router):
+    """Validation checks requested labels and reports missing ones without attempting a write."""
+    # Arrange
+    mock_project(router)
+    lookup = router.get(LABELS).mock(return_value=httpx.Response(200, json=[{"name": "bug"}]))
+    create = router.post(CREATE)
+
+    # Act
+    data = await call_tool(title="Validate labels", labels=["bug", "missing"], validate_only=True)
+
+    # Assert
+    assert data == {"status": "validated", "title": "Validate labels", "failed": {"labels:missing": "unknown label"}}
+    assert lookup.call_count == 1
+    assert create.call_count == 0
+    assert [call.request.method for call in router.calls] == ["GET", "GET"]
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [
+        (httpx.Response(403, json={"message": "Forbidden"}), "HTTP 403"),
+        (httpx.Response(200, json={"unexpected": "object"}), "invalid response"),
+        (httpx.Response(200, content=b"not JSON"), "invalid response"),
+        (httpx.Response(200, json=[], headers={"X-Next-Page": "invalid"}), "invalid response"),
+    ],
+)
+async def test_failed_label_lookup_omits_labels_and_continues(gitlab_env, router, response, reason):
+    """Failed or invalid label checks are reported while the issue is still created."""
+    # Arrange
+    mock_project(router)
+    lookup = router.get(LABELS).mock(return_value=response)
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(title="Still create", labels=["bug", "bug", "group::shared"])
+
+    # Assert
+    assert data["status"] == "created"
+    assert set(data["failed"]) == {"labels:bug", "labels:group::shared"}
+    assert all(reason in failure for failure in data["failed"].values())
+    assert json.loads(create.calls[0].request.content) == {"title": "Still create", "issue_type": "issue"}
+    assert lookup.call_count == 1
+    assert create.call_count == 1
+
+
+async def test_too_many_labels_are_rejected_before_http(gitlab_env, router):
+    """The 100-label input cap is enforced before any request, even for duplicates."""
+    # Arrange
+    labels = ["bug"] * 101
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="at most 100"):
+        await call_tool(title="Too many labels", labels=labels)
+    assert not router.calls
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(408, json={"message": "timeout"}),
+        httpx.Response(503, json={"message": "unavailable"}),
+        httpx.Response(201, content=b"not JSON"),
+        httpx.Response(201, json=[]),
+        httpx.ConnectError("connection lost"),
+    ],
+)
+async def test_unknown_creation_retains_label_failures(gitlab_env, router, response):
+    """Uncertain write outcomes retain label diagnostics and never retry."""
+    # Arrange
+    mock_project(router)
+    router.get(LABELS).mock(return_value=httpx.Response(200, json=[{"name": "bug"}]))
+    create = router.post(CREATE).mock(side_effect=response if isinstance(response, Exception) else [response])
+
+    # Act
+    data = await call_tool(title="Potential issue", labels=["bug", "missing"])
+
+    # Assert
+    assert data["status"] == "unknown"
+    assert data["failed"] == {"labels:missing": "unknown label"}
+    assert json.loads(create.calls[0].request.content)["labels"] == "bug"
+    assert create.call_count == 1
+
+
+async def test_create_issue_schema_documents_labels_and_validation(gitlab_env):
+    """The tool schema describes label limits, omitted failures, and validation limitations."""
+    # Arrange / Act
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+    tool = next(item for item in tools if item.name == "create_issue")
+
+    # Assert
+    label_limit = 100
+    label_schema = tool.input_schema["properties"]["labels"]
+    assert any(option.get("maxItems") == label_limit for option in label_schema["anyOf"])
+    assert "ancestor" in label_schema["description"]
+    assert "unknown" in tool.description
+    assert "permission" in tool.description
 
 
 @pytest.mark.parametrize(
