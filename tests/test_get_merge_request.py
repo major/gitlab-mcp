@@ -425,6 +425,55 @@ async def test_finished_merge_request_skips_the_divergence_read(gitlab_env, stat
 
 
 @respx.mock
+async def test_merge_request_includes_creation_date(gitlab_env):
+    """The detail query returns the creation date without the timestamp."""
+    # Arrange
+    node = make_mr(createdAt="2025-06-17T12:34:56Z")
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "createdAt" in query
+    assert data["created_at"] == "2025-06-17"
+
+
+@pytest.mark.parametrize("overrides", [{}, {"createdAt": None}], ids=["missing", "null"])
+@respx.mock
+async def test_merge_request_omits_missing_creation_date(gitlab_env, overrides):
+    """A missing or null creation timestamp leaves the detail field out."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(**overrides)))
+
+    # Act
+    data = await call_tool()
+
+    # Assert
+    assert "created_at" not in data
+
+
+@respx.mock
+async def test_compact_batch_does_not_request_or_return_creation_date(gitlab_env):
+    """Compact batch reads do not add a creation date, even if a mock node contains one."""
+    # Arrange
+    node = make_mr(createdAt="2025-06-17T12:34:56Z")
+    route = respx.post(GRAPHQL).mock(
+        return_value=httpx.Response(200, json={"data": {"project": {"mr_0": node}}}),
+    )
+
+    # Act
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_merge_requests", {"project": PROJECT, "iids": [IID]})
+
+    # Assert
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "createdAt" not in query
+    assert "created_at" not in result.structured_content["merge_requests"][0]
+
+
+@respx.mock
 async def test_merged_merge_request_includes_date_and_username(gitlab_env):
     """A merged merge request includes its date and merging user's username."""
     # Arrange
