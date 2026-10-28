@@ -130,6 +130,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `create_issue` | Create a project issue with verified labels and an optional inline or server-local file description. |
 | `create_merge_request` | Create a merge request from existing branches with optional labels, assignees, and blockers. |
 | `create_pipeline` | Create a pipeline for a ref after checking its expected commit SHA. |
+| `create_work_item_note` | Add a project or group work item comment from inline text or a server-local file. |
 | `edit_merge_request_description` | Replace one unique exact-text match in a merge request description. |
 | `edit_work_item_description` | Apply guarded text replacements or edit a selected table cell in a work item description. |
 | `get_current_user` | Return the username and ID of the user who owns the GitLab token. |

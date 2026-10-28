@@ -106,6 +106,37 @@ async def list_work_item_notes(  # noqa: PLR0913, PLR0917 - each argument is a u
 
 
 @mcp.tool(
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def create_work_item_note(  # noqa: PLR0913, PLR0917 - each argument is a user-facing note option.
+    ctx: Context,
+    project: Project,
+    iid: WorkItemIid,
+    body: Annotated[
+        str | None,
+        Field(description="Note text, up to 100000 UTF-8 bytes. Provide exactly one of body or body_file."),
+    ] = None,
+    body_file: Annotated[
+        str | None,
+        Field(description="Absolute server-local regular UTF-8 file, up to 100000 bytes. Use instead of body."),
+    ] = None,
+    scope: _work_items.WorkItemScope = "project",
+    validate_only: Annotated[
+        bool,
+        Field(description="Validate the body and target without writing; does not verify write permission."),
+    ] = False,
+) -> _work_items.WorkItemNoteCreateResult:
+    """Create one work-item note, like `glab issue note`.
+
+    Scope is explicit, with no project/group fallback. Group work-item support is experimental in GitLab 18.1 and
+    later, so permission or API errors can occur. Provide exactly one nonblank inline body or server-local body_file.
+    `validate_only` checks the input and target but does not guarantee write permission. GitLab quick actions may run
+    without saving a note. An unknown outcome requires checking GitLab before retrying; writes are never retried.
+    """
+    return await _work_items.post_work_item_note(get_client(ctx), project, iid, body, body_file, scope, validate_only)
+
+
+@mcp.tool(
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
 )
 async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argument is a user-facing edit option.
