@@ -42,6 +42,7 @@ WRITE_TOOLS = {
     "create_pipeline",
     "create_work_item_note",
     "edit_merge_request_description",
+    "edit_merge_request_note",
     "edit_work_item_description",
     "land_merge_request",
     "land_merge_requests",
@@ -130,6 +131,16 @@ async def test_server_instructions_list_real_main_arguments(gitlab_env):
             "include_mr_status",
             "count_only",
             "cursor",
+        },
+        "edit_merge_request_note": {
+            "project",
+            "iid",
+            "thread_id",
+            "note_id",
+            "expected_hash",
+            "body",
+            "old_text",
+            "new_text",
         },
         "post_review_notes": {
             "project",
@@ -298,6 +309,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         ),
         ("edit_merge_request_description", {"project", "iid", "old_text", "new_text"}, set()),
         (
+            "edit_merge_request_note",
+            {"project", "iid", "thread_id", "note_id", "expected_hash"},
+            {"body", "old_text", "new_text"},
+        ),
+        (
             "create_merge_request",
             {"project", "source_branch", "target_branch", "title"},
             {"description", "description_file", "labels", "remove_source_branch", "blocked_by"},
@@ -379,6 +395,34 @@ async def test_create_work_item_note_schema_and_annotations(tools):
     assert annotations.idempotent_hint is False
     assert annotations.open_world_hint is True
     assert annotations.destructive_hint is False
+
+
+async def test_edit_merge_request_note_schema_and_annotations(tools):
+    """Guarded edits require the target and hash and advertise destructive non-idempotent writes."""
+    # Arrange
+    tool = tools["edit_merge_request_note"]
+    schema = tool.input_schema
+
+    # Act / Assert
+    assert set(schema["required"]) == {"project", "iid", "thread_id", "note_id", "expected_hash"}
+    assert set(schema["properties"]) == {
+        "project",
+        "iid",
+        "thread_id",
+        "note_id",
+        "expected_hash",
+        "body",
+        "old_text",
+        "new_text",
+    }
+    assert schema["properties"]["note_id"]["exclusiveMinimum"] == 0
+    assert schema["properties"]["expected_hash"]["pattern"] == r"^[0-9a-f]{64}$"
+    assert tool.annotations.read_only_hint is False
+    assert tool.annotations.destructive_hint is True
+    assert tool.annotations.idempotent_hint is False
+    assert tool.annotations.open_world_hint is True
+    assert "glab api --method PUT" in tool.description
+    assert "APPROVE" in tool.description
 
 
 async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
