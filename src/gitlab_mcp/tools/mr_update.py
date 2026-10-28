@@ -11,9 +11,8 @@ lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
-from gitlab_mcp.common import MAX_PAGES, Iid, Project, lower_or_empty
+from gitlab_mcp.common import MAX_PAGES, Iid, Project, lower_or_empty, validate_project_labels
 from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_blockers, fetch_merge_request, mr_rest_path, set_people
-from gitlab_mcp.tools.labels import validate_project_labels
 
 # Queries and mutations for update_merge_request. Each one changes one thing, so each step can fail on its own. 🔧
 SET_DRAFT_MUTATION = """

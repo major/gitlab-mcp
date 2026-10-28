@@ -6,10 +6,14 @@ import os
 import stat
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import quote
+lazy from collections.abc import Sequence
 
+from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from gitlab_mcp.errors import InvalidCursorError, raise_review_preflight_error
+lazy from gitlab_mcp.client import GitLabClient
 
 # Upper bound on GraphQL pages scanned when approved, has_open_threads, or
 # thread filters run on our side. Keeps one tool call from walking a huge project.
@@ -24,6 +28,8 @@ HTTP_SERVER_ERROR = 500
 DISCUSSION_PREFIX = "gid://gitlab/Discussion/"
 # Files per page of the REST diffs endpoint, the largest page GitLab serves.
 DIFF_PAGE_SIZE = 100
+# Labels per page on the project labels endpoint. The largest page GitLab serves.
+PROJECT_LABELS_PAGE_SIZE = 100
 # Bodies are small enough to bound memory and request size, including file-backed notes.
 REVIEW_NOTE_BODY_CAP = 100000
 # Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
@@ -93,3 +99,52 @@ def read_server_local_utf8_file(
         return encoded.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise_review_preflight_error(f"{path_field} is not valid UTF-8", cause=exc)
+
+
+async def validate_project_labels(
+    client: GitLabClient,
+    project: str,
+    labels: Sequence[str],
+) -> tuple[list[str], dict[str, str]]:
+    """Return requested labels that exist and failures for labels that cannot be checked.
+
+    Names are matched exactly, including scoped and ancestor-group labels. The
+    scan stops when every requested name is found or after ``MAX_PAGES``.
+    Failure keys are requested label names; callers can add tool-specific context.
+    """
+    requested = list(dict.fromkeys(labels))
+    if not requested:
+        return [], {}
+
+    wanted = set(requested)
+    found: set[str] = set()
+    path = f"/projects/{quote(project, safe='')}/labels"
+    page = 1
+    try:
+        for _ in range(MAX_PAGES):
+            data, next_page = await client.get_page(
+                path,
+                include_ancestor_groups=True,
+                per_page=PROJECT_LABELS_PAGE_SIZE,
+                page=page,
+            )
+            if not isinstance(data, list) or any(
+                not isinstance(label, dict) or not isinstance(label.get("name"), str) for label in data
+            ):
+                return [name for name in labels if name in found], {
+                    name: "could not verify label: invalid response" for name in requested if name not in found
+                }
+            found.update(label["name"] for label in data if label["name"] in wanted)
+            if found == wanted:
+                return [name for name in labels if name in found], {}
+            if next_page is None:
+                return [name for name in labels if name in found], {
+                    name: "unknown label" for name in requested if name not in found
+                }
+            page = next_page
+    except ToolError as exc:
+        return [name for name in labels if name in found], {name: str(exc) for name in requested if name not in found}
+
+    return [name for name in labels if name in found], {
+        name: f"could not verify label after {MAX_PAGES} pages" for name in requested if name not in found
+    }

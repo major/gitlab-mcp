@@ -2,18 +2,14 @@
 
 from typing import Annotated, Any
 from urllib.parse import quote
-lazy from collections.abc import Sequence
 
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
-from gitlab_mcp.common import MAX_PAGES, Project
+from gitlab_mcp.common import MAX_PAGES, PROJECT_LABELS_PAGE_SIZE, Project
 lazy from gitlab_mcp.client import GitLabClient
-
-# Labels per page on the project labels endpoint. The largest page GitLab serves.
-PROJECT_LABELS_PAGE_SIZE = 100
 
 
 class ProjectLabels(BaseModel):
@@ -105,52 +101,3 @@ def _label_check_result(wanted: list[str], found: set[str], *, has_more: bool) -
         existing=[name for name in wanted if name in found],
         missing=[name for name in wanted if name not in found],
     )
-
-
-async def validate_project_labels(
-    client: GitLabClient,
-    project: str,
-    labels: Sequence[str],
-) -> tuple[list[str], dict[str, str]]:
-    """Return requested labels that exist and failures for labels that cannot be checked.
-
-    Names are matched exactly, including scoped and ancestor-group labels. The
-    scan stops when every requested name is found or after ``MAX_PAGES``.
-    Failure keys are requested label names; callers can add tool-specific context.
-    """
-    requested = list(dict.fromkeys(labels))
-    if not requested:
-        return [], {}
-
-    wanted = set(requested)
-    found: set[str] = set()
-    path = f"/projects/{quote(project, safe='')}/labels"
-    page = 1
-    try:
-        for _ in range(MAX_PAGES):
-            data, next_page = await client.get_page(
-                path,
-                include_ancestor_groups=True,
-                per_page=PROJECT_LABELS_PAGE_SIZE,
-                page=page,
-            )
-            if not isinstance(data, list) or any(
-                not isinstance(label, dict) or not isinstance(label.get("name"), str) for label in data
-            ):
-                return [name for name in labels if name in found], {
-                    name: "could not verify label: invalid response" for name in requested if name not in found
-                }
-            found.update(label["name"] for label in data if label["name"] in wanted)
-            if found == wanted:
-                return [name for name in labels if name in found], {}
-            if next_page is None:
-                return [name for name in labels if name in found], {
-                    name: "unknown label" for name in requested if name not in found
-                }
-            page = next_page
-    except ToolError as exc:
-        return [name for name in labels if name in found], {name: str(exc) for name in requested if name not in found}
-
-    return [name for name in labels if name in found], {
-        name: f"could not verify label after {MAX_PAGES} pages" for name in requested if name not in found
-    }
