@@ -1224,6 +1224,7 @@ async def test_summary_selects_make_pytest_block_and_terminal_failure_in_one_tai
         f"{header}\n"
         "FAILED tests/test_sample.py::test_bad - AssertionError\n"
         "error: detailed pytest failure\n"
+        "========================= 2 failed in 0.10s =========================\n"
         "ERROR: Job failed: exit code 1\n"
     )
     assert data["text"] == expected
@@ -1242,7 +1243,7 @@ async def test_summary_selects_make_pytest_block_and_terminal_failure_in_one_tai
 
 @pytest.mark.parametrize(
     "body",
-    ["", "starting build\nerror occurred\nError without a code\nFAILED outside pytest summary\n"],
+    ["", "starting build\nerror occurred\nError without a code\n"],
     ids=["empty", "no-recognized-markers"],
 )
 @respx.mock
@@ -1262,6 +1263,50 @@ async def test_summary_returns_no_marker_for_empty_or_unrecognized_text(body):
     assert len(respx.calls) == ONE_CALL
 
 
+@pytest.mark.parametrize(
+    "counts",
+    [
+        "================ 2 failed, 3 passed, 1 warning in 1.23s ================",
+        "=========== 4 passed in 0.08s ===========",
+        "===== 1 error, 2 skipped, 3 xfailed, 1 xpassed in 2.0s =====",
+        "1 failed, 2 passed in 0.1s",
+        "===== 1 passed, 3 deselected in 0.1s =====",
+        "===== 1 failed, 1 rerun in 1.23s (0:00:01) =====",
+    ],
+)
+@respx.mock
+async def test_summary_recognizes_standalone_pytest_failures_and_final_counts(counts):
+    """Pytest lines and final totals need no short-summary header in the last-100-line window."""
+    # Arrange
+    failed = "FAILED tests/test_demo.py::test_bad - AssertionError"
+    route = mock_tail(f"setup\n{failed}\n{counts}\nrunner cleanup\n")
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    assert data["text"] == f"{failed}\n{counts}\n"
+    assert data["found"] is True
+    assert "hint" not in data
+    assert route.call_count == len(respx.calls) == ONE_CALL
+
+
+@pytest.mark.parametrize("body", ["make: *** [lint] Error 2.\n", "ERROR: Job failed: exit code 1\n"])
+@respx.mock
+async def test_summary_hints_when_only_make_or_runner_failure_is_visible(body):
+    """A generic failure does not imply tests ran or that earlier diagnostics are absent."""
+    # Arrange
+    mock_tail(body)
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    assert data["hint"] == ("Earlier diagnostics may be outside this 100-line window; try view=failures or search")
+    assert "pytest" not in data["hint"].lower()
+    assert len(respx.calls) == ONE_CALL
+
+
 @respx.mock
 async def test_summary_character_cap_keeps_recent_terminal_failure():
     """When selected output is clipped, summary keeps its newest evidence at the end."""
@@ -1278,6 +1323,23 @@ async def test_summary_character_cap_keeps_recent_terminal_failure():
     assert data["truncated"] is True
     assert data["complete"] is None
     assert data["found"] is True
+    assert len(respx.calls) == ONE_CALL
+
+
+@respx.mock
+async def test_summary_hint_reflects_cause_hidden_by_character_cap():
+    """A cause removed by the output cap does not make a generic displayed footer informative."""
+    # Arrange
+    footer = "ERROR: Job failed: exit code 1\n"
+    mock_tail("error: missing dependency\n" + footer)
+
+    # Act
+    data = await call_log(view="summary", max_chars=len(footer))
+
+    # Assert
+    assert data["text"] == footer
+    assert data["truncated"] is True
+    assert "view=failures" in data["hint"]
     assert len(respx.calls) == ONE_CALL
 
 

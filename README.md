@@ -143,7 +143,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_merge_request_threads` | Read review threads, note IDs, body hashes, and status for one or more merge requests. |
 | `get_merge_requests` | Read compact status for up to 20 merge requests. |
 | `get_pipeline` | Read pipeline metadata and one page of its jobs. |
-| `get_pipeline_failures` | List failed runner and build jobs with optional log tails. |
+| `get_pipeline_failures` | List failed runner and build jobs with optional diagnostic log excerpts. |
 | `get_pipeline_test_report` | Read pipeline test suite summaries or failed and errored test cases. |
 | `get_work_item` | Read a project or group work item and selected description content. |
 | `get_work_item_note` | Read a scoped human note body in bounded pages with a full-body hash. |

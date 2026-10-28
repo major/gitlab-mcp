@@ -697,7 +697,7 @@ async def test_failure_excerpts_follow_displayed_order_and_only_select_failed_bu
         start_cursor="previous-page",
     )
     route = respx.post(GRAPHQL).mock(
-        side_effect=[pipeline_response(page), failure_log_response("first output", "second output")],
+        side_effect=[pipeline_response(page), failure_log_response("error: first output", "error: second output")],
     )
     expected_ids = [12, 11] if order == "newest_first" else [11, 12]
 
@@ -710,7 +710,7 @@ async def test_failure_excerpts_follow_displayed_order_and_only_select_failed_bu
     # Assert
     assert route.call_count == TWO_GRAPHQL_REQUESTS
     assert [entry["job_id"] for entry in data["failure_excerpts"]] == expected_ids
-    assert [entry["text"] for entry in data["failure_excerpts"]] == ["first output", "second output"]
+    assert [entry["text"] for entry in data["failure_excerpts"]] == ["error: first output", "error: second output"]
     assert sent_variables(route, 1) == {
         "project": PROJECT,
         "job0": f"gid://gitlab/Ci::Build/{expected_ids[0]}",
@@ -748,7 +748,10 @@ async def test_failure_excerpt_cap_counts_only_extra_failed_builds_on_current_pa
         cursor="next-page",
     )
     route = respx.post(GRAPHQL).mock(
-        side_effect=[pipeline_response(page), failure_log_response(*(f"log {number}" for number in range(20, 15, -1)))],
+        side_effect=[
+            pipeline_response(page),
+            failure_log_response(*(f"error: log {number}" for number in range(20, 15, -1))),
+        ],
     )
 
     # Act
@@ -759,6 +762,33 @@ async def test_failure_excerpt_cap_counts_only_extra_failed_builds_on_current_pa
     assert [entry["job_id"] for entry in data["failure_excerpts"]] == [20, 19, 18, 17, 16]
     assert data["failure_excerpts_omitted"] == 1
     assert "job5" not in json.loads(route.calls[1].request.content)["variables"]
+
+
+@respx.mock
+async def test_pipeline_excerpts_scan_only_five_selected_jobs_without_metadata_requests(gitlab_env):
+    """The shared fallback adds at most five trace reads to the pipeline and batched summary requests."""
+    # Arrange
+    builds = [job_node("Ci::Build", number, status="FAILED") for number in range(20, 14, -1)]
+    graphql = respx.post(GRAPHQL).mock(
+        side_effect=[pipeline_response(pipeline_node(*builds)), failure_log_response(*([None] * 5))],
+    )
+    traces = [
+        respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/{number}/trace").mock(
+            return_value=httpx.Response(200, text=f"error: diagnostic for {number}\n"),
+        )
+        for number in range(20, 15, -1)
+    ]
+
+    # Act
+    data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
+
+    # Assert
+    assert graphql.call_count == TWO_GRAPHQL_REQUESTS
+    assert all(trace.call_count == 1 for trace in traces)
+    assert len(respx.calls) == TWO_GRAPHQL_REQUESTS + len(traces)
+    assert [item["job_id"] for item in data["failure_excerpts"]] == [20, 19, 18, 17, 16]
+    assert all(item["source"] == "trace_prefix" for item in data["failure_excerpts"])
+    assert data["failure_excerpts_omitted"] == 1
 
 
 @respx.mock
@@ -776,6 +806,12 @@ async def test_failure_excerpts_are_masked_bounded_and_distinguish_missing_from_
             failure_log_response(long_summary, ""),
         ],
     )
+    traces = [
+        respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/{number}/trace").mock(
+            return_value=httpx.Response(200, text="no failure marker\n"),
+        )
+        for number in (11, 12)
+    ]
 
     # Act
     data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
@@ -793,6 +829,8 @@ async def test_failure_excerpts_are_masked_bounded_and_distinguish_missing_from_
     assert second["text"] == ""
     assert second["chars"] == 0
     assert second["truncated"] is False
+    assert all(trace.call_count == 1 for trace in traces)
+    assert len(respx.calls) == TWO_GRAPHQL_REQUESTS + len(traces)
 
 
 @respx.mock
@@ -809,6 +847,12 @@ async def test_missing_failure_excerpt_is_unavailable_but_empty_excerpt_is_avail
     )
     log_data = graphql_response({"job_0": None, "job_1": {"trace": {"htmlSummary": ""}}})
     route = respx.post(GRAPHQL).mock(side_effect=[response, log_data])
+    traces = [
+        respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/{number}/trace").mock(
+            return_value=httpx.Response(404),
+        )
+        for number in (11, 12)
+    ]
 
     # Act
     data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
@@ -820,6 +864,7 @@ async def test_missing_failure_excerpt_is_unavailable_but_empty_excerpt_is_avail
     assert unavailable["text"] == ""
     assert empty["available"] is True
     assert empty["text"] == ""
+    assert all(trace.call_count == 1 for trace in traces)
 
 
 @respx.mock
@@ -832,6 +877,9 @@ async def test_log_graphql_error_keeps_job_table_and_adds_excerpt_warning(gitlab
             httpx.Response(200, json={"errors": [{"message": "Denied"}], "data": None}),
         ],
     )
+    trace = respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/11/trace").mock(
+        return_value=httpx.Response(404),
+    )
 
     # Act
     data = await call_tool("get_pipeline", {"pipeline_id": 901, "include_failure_excerpts": True})
@@ -842,6 +890,7 @@ async def test_log_graphql_error_keeps_job_table_and_adds_excerpt_warning(gitlab
     assert data["failure_excerpts"][0]["available"] is False
     assert data["excerpt_warning"]
     assert "Denied" in data["excerpt_warning"]
+    assert trace.call_count == 1
 
 
 @pytest.mark.parametrize(
