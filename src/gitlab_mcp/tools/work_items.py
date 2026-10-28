@@ -97,12 +97,38 @@ async def list_work_item_notes(  # noqa: PLR0913, PLR0917 - each argument is a u
     """Read a bounded page of human work-item notes, like a scoped `glab api graphql` query.
 
     `scope="group"` reads group work items such as epics. Group work-item support is experimental in GitLab 18.1 and
-    later, so permission or API errors can occur. System notes are omitted. Each discussion returns up to 50 notes,
-    and each call returns up to 20 discussions. Use `next_cursor` for more discussions. `notes_truncated` reports
-    omitted nested notes or content cut by the body limits. `discussions_complete` reports whether all discussions
-    were read.
+    later, so permission or API errors can occur. System notes are omitted. Each note has a `note_id` for use with
+    `get_work_item_note`. Each discussion returns up to 50 notes, and each call returns up to 20 discussions. The
+    nested 50-note limit cannot be paged here. `next_cursor` advances discussions, not note bodies. The aggregate body
+    budget can stop a page before all fetched notes are returned. Restart the list scan with `max_body_chars=0` and
+    follow its own `next_cursor` values to discover their IDs; cursors are bound to the body limit. Use
+    `get_work_item_note` to read full bodies in chunks. `notes_truncated` reports omitted nested notes or content cut
+    by the body limits. `discussions_complete` reports whether all discussions were read.
     """
     return await _work_items.read_work_item_notes(get_client(ctx), project, iid, scope, cursor, max_body_chars)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def get_work_item_note(  # noqa: PLR0913, PLR0917 - each argument is a user-facing read option.
+    ctx: Context,
+    project: Project,
+    iid: WorkItemIid,
+    note_id: Annotated[str, Field(description="Canonical GitLab Note global ID from list_work_item_notes.")],
+    scope: _work_items.WorkItemScope = "project",
+    body_offset: Annotated[int, Field(ge=0, description="Unicode code-point offset for the body page.")] = 0,
+    body_limit: Annotated[
+        int, Field(ge=1, le=4000, description="Maximum body characters per page, from 1 to 4000.")
+    ] = 4000,
+) -> _work_items.WorkItemNotePage:
+    """Read one work-item note body page, like a scoped `glab api graphql` query.
+
+    Use a `note_id` from `list_work_item_notes` and the same explicit project or group scope. GitLab's note query and
+    group work-item support are experimental in GitLab 18.1 and later. The API fetches the full body each time; only
+    MCP output is paginated. Use `next_body_offset` for the next page. Offsets count Unicode code points, not bytes or
+    grapheme clusters. `body_hash` is the SHA-256 hash of the full UTF-8 body. If it changes between pages, the note
+    was edited and paging must restart from offset 0. System notes and notes on other work items are rejected.
+    """
+    return await _work_items.read_work_item_note(get_client(ctx), project, iid, note_id, scope, body_offset, body_limit)
 
 
 @mcp.tool(

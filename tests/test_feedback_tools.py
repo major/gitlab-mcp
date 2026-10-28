@@ -75,6 +75,7 @@ def notes_response() -> httpx.Response:
                                     },
                                     {
                                         "system": False,
+                                        "id": "gid://gitlab/Note/1",
                                         "body": "Please add a test.",
                                         "createdAt": "2026-10-21T12:00:00Z",
                                         "author": {"username": "reviewer"},
@@ -137,7 +138,9 @@ async def test_list_work_item_notes_omits_system_notes(gitlab_env, router):
     result = await call_tool("list_work_item_notes")
 
     # Assert
-    assert result["notes"] == [{"by": "reviewer", "body": "Please add a test.", "at": "2026-10-21"}]
+    assert result["notes"] == [
+        {"note_id": "gid://gitlab/Note/1", "by": "reviewer", "body": "Please add a test.", "at": "2026-10-21"}
+    ]
     assert result["discussions_complete"] is True
     assert result["notes_truncated"] is False
     assert json.loads(route.calls[0].request.content)["variables"] == {

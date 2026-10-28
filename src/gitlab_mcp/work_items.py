@@ -102,6 +102,20 @@ query($fullPath: ID!, $iid: String!) {
 }
 """
 
+_NOTE_READ_QUERY = """
+query($fullPath: ID!, $iid: String!, $noteId: NoteID!) {
+  __SCOPE_LOOKUP__
+  namespace(fullPath: $fullPath) {
+    __typename fullPath
+    workItem(iid: $iid) { id iid }
+  }
+  note(id: $noteId) {
+    id system body createdAt author { username }
+    discussion { noteable { __typename ... on Issue { id } } }
+  }
+}
+"""
+
 _CREATE_NOTE_MUTATION = """
 mutation($noteableId: NoteableID!, $body: String!) {
   createNote(input: {noteableId: $noteableId, body: $body}) {
@@ -126,7 +140,7 @@ query($fullPath: ID!, $iid: String!, $after: String) {
             nodes {
               notes(first: 50) {
                 pageInfo { hasNextPage }
-                nodes { system body createdAt author { username } }
+                nodes { id system body createdAt author { username } }
               }
             }
           }
@@ -213,10 +227,22 @@ class WorkItemEditSource(BaseModel):
 class WorkItemNote(BaseModel):
     """One non-system note with a bounded body."""
 
+    note_id: str
     by: str = Field(default="", exclude_if=lambda value: not value)
     body: str
     at: str
     body_truncated: bool = Field(default=False, exclude_if=lambda value: not value)
+
+
+class WorkItemNotePage(BaseModel):
+    """One bounded note body page and the full-body hash."""
+
+    note_id: str
+    by: str = Field(default="", exclude_if=lambda value: not value)
+    body: str
+    at: str
+    body_hash: str
+    next_body_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class WorkItemNotes(BaseModel):
@@ -933,6 +959,94 @@ def _valid_global_id(value: Any, typename: str) -> bool:
     return isinstance(value, str) and re.fullmatch(rf"gid://gitlab/{typename}/[1-9][0-9]*", value) is not None
 
 
+def _verified_note(data: dict[str, Any], note_id: str, item_id: str) -> dict[str, Any]:
+    """Check the returned human note and its parent without exposing note content."""
+    note = data.get("note")
+    if note is None:
+        _raise_data_error("Work-item note not found, or the token cannot see it.")
+    if not isinstance(note, dict):
+        _raise_data_error("GitLab returned an invalid work-item note.")
+    returned_id = note.get("id")
+    if not _valid_global_id(returned_id, "Note"):
+        _raise_data_error("GitLab returned an invalid work-item note global ID.")
+    if returned_id != note_id:
+        _raise_data_error("GitLab returned a different work-item note than requested.")
+    if note.get("system") is True:
+        _raise_data_error("GitLab returned a system note, not a human note.")
+    if note.get("system") is not False:
+        _raise_data_error("GitLab returned an invalid work-item note system flag.")
+    discussion = note.get("discussion")
+    parent = discussion.get("noteable") if isinstance(discussion, dict) else None
+    parent_id = parent.get("id") if isinstance(parent, dict) else None
+    if (
+        not isinstance(parent, dict)
+        or parent.get("__typename") != "Issue"
+        or not isinstance(parent_id, str)
+        or not (_valid_global_id(parent_id, "Issue") or _valid_global_id(parent_id, "WorkItem"))
+        # GitLab WorkItem inherits Issue and uses the same issues table row ID.
+        or parent_id.rsplit("/", 1)[-1] != item_id.rsplit("/", 1)[-1]
+    ):
+        _raise_data_error("GitLab returned an invalid or different work-item note parent.")
+    return note
+
+
+def _note_page(note: dict[str, Any], note_id: str, body_offset: int, body_limit: int) -> WorkItemNotePage:
+    """Build a bounded body page and hash the full original UTF-8 body."""
+    body = note.get("body")
+    if not isinstance(body, str):
+        _raise_data_error("GitLab returned an invalid work-item note body.")
+    try:
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError as exc:
+        _raise_data_error("GitLab returned an invalid UTF-8 work-item note body.", cause=exc)
+    created_at = note.get("createdAt") or ""
+    if not isinstance(created_at, str):
+        _raise_data_error("GitLab returned an invalid work-item note timestamp.")
+    author = note.get("author")
+    username = author.get("username", "") if isinstance(author, dict) else ""
+    end = body_offset + body_limit
+    return WorkItemNotePage(
+        note_id=note_id,
+        by=username if isinstance(username, str) else "",
+        body=body[body_offset:end],
+        at=created_at[:10],
+        body_hash=body_hash,
+        next_body_offset=end if end < len(body) else None,
+    )
+
+
+async def read_work_item_note(  # noqa: PLR0913, PLR0917 - signature mirrors the tool API.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    note_id: str,
+    scope: WorkItemScope = "project",
+    body_offset: int = 0,
+    body_limit: int = NOTE_BODY_CAP,
+) -> WorkItemNotePage:
+    """Read one verified human note as a bounded body page with a full-body hash."""
+    _validate_arguments(project, iid)
+    if not _valid_global_id(note_id, "Note"):
+        _raise_tool_error("note_id must be a canonical positive GitLab Note global ID.")
+    if type(body_offset) is not int or body_offset < 0:
+        _raise_tool_error("body_offset must be a nonnegative integer.")
+    if type(body_limit) is not int or not 1 <= body_limit <= NOTE_BODY_CAP:
+        _raise_tool_error(f"body_limit must be an integer from 1 to {NOTE_BODY_CAP}.")
+
+    data = await client.graphql(
+        _query_for_scope(_NOTE_READ_QUERY, scope),
+        {"fullPath": project, "iid": str(iid), "noteId": note_id},
+    )
+    _, item = _item_from_data(data, scope, project, iid)
+    resolved_iid = item.get("iid")
+    if type(resolved_iid) not in (str, int) or _positive_graphql_iid(resolved_iid) != iid:
+        _raise_data_error("GitLab returned a different work item IID than requested.")
+    item_id = item.get("id")
+    if not isinstance(item_id, str) or not _valid_global_id(item_id, "WorkItem"):
+        _raise_data_error("GitLab returned an invalid work item global ID.")
+    return _note_page(_verified_note(data, note_id, item_id), note_id, body_offset, body_limit)
+
+
 def _note_mutation_result(data: Any) -> WorkItemNoteCreateResult:
     """Classify a mutation payload without returning body or server-provided error text."""
     unknown = WorkItemNoteCreateResult(status="unknown", message="Check GitLab before retrying.")
@@ -1038,6 +1152,11 @@ def _map_human_note(
         _raise_data_error("GitLab returned an invalid work-item note.")
     if note.get("system") is True:
         return None, remaining_budget, False
+    if note.get("system") is not False:
+        _raise_data_error("GitLab returned an invalid work-item note system flag.")
+    note_id = note.get("id")
+    if not _valid_global_id(note_id, "Note"):
+        _raise_data_error("GitLab returned an invalid work-item note global ID.")
     body = note.get("body") or ""
     if not isinstance(body, str):
         _raise_data_error("GitLab returned an invalid work-item note body.")
@@ -1050,6 +1169,7 @@ def _map_human_note(
     if not isinstance(created_at, str):
         _raise_data_error("GitLab returned an invalid work-item note timestamp.")
     mapped_note = WorkItemNote(
+        note_id=note_id,
         by=username if isinstance(username, str) else "",
         body=output_body,
         at=created_at[:10],
