@@ -166,6 +166,7 @@ class WorkItemDetail(BaseModel):
     description: str | None = Field(default=None, exclude_if=lambda value: value is None)
     description_truncated: bool = Field(default=False, exclude_if=lambda value: not value)
     description_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    next_description_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
     headings: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     sections: list[WorkItemSection] | None = Field(default=None, exclude_if=lambda value: value is None)
     labels: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
@@ -388,12 +389,13 @@ def _select_section(
     _raise_tool_error(f"Section {selector!r} was not found. Available headings: {candidates}.")
 
 
-def _description_result(
+def _description_result(  # noqa: PLR0913, PLR0917 - options mirror the public detail reader.
     item: dict[str, Any],
     include_description: bool,
     description_limit: int,
     section: str | list[str] | None,
     headings_only: bool,
+    description_offset: int,
 ) -> tuple[str | None, bool, str | None, list[str] | None, list[WorkItemSection] | None]:
     """Build the bounded description, hash, and optional focused section result."""
     if not include_description:
@@ -429,9 +431,10 @@ def _description_result(
         return None, False, description_hash, None, selected_sections
     if raw_description is None:
         return None, False, description_hash, None, None
+    end = description_offset + description_limit
     return (
-        raw_description[:description_limit],
-        len(raw_description) > description_limit,
+        raw_description[description_offset:end],
+        len(raw_description) > end,
         description_hash,
         None,
         None,
@@ -737,6 +740,7 @@ async def read_work_item(  # noqa: PLR0913, PLR0917 - signature is part of the p
     cursor: str | None = None,
     section: str | list[str] | None = None,
     headings_only: bool = False,
+    description_offset: int = 0,
 ) -> WorkItemDetail:
     """Read one project's or group's work item and bounded detail widgets.
 
@@ -744,9 +748,19 @@ async def read_work_item(  # noqa: PLR0913, PLR0917 - signature is part of the p
     to fetch incomplete connections. Merge each list across pages; completed
     connections are omitted from later GraphQL requests. Scope is explicit, with
     no fallback to the other namespace type. Focused section reads share the description
-    limit and cannot be combined with a widget cursor.
+    limit and cannot be combined with a widget cursor. Full-description pages use
+    Unicode character offsets and repeat the full-description hash for change detection.
     """
     _validate_arguments(project, iid)
+    if type(description_offset) is not int or description_offset < 0:
+        _raise_tool_error("description_offset must be a nonnegative integer.")
+    if description_offset and (
+        section is not None or headings_only or cursor is not None or not include_description or description_limit <= 0
+    ):
+        _raise_tool_error(
+            "Positive description_offset requires a full description and a positive description_limit, "
+            "without section, headings_only, or cursor."
+        )
     _validate_section_options(section, headings_only, include_description, description_limit, cursor)
     cursor_include_description = include_description
     include_description = include_description and description_limit > 0
@@ -801,6 +815,7 @@ async def read_work_item(  # noqa: PLR0913, PLR0917 - signature is part of the p
         description_limit,
         section,
         headings_only,
+        description_offset,
     )
     work_item_type = item.get("workItemType")
     return WorkItemDetail(
@@ -814,6 +829,11 @@ async def read_work_item(  # noqa: PLR0913, PLR0917 - signature is part of the p
         description=description,
         description_truncated=description_truncated,
         description_hash=description_hash,
+        next_description_offset=(
+            description_offset + len(description)
+            if description_truncated and section is None and not headings_only and description is not None
+            else None
+        ),
         headings=headings,
         sections=selected_sections,
         labels=_string_connection_values(labels, "title", "label widget"),

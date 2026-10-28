@@ -10,7 +10,9 @@ import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp.work_items import NOTE_BODY_BUDGET
+from gitlab_mcp.client import GitLabClient
+from gitlab_mcp.config import Settings
+from gitlab_mcp.work_items import NOTE_BODY_BUDGET, read_work_item
 from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -19,6 +21,7 @@ IID = 42
 WORK_ITEM_ID = "gid://gitlab/WorkItem/123"
 UPDATED = {"data": {"workItemUpdate": {"errors": [], "workItem": {"id": WORK_ITEM_ID}}}}
 EXPECTED_PAGE_REQUESTS = 2
+DESCRIPTION_PAGE_SIZE = 4000
 
 
 def work_item(**overrides: Any) -> dict[str, Any]:
@@ -127,6 +130,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         ({"iid": 0}, "iid must be a positive integer"),
         ({"description_limit": -1}, "greater than or equal to 0"),
         ({"description_limit": 4001}, "less than or equal to 4000"),
+        ({"description_offset": -1}, "greater than or equal to 0"),
     ],
 )
 @respx.mock
@@ -291,6 +295,227 @@ async def test_description_can_be_skipped_or_truncated(
     assert "description @include(if: $includeDescription)" in query
     assert result.get("description") == expected_description
     assert result.get("description_truncated", False) is (expected_description == "A lo")
+    assert result.get("next_description_offset") == (4 if expected_description == "A lo" else None)
+
+
+@pytest.mark.parametrize("length", [4000, 4001])
+@respx.mock
+async def test_description_page_at_character_limit(gitlab_env, length):
+    """Only text beyond the default 4000-character limit has a continuation."""
+    # Arrange
+    description = "x" * length
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=description)))
+
+    # Act
+    result = await call_tool("get_work_item", {"project": PROJECT, "iid": IID})
+
+    # Assert
+    assert result["description"] == description[:4000]
+    assert result.get("description_truncated", False) is (length > DESCRIPTION_PAGE_SIZE)
+    assert result.get("next_description_offset") == (DESCRIPTION_PAGE_SIZE if length > DESCRIPTION_PAGE_SIZE else None)
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_description_pages_reconstruct_full_text_and_keep_full_hash(gitlab_env):
+    """Three pages reconstruct the description and repeat the full-description hash."""
+    # Arrange
+    description = "a" * 4000 + "b" * 4000 + "end"
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=description)))
+    arguments = {"project": PROJECT, "iid": IID}
+
+    # Act
+    first = await call_tool("get_work_item", arguments)
+    second = await call_tool("get_work_item", arguments | {"description_offset": first["next_description_offset"]})
+    third = await call_tool("get_work_item", arguments | {"description_offset": second["next_description_offset"]})
+
+    # Assert
+    assert first["description"] + second["description"] + third["description"] == description
+    assert first["next_description_offset"] == DESCRIPTION_PAGE_SIZE
+    assert second["next_description_offset"] == 2 * DESCRIPTION_PAGE_SIZE
+    assert "next_description_offset" not in third
+    assert first["description_truncated"] is True
+    assert second["description_truncated"] is True
+    assert "description_truncated" not in third
+    expected_hash = hashlib.sha256(description.encode("utf-8")).hexdigest()
+    assert [page["description_hash"] for page in (first, second, third)] == [expected_hash] * 3
+    assert route.call_count == len((first, second, third))
+
+
+@respx.mock
+async def test_description_offsets_count_unicode_characters_not_bytes_or_graphemes(gitlab_env):
+    """Offsets count code points, even when a page splits a combining character."""
+    # Arrange
+    description = "🦊e\u0301漢"
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=description)))
+    arguments = {"project": PROJECT, "iid": IID, "description_limit": 2}
+
+    # Act
+    first = await call_tool("get_work_item", arguments)
+    second = await call_tool("get_work_item", arguments | {"description_offset": first["next_description_offset"]})
+
+    # Assert
+    assert first["description"] == "🦊e"
+    assert first["next_description_offset"] == len("🦊e")
+    assert second["description"] == "\u0301漢"
+    assert "next_description_offset" not in second
+    assert first["description_hash"] == second["description_hash"] == hashlib.sha256(description.encode()).hexdigest()
+    assert route.call_count == EXPECTED_PAGE_REQUESTS
+
+
+@respx.mock
+async def test_description_hash_detects_change_between_pages(gitlab_env):
+    """An edit outside the next slice still changes the full-description hash."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[response(work_item(description="abcdef")), response(work_item(description="Abcdef"))],
+    )
+    arguments = {"project": PROJECT, "iid": IID, "description_limit": 3}
+
+    # Act
+    first = await call_tool("get_work_item", arguments)
+    second = await call_tool("get_work_item", arguments | {"description_offset": first["next_description_offset"]})
+
+    # Assert
+    assert first["description"] == "abc"
+    assert second["description"] == "def"
+    assert first["description_hash"] == hashlib.sha256(b"abcdef").hexdigest()
+    assert second["description_hash"] == hashlib.sha256(b"Abcdef").hexdigest()
+    assert first["description_hash"] != second["description_hash"]
+    assert route.call_count == EXPECTED_PAGE_REQUESTS
+
+
+@pytest.mark.parametrize(
+    ("description", "offset", "expected"),
+    [
+        (None, 0, None),
+        (None, 1, None),
+        ("", 0, ""),
+        ("", 1, ""),
+        ("abc", 3, ""),
+        ("abc", 9, ""),
+    ],
+)
+@respx.mock
+async def test_description_page_at_or_past_end_has_no_continuation(gitlab_env, description, offset, expected):
+    """Null remains absent, while empty and exhausted strings remain present and empty."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=description)))
+
+    # Act
+    result = await call_tool("get_work_item", {"project": PROJECT, "iid": IID, "description_offset": offset})
+
+    # Assert
+    if expected is None:
+        assert "description" not in result
+    else:
+        assert result["description"] == expected
+    assert result["description_hash"] == hashlib.sha256((description or "").encode()).hexdigest()
+    assert "description_truncated" not in result
+    assert "next_description_offset" not in result
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"section": "A"},
+        {"section": ["A"]},
+        {"headings_only": True},
+        {"cursor": "resume"},
+        {"cursor": ""},
+        {"include_description": False},
+        {"description_limit": 0},
+    ],
+)
+@respx.mock
+async def test_description_offset_incompatible_options_fail_before_request(gitlab_env, arguments):
+    """Positive offsets cannot be combined with focused reads, cursors, or skipped descriptions."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="description_offset"):
+        await call_tool("get_work_item", {"project": PROJECT, "iid": IID, "description_offset": 1, **arguments})
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize("offset", [-1, 1.5, True])
+@respx.mock
+async def test_direct_description_offset_validation_fails_before_request(gitlab_env, offset):
+    """Direct helper callers must provide a nonnegative integer offset."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item()))
+    client = GitLabClient(Settings.from_env())
+
+    # Act / Assert
+    try:
+        with pytest.raises(ToolError, match="description_offset"):
+            await read_work_item(client, PROJECT, IID, description_offset=offset)
+    finally:
+        await client.aclose()
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_direct_reader_keeps_legacy_positional_arguments(gitlab_env):
+    """Existing positional callers still receive the first description page."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description="abcdef")))
+    client = GitLabClient(Settings.from_env())
+
+    # Act
+    try:
+        result = await read_work_item(client, PROJECT, IID, "project", True, 4, None, None, False)
+    finally:
+        await client.aclose()
+
+    # Assert
+    assert result.description == "abcd"
+    assert result.next_description_offset == len("abcd")
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_offset_zero_preserves_widget_cursor_paging(gitlab_env):
+    """Widget cursors still resume with offset zero while the description has more pages."""
+    # Arrange
+    node = work_item(description="long description")
+    node["widgets"][0]["labels"]["pageInfo"] = {"hasNextPage": True, "endCursor": "labels-next"}
+    route = respx.post(GRAPHQL).mock(return_value=response(node))
+    arguments = {"project": PROJECT, "iid": IID, "description_limit": 4, "description_offset": 0}
+
+    # Act
+    first = await call_tool("get_work_item", arguments)
+    second = await call_tool("get_work_item", arguments | {"cursor": first["next_cursor"]})
+
+    # Assert
+    assert first["description"] == second["description"] == "long"
+    assert first["next_description_offset"] == second["next_description_offset"] == len("long")
+    assert request_variables(route)[1]["labelsAfter"] == "labels-next"
+    assert route.call_count == EXPECTED_PAGE_REQUESTS
+
+
+@pytest.mark.parametrize("selector", ["A", ["A"]])
+@respx.mock
+async def test_focused_sections_do_not_offer_description_paging(gitlab_env, selector):
+    """Truncated focused reads retain their shapes without offering full-description offsets."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=response(work_item(description="## A\nabcdef")))
+
+    # Act
+    result = await call_tool(
+        "get_work_item", {"project": PROJECT, "iid": IID, "section": selector, "description_limit": 3}
+    )
+
+    # Assert
+    if isinstance(selector, str):
+        assert result["description"] == "abc"
+        assert result["description_truncated"] is True
+    else:
+        assert result["sections"] == [{"heading": "A", "content": "abc", "truncated": True}]
+    assert "next_description_offset" not in result
+    assert route.call_count == 1
 
 
 @respx.mock

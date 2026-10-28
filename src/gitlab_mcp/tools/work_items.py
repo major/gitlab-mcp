@@ -41,6 +41,14 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
         bool,
         Field(description="Return the description's ATX heading names without section content."),
     ] = False,
+    description_offset: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Unicode character offset for full-description paging. Use next_description_offset; "
+            "positive offsets exclude section, headings_only, widget cursor, skipped descriptions, and limit 0.",
+        ),
+    ] = 0,
 ) -> _work_items.WorkItemDetail:
     """Read one project or group work item, like a scoped `glab api graphql` query.
 
@@ -51,7 +59,11 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
     `description_truncated` when cut. A list `section`, even with one heading, returns `sections` entries with
     `heading`, `content`, and `truncated` when cut. Set `headings_only` to list all ATX headings. Focused reads require
     the description and a positive limit, and do not accept a widget cursor. The limit caps total content across
-    selected sections.
+    selected sections. For full descriptions, use `next_description_offset` as `description_offset` for the next
+    page. Offsets count Unicode code points, not bytes or grapheme clusters. Positive offsets cannot be combined with
+    `section`, `headings_only`, a widget `cursor`, `include_description=false`, or `description_limit=0`. Continue
+    widget cursors with offset 0. Compare `description_hash` across description pages; it hashes the full description.
+    If the hash changes, the description was edited and paging must restart from offset 0.
     """
     return await _work_items.read_work_item(
         get_client(ctx),
@@ -63,6 +75,7 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
         cursor,
         section,
         headings_only,
+        description_offset,
     )
 
 
