@@ -31,7 +31,11 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
     ] = None,
     section: Annotated[
         str | list[str] | None,
-        Field(description="One exact heading or a list of headings to read from the description."),
+        Field(
+            description="One exact heading or a list of headings. A string returns description and, when cut, "
+            "description_truncated. A list, even with one heading, returns sections with heading, content, "
+            "and, when cut, truncated."
+        ),
     ] = None,
     headings_only: Annotated[
         bool,
@@ -43,9 +47,11 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
     `scope` is explicit. Use `group` for group work items such as epics. The group work-item API is experimental in
     GitLab 18.1 and later, so permission or API errors can occur. Widget lists fetch up to 100 entries each;
     `next_cursor` resumes incomplete lists. Merge each returned list across pages. Set `include_description` false or
-    lower `description_limit` to reduce output. Set `section` to read one heading or an ordered list of headings, or
-    set `headings_only` to list all ATX headings. Focused reads require the description and a positive limit, and do
-    not accept a widget cursor. The limit caps total content across selected sections.
+    lower `description_limit` to reduce output. A string `section` returns selected content in `description`, with
+    `description_truncated` when cut. A list `section`, even with one heading, returns `sections` entries with
+    `heading`, `content`, and `truncated` when cut. Set `headings_only` to list all ATX headings. Focused reads require
+    the description and a positive limit, and do not accept a widget cursor. The limit caps total content across
+    selected sections.
     """
     return await _work_items.read_work_item(
         get_client(ctx),

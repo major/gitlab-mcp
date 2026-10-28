@@ -96,21 +96,35 @@ async def test_full_read_keeps_default_description_and_adds_full_hash(gitlab_env
     assert result.get("headings") is None
 
 
+@pytest.mark.parametrize(
+    ("selector", "expected", "absent"),
+    [
+        ("target", {"description": "1234", "description_truncated": True}, ("sections",)),
+        (
+            ["target"],
+            {"sections": [{"heading": "Target", "content": "1234", "truncated": True}]},
+            ("description", "description_truncated"),
+        ),
+    ],
+    ids=("string", "singleton-list"),
+)
 @respx.mock
-async def test_single_section_uses_description_and_reports_truncation(gitlab_env):
-    """A single selected section is returned through the existing description fields."""
+async def test_single_section_shape_depends_on_selector_type(gitlab_env, selector, expected, absent):
+    """A string and singleton list select the same content with different response shapes."""
     # Arrange
     description = "## First\nignored\n## Target\n123456789\n## Last\nignored too"
-    respx.post(GRAPHQL).mock(return_value=response(description))
+    route = respx.post(GRAPHQL).mock(return_value=response(description))
 
     # Act
-    result = await call_work_item(section="target", description_limit=4)
+    result = await call_work_item(section=selector, description_limit=4)
 
     # Assert
-    assert result["description"] == "1234"
-    assert result["description_truncated"] is True
+    assert route.call_count == 1
+    for key, value in expected.items():
+        assert result[key] == value
+    for key in absent:
+        assert key not in result
     assert result["description_hash"] == hashlib.sha256(description.encode()).hexdigest()
-    assert "sections" not in result
 
 
 @pytest.mark.parametrize(
