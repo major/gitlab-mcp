@@ -1,5 +1,6 @@
 """Tests for the get_merge_request tool, run through a real in-memory MCP client 🧪."""
 
+import hashlib
 import json
 import re
 from types import SimpleNamespace
@@ -167,6 +168,35 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
             ],
             "index_complete": True,
         },
+    }
+
+
+@respx.mock
+async def test_default_raw_result_remains_unwrapped(gitlab_env):
+    """The first page keeps the existing top-level detail fields in raw MCP structured content."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_merge_request", {"project": PROJECT, "iid": IID})
+
+    # Assert
+    assert route.call_count == 1
+    assert result.structured_content == {
+        "iid": IID,
+        "title": "Rebuild support",
+        "state": "opened",
+        "author": "bkearney",
+        "author_id": AUTHOR_ID,
+        "source_branch": "feat/rebuild",
+        "target_branch": "main",
+        "head_sha": HEAD_SHA,
+        "merge_status": "mergeable",
+        "approved": False,
+        "pipeline_status": "success",
+        "changes": {"files": 7, "additions": 483, "deletions": 15},
+        "threads": {"open_count": 0, "resolved_count": 0, "index_complete": True},
     }
 
 
@@ -765,7 +795,9 @@ async def test_description_pages_reconstruct_unicode_text_without_gaps_or_overla
     assert "".join(pages) == description
     assert pages == [description[0:3], description[3:6], description[6:9], description[9:12]]
     assert route.call_count == len(pages)
-    assert all(json.loads(call.request.content)["variables"]["includeDescription"] is True for call in route.calls)
+    variables = [json.loads(call.request.content)["variables"] for call in route.calls]
+    assert variables[0]["includeDescription"] is True
+    assert all(item == {"fullPath": PROJECT, "iid": str(IID)} for item in variables[1:])
 
 
 @respx.mock
@@ -791,11 +823,20 @@ async def test_default_description_cap_pages_reconstruct_long_text(gitlab_env):
 
 
 @respx.mock
-async def test_description_offset_pages_custom_limit_and_issue_keys_scan_full_text(gitlab_env):
-    """A page starts at its character offset while issue-key extraction still scans the full description."""
+async def test_description_offset_returns_only_description_page_with_no_extra_reads(gitlab_env, monkeypatch):
+    """A continuation reads only the description, even with options that normally need extra reads."""
     # Arrange
-    node = make_mr(title="TITLE-1", description="prefix body KEY-89 suffix")
+    description = "prefix body KEY-89 suffix"
+    node = make_mr(
+        title="TITLE-1",
+        description=description,
+        detailedMergeStatus="BLOCKED_STATUS",
+        headPipeline={"status": "FAILED", "id": "gid://gitlab/Ci::Pipeline/123"},
+    )
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+    jobs = respx.get(PIPELINE_JOBS).mock(return_value=httpx.Response(200, json=[]))
+    rest = respx.get(MR_REST).mock(return_value=httpx.Response(200, json={"diverged_commits_count": 1}))
+    monkeypatch.setattr(mr_read, "_extract_issue_keys", lambda *args: pytest.fail("Continuation extracted issue keys"))
     page_start = len("prefix ")
     page_end = page_start + len("body")
 
@@ -804,14 +845,128 @@ async def test_description_offset_pages_custom_limit_and_issue_keys_scan_full_te
         include_description=True,
         description_limit=4,
         description_offset=page_start,
+        include_jobs=True,
+        include_labels=True,
+        include_threads=True,
+        include_commits_behind=True,
+        issue_key_pattern=r"KEY-[0-9]+",
     )
 
     # Assert
     assert route.call_count == 1
-    assert data["description"] == "body"
-    assert data["description_truncated"] is True
-    assert data["next_description_offset"] == page_end
-    assert data["issue_keys"] == ["TITLE-1", "KEY-89"]
+    assert jobs.call_count == rest.call_count == 0
+    request = json.loads(route.calls.last.request.content)
+    assert request["variables"] == {"fullPath": PROJECT, "iid": str(IID)}
+    assert re.sub(r"\s+", " ", request["query"]).strip() == (
+        "query($fullPath: ID!, $iid: String!) { project(fullPath: $fullPath) "
+        "{ mergeRequest(iid: $iid) { description } } }"
+    )
+    assert data == {
+        "iid": IID,
+        "description": "body",
+        "description_truncated": True,
+        "next_description_offset": page_end,
+        "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
+    }
+
+
+@respx.mock
+async def test_description_hash_compares_full_raw_text_across_pages_and_edits(gitlab_env):
+    """Unicode and CRLF stay unchanged in the full hash, including edits outside the page."""
+    # Arrange
+    description = "é😀\r\ne\u0301 body END-9"
+    changed = "É😀\r\ne\u0301 body END-9"
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            graphql_response(make_mr(description=description)),
+            graphql_response({"description": description}),
+            graphql_response({"description": changed}),
+        ],
+    )
+
+    # Act
+    first = await call_tool(include_description=True, include_description_hash=True, description_limit=3)
+    second = await call_tool(include_description=True, description_offset=3, description_limit=3)
+    edited = await call_tool(include_description=True, description_offset=3, description_limit=3)
+
+    # Assert
+    assert route.call_count == len([first, second, edited])
+    assert first["description_hash"] == second["description_hash"] == hashlib.sha256(description.encode()).hexdigest()
+    assert second["description"] == edited["description"] == description[3:6]
+    assert edited["description_hash"] == hashlib.sha256(changed.encode()).hexdigest()
+    assert edited["description_hash"] != first["description_hash"]
+
+
+@pytest.mark.parametrize("description", [None, ""], ids=["null", "empty"])
+@respx.mock
+async def test_description_hash_for_null_or_empty_text(gitlab_env, description):
+    """Null and empty descriptions have the same full hash and no description fields."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        side_effect=[
+            graphql_response(make_mr(description=description)),
+            graphql_response({"description": description}),
+        ],
+    )
+
+    # Act
+    first = await call_tool(include_description=True, include_description_hash=True)
+    continuation = await call_tool(include_description=True, description_offset=1)
+
+    # Assert
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    assert route.call_count == len([first, continuation])
+    assert first["description_hash"] == empty_hash
+    assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(first)
+    assert continuation == {"iid": IID, "description_hash": empty_hash}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "include_hash"),
+    [({}, False), ({"include_description_hash": False}, False), ({"include_description_hash": True}, True)],
+    ids=["default", "explicit-false", "opt-in"],
+)
+@respx.mock
+async def test_first_description_page_hash_is_opt_in(gitlab_env, arguments, include_hash):
+    """The first page includes a full-description hash only when requested."""
+    # Arrange
+    description = "FIRST-1 then SECOND-2"
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, description_limit=5, **arguments)
+
+    # Assert
+    assert route.call_count == 1
+    assert data["description"] == description[:5]
+    assert data["issue_keys"] == ["FIRST-1", "SECOND-2"]
+    assert ("description_hash" in data) is include_hash
+    if include_hash:
+        assert data["description_hash"] == hashlib.sha256(description.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{}, {"include_description_hash": False}, {"include_description_hash": True}],
+    ids=["default", "explicit-false", "explicit-true"],
+)
+@respx.mock
+async def test_continuation_hash_is_always_included(gitlab_env, arguments):
+    """Continuations include the full hash regardless of the first-page hash option."""
+    # Arrange
+    description = "one two"
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response({"description": description}))
+
+    # Act
+    data = await call_tool(include_description=True, description_offset=4, **arguments)
+
+    # Assert
+    assert route.call_count == 1
+    assert data == {
+        "iid": IID,
+        "description": "two",
+        "description_hash": hashlib.sha256(description.encode()).hexdigest(),
+    }
 
 
 @pytest.mark.parametrize("extra_offset", [0, 5], ids=["at-end", "past-end"])
@@ -827,8 +982,62 @@ async def test_description_offset_at_or_beyond_end_omits_description_and_continu
 
     # Assert
     assert route.call_count == 1
-    assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
-    assert data["issue_keys"] == ["KEY-2"]
+    assert data == {"iid": IID, "description_hash": hashlib.sha256(description.encode()).hexdigest()}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"include_description_hash": True},
+        {"include_description_hash": True, "include_description": False},
+        {"include_description_hash": True, "include_description": True, "description_limit": 0},
+        {"include_description_hash": True, "include_description": False, "description_offset": 1},
+        {
+            "include_description_hash": True,
+            "include_description": True,
+            "description_limit": 0,
+            "description_offset": 1,
+        },
+    ],
+    ids=[
+        "omitted-description",
+        "explicit-false",
+        "zero-limit",
+        "continuation-without-description",
+        "continuation-zero-limit",
+    ],
+)
+@respx.mock
+async def test_description_hash_requires_included_description_and_positive_limit(gitlab_env, arguments):
+    """A requested hash requires fetching the description and fails before any HTTP request otherwise."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"include_description.*description_limit"):
+        await call_tool(**arguments)
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"issue_key_pattern": "["},
+        {"issue_key_pattern": r"KEY-[0-9]+", "issue_key_prefixes": []},
+        {"issue_key_prefixes": ["invalid"]},
+    ],
+    ids=["invalid-regex", "conflicting-filters", "invalid-prefix"],
+)
+@respx.mock
+async def test_continuation_validates_issue_key_options_before_request(gitlab_env, arguments):
+    """Description-only pages still validate issue-key options before fetching GitLab."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response({"description": "text"}))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="issue_key"):
+        await call_tool(include_description=True, description_offset=1, **arguments)
+    assert route.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -1469,26 +1678,28 @@ async def test_null_thread_counts_count_as_zero(gitlab_env):
     assert data["threads"] == {"open_count": 0, "resolved_count": 0, "index_complete": True}
 
 
+@pytest.mark.parametrize("offset", [0, 1], ids=["detail", "continuation"])
 @respx.mock
-async def test_missing_project_is_reported(gitlab_env):
+async def test_missing_project_is_reported(gitlab_env, offset):
     """GitLab returns project null for unknown or invisible projects."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": {"project": None}}))
 
     # Act / Assert
     with pytest.raises(ToolError, match="not found, or the token cannot see it"):
-        await call_tool()
+        await call_tool(include_description=True, description_offset=offset)
 
 
+@pytest.mark.parametrize("offset", [0, 1], ids=["detail", "continuation"])
 @respx.mock
-async def test_missing_merge_request_is_reported(gitlab_env):
+async def test_missing_merge_request_is_reported(gitlab_env, offset):
     """A null mergeRequest names the IID and the project."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=graphql_response(None))
 
     # Act / Assert
     with pytest.raises(ToolError, match=r"Merge request !2187 not found in 'group/project'"):
-        await call_tool()
+        await call_tool(include_description=True, description_offset=offset)
 
 
 @respx.mock
