@@ -265,7 +265,13 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         (
             "get_merge_request",
             {"project", "iid"},
-            {"include_threads", "include_description", "description_limit", "description_offset"},
+            {
+                "include_threads",
+                "include_description",
+                "description_limit",
+                "description_offset",
+                "include_description_hash",
+            },
         ),
         ("get_merge_request_threads", {"project"}, {"iid", "iids", "include_mr_status"}),
         (
@@ -343,6 +349,34 @@ async def test_new_and_extended_options_are_in_the_schema(tools, name, required,
     # Assert
     assert required <= required_fields
     assert required | optional <= properties
+
+
+async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
+    """The two detail shapes share an object output schema without a result wrapper."""
+    # Arrange
+    schema = tools["get_merge_request"].output_schema
+
+    # Act
+    branches = {branch["title"]: branch for branch in schema["anyOf"]}
+    detail = branches["MergeRequestDetail"]
+    page = branches["MergeRequestDescriptionPage"]
+
+    # Assert
+    assert schema["type"] == "object"
+    assert set(branches) == {"MergeRequestDetail", "MergeRequestDescriptionPage"}
+    assert {"iid", "title", "state", "source_branch", "target_branch", "approved"} <= set(detail["required"])
+    assert "description_hash" in detail["properties"]
+    assert "description_hash" not in detail["required"]
+    assert page["additionalProperties"] is False
+    assert set(page["required"]) == {"iid", "description_hash"}
+    assert set(page["properties"]) == {
+        "iid",
+        "description",
+        "description_truncated",
+        "next_description_offset",
+        "description_hash",
+    }
+    assert tools["get_merge_request"].input_schema["properties"]["include_description_hash"]["default"] is False
 
 
 @pytest.mark.parametrize(

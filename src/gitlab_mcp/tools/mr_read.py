@@ -1,5 +1,6 @@
 """Merge request read tools: list, merge train, and status views 🔀."""
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -9,7 +10,7 @@ from urllib.parse import quote
 
 import regex
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
@@ -103,6 +104,15 @@ query(
         }
       }
     }
+  }
+}
+"""
+
+# Continuation pages need no status or discussion data.
+MERGE_REQUEST_DESCRIPTION_QUERY = """
+query($fullPath: ID!, $iid: String!) {
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) { description }
   }
 }
 """
@@ -254,6 +264,7 @@ class MergeRequestDetail(BaseModel):
     description: str = Field(default="", exclude_if=lambda v: not v)
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
     next_description_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    description_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys_truncated: bool | None = Field(
         default=None,
@@ -290,6 +301,25 @@ class MergeRequestDetail(BaseModel):
         exclude_if=lambda value: value is None,
     )
     threads: ThreadIndex | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class MergeRequestDescriptionPage(BaseModel):
+    """A description-only continuation page with the hash of the full description."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iid: int
+    description: str = Field(default="", exclude_if=lambda value: not value)
+    description_truncated: bool = Field(default=False, exclude_if=lambda value: not value)
+    next_description_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    description_hash: str
+
+
+# FastMCP otherwise wraps an inferred union in a `result` property.
+GET_MERGE_REQUEST_OUTPUT_SCHEMA = {
+    "type": "object",
+    **TypeAdapter(MergeRequestDetail | MergeRequestDescriptionPage).json_schema(mode="serialization"),
+}
 
 
 class CompactMergeRequest(BaseModel):
@@ -654,6 +684,26 @@ def _page_description(description: str | None, limit: int, offset: int) -> tuple
     return page, True, end
 
 
+def _description_hash(description: str | None) -> str:
+    """Hash the full raw description as UTF-8, treating null as empty text."""
+    return hashlib.sha256((description or "").encode("utf-8")).hexdigest()
+
+
+def _validate_description_options(
+    include_description: bool, description_limit: int, description_offset: int, include_description_hash: bool
+) -> None:
+    """Reject paging or hashing when the description will not be fetched."""
+    if description_offset > 0 and (not include_description or description_limit == 0):
+        raise ToolError(  # noqa: TRY003 - name both incompatible options for an actionable error.
+            "description_offset must be 0 unless include_description is true and description_limit is greater than 0."
+        )
+    if include_description_hash and (not include_description or description_limit == 0):
+        raise ToolError(  # noqa: TRY003 - name the incompatible options for an actionable error.
+            "include_description_hash requires include_description to be true and description_limit to be "
+            "greater than 0."
+        )
+
+
 def _extract_issue_keys(
     title: str,
     description: str | None,
@@ -963,14 +1013,22 @@ async def _add_commits_behind(
         detail.commits_behind = mr.get("diverged_commits_count")  # GitLab may send null.
 
 
-@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+@mcp.tool(
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+    output_schema=GET_MERGE_REQUEST_OUTPUT_SCHEMA,
+)
 async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls one optional detail.
     ctx: Context,
     project: Project,
     iid: Iid,
     include_jobs: Annotated[
         bool,
-        Field(description="Include failed job IDs and names as TSV. Defaults to false to keep output compact."),
+        Field(
+            description=(
+                "Include failed job IDs and names as TSV. Defaults to false to keep output compact; "
+                "ignored on continuation pages."
+            ),
+        ),
     ] = False,
     include_description: Annotated[
         bool,
@@ -978,14 +1036,16 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     ] = False,
     include_labels: Annotated[
         bool,
-        Field(description="Include the first 100 labels. Defaults to false to keep output compact."),
+        Field(
+            description="Include the first 100 labels. Defaults to false; ignored on continuation pages.",
+        ),
     ] = False,
     include_threads: Annotated[
         bool,
         Field(
             description=(
                 "Include the first page of open thread refs. Defaults to true; false skips discussion data but returns "
-                "open_thread_count and resolved_thread_count."
+                "open_thread_count and resolved_thread_count. Ignored on continuation pages."
             ),
         ),
     ] = True,
@@ -994,8 +1054,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         Field(
             max_length=20,
             description=(
-                "Optional literal prefixes for issue keys. Each prefix must start with an uppercase ASCII letter, "
-                "followed by up to 31 uppercase letters, digits, or underscores."
+                "Optional literal prefixes for first-page issue keys. Each prefix must start with an uppercase ASCII "
+                "letter, followed by up to 31 uppercase letters, digits, or underscores."
             ),
         ),
     ] = None,
@@ -1005,7 +1065,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
             min_length=1,
             max_length=256,
             description=(
-                "Optional caller-authored regex that replaces default issue-key extraction. Matches return the full "
+                "Optional caller-authored regex that replaces first-page issue-key extraction. Matches return the full "
                 "text, preserve case, and are limited to 256 characters. The scan is limited to 65,536 characters "
                 "with a 50 ms matching timeout. Timeout does not sandbox pattern compilation. Cannot be combined "
                 "with issue_key_prefixes."
@@ -1018,18 +1078,34 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     ] = DESCRIPTION_CAP,
     description_offset: Annotated[
         int,
-        Field(ge=0, description="Character offset for the description page. Use next_description_offset to continue."),
+        Field(
+            ge=0,
+            description=(
+                "Character offset for the description page. Nonzero offsets return description-only pages; "
+                "use next_description_offset to continue."
+            ),
+        ),
     ] = 0,
     include_commits_behind: Annotated[
         bool,
         Field(
             description=(
                 "Add commits_behind, the number of target branch commits missing from the source branch. "
-                "One extra REST call per MR. Defaults to false."
+                "One extra REST call per MR. Defaults to false; ignored on continuation pages."
             ),
         ),
     ] = False,
-) -> MergeRequestDetail:
+    include_description_hash: Annotated[
+        bool,
+        Field(
+            description=(
+                "Include the full description SHA-256 hash on the first page. Continuation pages always include it; "
+                "compare hashes and restart paging if they differ. Requires include_description=true and a positive "
+                "description_limit."
+            ),
+        ),
+    ] = False,
+) -> MergeRequestDetail | MergeRequestDescriptionPage:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
     - `merge_status` is the source of truth for mergeability. Open threads and failed CI do not always block a merge.
@@ -1046,8 +1122,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
     - `latest_pipeline_id` is the numeric ID of the head pipeline when one is attached, even when jobs are not
       requested.
-    - `issue_keys` lists unique uppercase-prefix-number keys from the title on every call and from the raw description
-      when included, up to 100. By default, partial matches from full CVE identifiers are skipped.
+    - `issue_keys` lists unique uppercase-prefix-number keys from the title on the first page and from the raw
+      description when included, up to 100. By default, partial matches from full CVE identifiers are skipped.
       `issue_key_prefixes` filters by literal prefixes, not regular expressions, and keeps matching CVE partials. Set
       `issue_key_pattern` to replace that extraction with a caller-authored regex; it cannot be combined with prefixes.
       Custom patterns return full matches, preserve case, and use a bounded scan with a matching timeout.
@@ -1055,21 +1131,34 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `description_limit` controls description length when the description is included. Zero skips it; the default is
       4000 characters.
     - `description_offset` starts a description page at that character offset. When `next_description_offset` is
-      returned, call again with that value to continue. Each page is capped at 4000 characters. Descriptions can
-      change between calls, so restart paging if the merge request is edited.
+      returned, call again with that value to continue. Nonzero offsets return only the IID, description page,
+      continuation fields, and full description hash. Other detail flags are ignored on continuation pages.
+      Each page is capped at 4000 characters. Set `include_description_hash=true` on the first page to compare hashes
+      across all pages and restart paging if the description changes. The hash is SHA-256 of the full raw description
+      encoded as UTF-8, with null treated as empty text.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
       the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
     - Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are not visible to the token.
     - `commits_behind` (with `include_commits_behind=true`) counts target branch commits missing from the source
       branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
     """
-    if description_offset > 0 and (not include_description or description_limit == 0):
-        raise ToolError(  # noqa: TRY003 - name both incompatible options for an actionable error.
-            "description_offset must be 0 unless include_description is true and description_limit is greater than 0."
-        )
+    _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
     include_description = include_description and description_limit > 0
     custom_issue_key_pattern = _compile_issue_key_pattern(issue_key_pattern, issue_key_prefixes)
     client = get_client(ctx)
+    if description_offset > 0:
+        node = await fetch_merge_request(client, MERGE_REQUEST_DESCRIPTION_QUERY, project, iid)
+        raw_description = node.get("description")
+        description, description_truncated, next_description_offset = _page_description(
+            raw_description, description_limit, description_offset
+        )
+        return MergeRequestDescriptionPage(
+            iid=iid,
+            description=description,
+            description_truncated=description_truncated,
+            next_description_offset=next_description_offset,
+            description_hash=_description_hash(raw_description),
+        )
     node = await fetch_merge_request(
         client,
         MERGE_REQUEST_QUERY,
@@ -1089,6 +1178,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         description_offset=description_offset,
         custom_issue_key_pattern=custom_issue_key_pattern,
     )
+    if include_description_hash:
+        detail.description_hash = _description_hash(node.get("description"))
     await _add_blockers(client, project, [detail])
     if include_commits_behind:
         await _add_commits_behind(client, project, [detail])
