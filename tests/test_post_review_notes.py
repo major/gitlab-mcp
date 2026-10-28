@@ -28,6 +28,7 @@ FOUR_PREFLIGHT_REQUESTS = 4
 THREE_PAGES = 3
 REASON_CAP = 200
 BLOB_CAP = 131_072
+REVIEW_BATCH_TTL = 1800
 OLD_CONTEXT_LINE = 8
 NEW_CONTEXT_LINE = 11
 MIXED_INLINE_LINE = 2
@@ -222,6 +223,8 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
         {"index": 1, "status": "validated"},
     ]
     assert data["batch_id"]
+    assert data["ttl_seconds"] == REVIEW_BATCH_TTL
+    assert "expires_at" not in data
     assert "warning" not in data
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -242,6 +245,8 @@ async def test_validate_only_stale_head_sha_remains_unattempted_without_posting(
     # Assert
     assert data["results"] == [{"index": 0, "status": "unattempted"}]
     assert "stale" in data["warning"]
+    assert "ttl_seconds" not in data
+    assert "batch_id" not in data
     assert len(mr_route.calls) == 1
     assert not diff_route.called
     assert not post_route.called

@@ -32,6 +32,7 @@ DIFF_CALLS_FOR_VALIDATE_AND_POST = 2
 SECOND_WRITE = 2
 SECOND_CACHED_NOTE_NEW_LINE = 2
 PEOPLE_REQUESTS = 3
+WARNING_CAP = 500
 
 
 @pytest.fixture
@@ -116,6 +117,28 @@ def assert_rejected(result: Any) -> str:
     return message
 
 
+def assert_unavailable(result: Any, *, head: str | None = HEAD) -> dict[str, Any]:
+    """Check the safe, structured response for an unavailable single-use batch."""
+    assert not result.is_error
+    data = result.structured_content
+    assert data["results"] == []
+    assert data["batch_error"] == "unavailable"
+    assert data.get("current_head_sha") == head
+    warning = data["warning"].lower()
+    assert "unavailable" in warning
+    assert "this call attempted no writes" in warning
+    assert "prior attempts may have posted" in warning
+    assert "wait for any in-flight attempt to finish" in warning
+    assert "check prior results and gitlab before resubmitting" in warning
+    assert "if a previous attempt may have written" in warning
+    assert "check the head and note positions before resubmitting" in warning
+    assert "explicit approve for any changed final text" in warning
+    assert len(warning) <= WARNING_CAP
+    assert "ttl_seconds" not in data
+    assert "batch_id" not in data
+    return data
+
+
 @respx.mock
 async def test_validated_batch_posts_frozen_bodies_and_positions(
     review_client: Client,
@@ -140,6 +163,9 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     assert not prepared.is_error
     token_data = prepared.structured_content
     assert token_data["batch_id"]
+    assert token_data["ttl_seconds"] == review_batches.ReviewBatchCache.TTL_SECONDS
+    assert "expires_at" not in token_data
+    assert "batch_error" not in token_data
     assert [row["status"] for row in token_data["results"]] == ["validated"] * 3
     batch_id = token_data["batch_id"]
     changed_body_path.write_text("changed after validation", encoding="utf-8")
@@ -148,6 +174,8 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
 
     # Assert
     assert not posted.is_error
+    assert "ttl_seconds" not in posted.structured_content
+    assert "batch_error" not in posted.structured_content
     assert [row["status"] for row in posted.structured_content["results"]] == ["posted"] * 3
     requests = [json.loads(call.request.content) for call in post_route.calls]
     assert [request["body"] for request in requests] == ["inline body", "original file body", "deleted file body"]
@@ -483,13 +511,13 @@ async def test_stale_live_head_consumes_token_without_writes(review_client: Clie
     assert len(diff_route.calls) == prior_diff_calls
     assert not post_route.called
     replay = await call_review(review_client, **note_args(batch_id=batch_id))
-    assert "send the notes again" in assert_rejected(replay).lower()
+    assert_unavailable(replay, head=live_sha)
 
 
 @pytest.mark.parametrize(
     ("changed_field", "changed_value"),
-    [("project", "group/other"), ("iid", IID + 1), ("head_sha", "d" * 40)],
-    ids=["project", "iid", "head-sha"],
+    [("project", "group/other"), ("iid", IID + 1), ("head_sha", "d" * 40), ("head_sha", "invalid")],
+    ids=["project", "iid", "head-sha", "invalid-head-sha"],
 )
 @respx.mock
 async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
@@ -514,11 +542,11 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
     mismatch = await call_review(review_client, **arguments)
 
     # Assert
-    assert "send the notes again" in assert_rejected(mismatch).lower()
+    assert "does not match" in assert_rejected(mismatch).lower()
     assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == before
     replay = await call_review(review_client, **note_args(batch_id=batch_id))
-    assert "send the notes again" in assert_rejected(replay).lower()
-    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == before
+    assert_unavailable(replay)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == (before[0] + 1, *before[1:])
 
 
 @pytest.mark.parametrize(
@@ -587,6 +615,7 @@ async def test_failed_validation_does_not_return_a_batch_token(review_client: Cl
     # Assert
     assert not result.is_error
     assert "batch_id" not in result.structured_content
+    assert "ttl_seconds" not in result.structured_content
     assert result.structured_content["results"][0]["status"] == "failed"
     assert len(mr_route.calls) == MR_CALLS_PER_PREFLIGHT
     assert len(diff_route.calls) == 1
@@ -595,12 +624,12 @@ async def test_failed_validation_does_not_return_a_batch_token(review_client: Cl
 
 @respx.mock
 async def test_unknown_and_replayed_tokens_are_rejected(review_client: Client) -> None:
-    """Unknown tokens and tokens already claimed cannot trigger reads or writes."""
+    """Unknown and claimed tokens only trigger one diagnostic head read each."""
     # Arrange
     mr_route, diff_route = add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     unknown = await call_review(review_client, **note_args(batch_id="not-a-token"))
-    assert "send the notes again" in assert_rejected(unknown).lower()
+    assert_unavailable(unknown)
     prepared = await call_review(
         review_client,
         **note_args(notes=[{"file": "src.py", "line": 1, "body": "review"}], validate_only=True),
@@ -614,12 +643,15 @@ async def test_unknown_and_replayed_tokens_are_rejected(review_client: Client) -
 
     # Assert
     assert not first.is_error
-    assert "send the notes again" in assert_rejected(replay).lower()
-    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == calls_after_first
+    assert_unavailable(replay)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == (
+        calls_after_first[0] + 1,
+        *calls_after_first[1:],
+    )
 
 
 @respx.mock
-async def test_expired_batch_token_is_rejected_without_gitlab_requests(
+async def test_expired_batch_token_only_reads_head(
     review_client: Client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -635,14 +667,39 @@ async def test_expired_batch_token_is_rejected_without_gitlab_requests(
     )
     batch_id = prepared.structured_content["batch_id"]
     prior = (len(mr_route.calls), len(diff_route.calls), len(post_route.calls))
-    now += review_batches.ReviewBatchCache.TTL_SECONDS + 1
+    now += review_batches.ReviewBatchCache.TTL_SECONDS
 
     # Act
     expired = await call_review(review_client, **note_args(batch_id=batch_id))
 
     # Assert
-    assert "send the notes again" in assert_rejected(expired).lower()
-    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == prior
+    assert_unavailable(expired)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == (prior[0] + 1, *prior[1:])
+
+
+@respx.mock
+async def test_batch_remains_claimable_just_before_expiration(
+    review_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lifetime metadata matches the fake-clock expiry boundary."""
+    # Arrange
+    now = 100.0
+    monkeypatch.setattr(review_batches, "time", SimpleNamespace(monotonic=lambda: now))
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"file": "src.py", "line": 1, "body": "review"}], validate_only=True),
+    )
+    now += prepared.structured_content["ttl_seconds"] - 0.01
+
+    # Act
+    posted = await call_review(review_client, **note_args(batch_id=prepared.structured_content["batch_id"]))
+
+    # Assert
+    assert not posted.is_error
+    assert posted.structured_content["results"][0]["status"] == "posted"
+    assert len(post_route.calls) == 1
 
 
 @respx.mock
@@ -664,8 +721,8 @@ async def test_token_does_not_survive_a_new_mcp_lifespan(gitlab_env) -> None:
         restarted = await call_review(restarted_client, **note_args(batch_id=batch_id))
 
     # Assert
-    assert "send the notes again" in assert_rejected(restarted).lower()
-    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == before
+    assert_unavailable(restarted)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == (before[0] + 1, *before[1:])
 
 
 @respx.mock
@@ -687,11 +744,127 @@ async def test_concurrent_calls_claim_a_token_once(review_client: Client) -> Non
     )
 
     # Assert
-    assert sum(not result.is_error for result in (first, second)) == 1
-    assert sum(result.is_error for result in (first, second)) == 1
+    assert all(not result.is_error for result in (first, second))
+    unavailable = next(result for result in (first, second) if result.structured_content.get("batch_error"))
+    assert_unavailable(unavailable)
+    posted = next(result for result in (first, second) if not result.structured_content.get("batch_error"))
+    assert posted.structured_content["results"][0]["status"] == "posted"
     assert len(post_route.calls) == 1
-    assert len(mr_route.calls) == MR_CALLS_FOR_VALIDATE_AND_POST
+    assert len(mr_route.calls) == MR_CALLS_FOR_VALIDATE_AND_POST + 1
     assert len(diff_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
+
+
+@pytest.mark.parametrize(
+    ("live_sha", "supplied_sha", "expected_status", "diff_refs"),
+    [(HEAD.upper(), HEAD, "current", {}), ("D" * 40, HEAD.upper(), "stale", {"diff_refs": None})],
+    ids=["current-no-diff-refs", "stale-null-diff-refs"],
+)
+@respx.mock
+async def test_unavailable_token_reports_live_sha_without_diff_refs(
+    review_client: Client,
+    live_sha: str,
+    supplied_sha: str,
+    expected_status: str,
+    diff_refs: dict[str, Any],
+) -> None:
+    """A single MR read compares normalized SHAs without requiring pending diff refs."""
+    # Arrange
+    mr_route = respx.get(MR_URL).mock(return_value=response({"sha": live_sha, **diff_refs}))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    people_route = respx.post(GRAPHQL).mock(return_value=response({}))
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(
+            batch_id="secret-batch-token",
+            head_sha=supplied_sha,
+            compact=True,
+            add_reviewers=["alice"],
+            add_assignees=["bob"],
+        ),
+    )
+
+    # Assert
+    data = assert_unavailable(result, head=live_sha.lower())
+    assert expected_status in data["warning"].lower()
+    if expected_status == "current":
+        assert "cached notes and positions remain unavailable" in data["warning"].lower()
+    assert data["posted_count"] == 0
+    assert "people" not in data
+    assert "secret-batch-token" not in data["warning"]
+    assert len(mr_route.calls) == 1
+    assert len(respx.calls) == 1
+    assert not post_route.called
+    assert not people_route.called
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param(response({}), id="missing-sha"),
+        pytest.param(response({"sha": None}), id="null-sha"),
+        pytest.param(response({"sha": 123}), id="numeric-sha"),
+        pytest.param(response({"sha": "invalid secret"}), id="invalid-sha"),
+        pytest.param(response([{"sha": HEAD}]), id="not-an-object"),
+        pytest.param(httpx.Response(200, content=b"secret invalid json"), id="invalid-json"),
+        pytest.param(response({"message": "secret API error"}, status=404), id="not-found"),
+        pytest.param(httpx.ConnectError("secret connection error"), id="connection-error"),
+    ],
+)
+@respx.mock
+async def test_unavailable_token_with_unknown_head_safely_hides_diagnostic_failure(
+    review_client: Client,
+    reply: httpx.Response | Exception,
+) -> None:
+    """Malformed MR responses and read errors leave the head unknown without leaking details."""
+    # Arrange
+    route = respx.get(MR_URL)
+    if isinstance(reply, Exception):
+        route.mock(side_effect=reply)
+    else:
+        route.mock(return_value=reply)
+
+    # Act
+    result = await call_review(review_client, **note_args(batch_id="secret-batch-token"))
+
+    # Assert
+    data = assert_unavailable(result, head=None)
+    assert "unknown" in data["warning"].lower()
+    assert "secret" not in data["warning"].lower()
+    assert len(route.calls) == 1
+    assert len(respx.calls) == 1
+
+
+@pytest.mark.parametrize("head_sha", ["", "a" * 39, "g" * 40], ids=["empty", "short", "not-hex"])
+@respx.mock
+async def test_unavailable_token_rejects_invalid_sha_without_a_read(review_client: Client, head_sha: str) -> None:
+    """An unavailable token with an invalid supplied SHA never triggers diagnostic I/O."""
+    # Arrange / Act
+    result = await call_review(review_client, **note_args(batch_id="unknown", head_sha=head_sha))
+
+    # Assert
+    data = assert_unavailable(result, head=None)
+    assert "unknown" in data["warning"].lower()
+    assert "40-character" in data["warning"]
+    assert not respx.calls
+
+
+@respx.mock
+async def test_unavailable_token_when_gitlab_setup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing client and cache still return safe unavailable recovery guidance."""
+    # Arrange
+    monkeypatch.delenv("GITLAB_URL", raising=False)
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+
+    # Act
+    async with Client(mcp) as client:
+        result = await call_review(client, **note_args(batch_id="unknown"))
+
+    # Assert
+    data = assert_unavailable(result, head=None)
+    assert "unknown" in data["warning"].lower()
+    assert not respx.calls
 
 
 @respx.mock
@@ -730,7 +903,11 @@ async def test_unknown_write_outcome_stops_batch_and_consumes_token(review_clien
     assert len(mr_route.calls) == MR_CALLS_FOR_VALIDATE_AND_POST
     assert len(diff_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
     replay = await call_review(review_client, **note_args(batch_id=batch_id))
-    assert "send the notes again" in assert_rejected(replay).lower()
+    assert_unavailable(replay)
+    assert len(post_route.calls) == SECOND_WRITE
+    assert not people_route.called
+    assert len(mr_route.calls) == MR_CALLS_FOR_VALIDATE_AND_POST + 1
+    assert len(diff_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
 
 
 @respx.mock
@@ -806,8 +983,8 @@ async def test_oldest_token_is_evicted_when_cache_limit_is_reached(
     oldest = await call_review(review_client, **note_args(batch_id=tokens[0]))
 
     # Assert
-    assert "send the notes again" in assert_rejected(oldest).lower()
-    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == before
+    assert_unavailable(oldest)
+    assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == (before[0] + 1, *before[1:])
     latest = await call_review(review_client, **note_args(batch_id=tokens[-1]))
     assert not latest.is_error
     assert len(post_route.calls) == 1
