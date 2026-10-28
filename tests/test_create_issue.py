@@ -1,13 +1,16 @@
 """Behavioral tests for creating project issues through the in-memory MCP client ✨."""
 
 import json
+import os
 from typing import Any
 
 import httpx
 import pytest
 import respx
+from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from gitlab_mcp.app import mcp
 from gitlab_mcp.tools import issues as _issues  # noqa: F401 - importing the module registers its tool.
 from mcp_helpers import call_tool as call_mcp_tool
 
@@ -98,6 +101,141 @@ async def test_omitted_description_is_not_sent(gitlab_env, router):
     # Assert
     assert json.loads(create.calls[0].request.content) == {"title": "No description", "issue_type": "issue"}
     assert data["status"] == "created"
+
+
+async def test_empty_inline_description_is_sent(gitlab_env, router):
+    """An explicit empty description is distinct from an omitted description."""
+    # Arrange
+    mock_project(router)
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(title="Empty description", description="")
+
+    # Assert
+    assert json.loads(create.calls[0].request.content)["description"] == ""
+    assert data["status"] == "created"
+
+
+@pytest.mark.parametrize(
+    "description",
+    ["", "Details: café 🙂\n", "x" * 100000, "🙂" * 25000],
+    ids=["empty", "utf8", "ascii-byte-limit", "multibyte-byte-limit"],
+)
+async def test_description_file_is_sent_in_issue_payload(gitlab_env, router, tmp_path, description):
+    """A server-local UTF-8 file supplies the exact issue description, including at the byte limit."""
+    # Arrange
+    source = tmp_path / "description.md"
+    source.write_text(description, encoding="utf-8")
+    mock_project(router)
+    create = router.post(CREATE).mock(return_value=create_response())
+
+    # Act
+    data = await call_tool(title="File description", description_file=str(source))
+
+    # Assert
+    assert json.loads(create.calls[0].request.content) == {
+        "title": "File description",
+        "issue_type": "issue",
+        "description": description,
+    }
+    assert data["status"] == "created"
+    assert [call.request.method for call in router.calls] == ["GET", "POST"]
+
+
+async def test_validate_only_accepts_description_file_without_creating(gitlab_env, router, tmp_path):
+    """Validation accepts a local description file and never sends a write."""
+    # Arrange
+    source = tmp_path / "description.md"
+    source.write_text("Details 🙂", encoding="utf-8")
+    project = mock_project(router)
+    create = router.post(CREATE)
+
+    # Act
+    data = await call_tool(title="File description", description_file=str(source), validate_only=True)
+
+    # Assert
+    assert data == {"status": "validated", "title": "File description"}
+    assert project.call_count == 1
+    assert create.call_count == 0
+    assert [call.request.method for call in router.calls] == ["GET"]
+
+
+@pytest.mark.parametrize("validate_only", [False, True])
+@pytest.mark.parametrize(
+    "file_case",
+    [
+        ("relative", "absolute server-local path"),
+        ("missing", "Could not read description_file"),
+        ("directory", "regular file"),
+        ("fifo", "regular file"),
+        ("invalid_utf8", "not valid UTF-8"),
+        ("oversized", "100000 UTF-8 bytes"),
+        ("oversized_multibyte", "100000 UTF-8 bytes"),
+    ],
+)
+async def test_invalid_description_file_fails_before_network(gitlab_env, router, tmp_path, file_case, validate_only):
+    """Invalid local files are rejected before all GitLab requests in both modes."""
+    # Arrange
+    kind, message = file_case
+    source = tmp_path / "description.md"
+    if kind == "relative":
+        path = "description.md"
+    elif kind == "directory":
+        path = str(tmp_path)
+    else:
+        path = str(source)
+        if kind == "fifo":
+            os.mkfifo(source)
+        elif kind == "invalid_utf8":
+            source.write_bytes(b"\xff")
+        elif kind == "oversized":
+            source.write_bytes(b"x" * 100001)
+        elif kind == "oversized_multibyte":
+            source.write_text("🙂" * 25000 + "x", encoding="utf-8")
+
+    # Act and assert
+    with pytest.raises(ToolError, match=message):
+        await call_tool(title="File description", description_file=path, validate_only=validate_only)
+    assert not router.calls
+
+
+@pytest.mark.parametrize("description", ["", "Inline text"])
+@pytest.mark.parametrize("validate_only", [False, True])
+async def test_both_description_sources_are_rejected(gitlab_env, router, tmp_path, description, validate_only):
+    """Both sources are rejected, even when the inline description is empty."""
+    # Arrange
+    source = tmp_path / "description.md"
+    source.write_text("File text", encoding="utf-8")
+
+    # Act and assert
+    with pytest.raises(ToolError, match="description or description_file"):
+        await call_tool(
+            title="Two descriptions",
+            description=description,
+            description_file=str(source),
+            validate_only=validate_only,
+        )
+    assert not router.calls
+
+
+async def test_description_file_is_documented_in_tool_schema(gitlab_env):
+    """The schema describes the optional and exclusive server-local file source."""
+    # Arrange
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+
+    # Act
+    tool = next(tool for tool in tools if tool.name == "create_issue")
+    schema = tool.input_schema
+    description = schema["properties"]["description_file"]["description"]
+
+    # Assert
+    assert "description_file" not in schema["required"]
+    assert "server-local" in description
+    assert "regular" in description
+    assert "100000" in description
+    assert "description" in description
 
 
 @pytest.mark.parametrize(

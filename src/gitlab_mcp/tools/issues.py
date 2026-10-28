@@ -10,7 +10,7 @@ lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
-from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR
+from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR, read_server_local_utf8_file
 
 MAX_PROJECT_PATH_LENGTH = 1024
 MAX_ISSUE_TITLE_LENGTH = 255
@@ -35,7 +35,10 @@ IssueDescription = Annotated[
     Field(
         strict=True,
         max_length=MAX_ISSUE_DESCRIPTION_LENGTH,
-        description="Optional issue description, up to 100000 characters and 100000 UTF-8 bytes.",
+        description=(
+            "Optional issue description, up to 100000 characters and 100000 UTF-8 bytes. "
+            "Omit both sources for no description; do not set with description_file."
+        ),
     ),
 ]
 
@@ -89,6 +92,23 @@ def _validate_issue_text(title: str, description: str | None) -> None:
         raise ToolError("description must contain valid UTF-8 text.") from exc  # noqa: TRY003
     if len(description_bytes) > MAX_ISSUE_DESCRIPTION_BYTES:
         raise ToolError(f"description exceeds {MAX_ISSUE_DESCRIPTION_BYTES} UTF-8 bytes.")  # noqa: TRY003
+
+
+def _issue_description(description: str | None, description_file: str | None) -> str | None:
+    """Resolve an optional inline or server-local description before any GitLab requests."""
+    if description is not None and description_file is not None:
+        raise ToolError("Set description or description_file, not both.")  # noqa: TRY003
+    if description_file is None:
+        return description
+    try:
+        return read_server_local_utf8_file(
+            description_file,
+            path_field="description_file",
+            size_field="description_file",
+            byte_limit=MAX_ISSUE_DESCRIPTION_BYTES,
+        )
+    except (OSError, ValueError) as exc:
+        raise ToolError(f"Could not read description_file: {exc}") from exc  # noqa: TRY003
 
 
 async def _check_issue_settings(client: GitLabClient, project_path: str) -> None:
@@ -159,7 +179,7 @@ async def _post_issue(
 @mcp.tool(
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
 )
-async def create_issue(
+async def create_issue(  # noqa: PLR0913, PLR0917 - each argument is a user-facing create option.
     ctx: Context,
     project: ProjectPath,
     title: IssueTitle,
@@ -167,15 +187,28 @@ async def create_issue(
     validate_only: Annotated[
         bool, Field(description="Check local input and project issue settings without creating.")
     ] = False,
+    description_file: Annotated[
+        str | None,
+        Field(
+            strict=True,
+            description=(
+                "Optional absolute server-local regular UTF-8 file, up to 100000 bytes. "
+                "Omit both sources for no description; do not set with description."
+            ),
+        ),
+    ] = None,
 ) -> IssueCreateResult:
     """Create an ordinary project issue, like `glab issue create`, with a project-settings preflight.
 
+    Omit both description sources for no description, or set only one. A description file is read on this server, not
+    the client, and must be an absolute regular UTF-8 file no larger than 100000 bytes.
     `validate_only=True` checks local inputs and reads the project settings, but does not ask GitLab to validate the
     issue or guarantee that the token can create one. It does not check for duplicates or provide idempotency. A
     connection error, HTTP 408 or 5xx response, or malformed success response can leave the write outcome unknown.
     Check GitLab before retrying. This tool does not add labels or assignees.
     """
     project_path = _validate_project_path(project)
+    description = _issue_description(description, description_file)
     _validate_issue_text(title, description)
     client = get_client(ctx)
     await _check_issue_settings(client, project_path)
