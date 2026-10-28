@@ -1,6 +1,7 @@
 """Tests for the get_merge_request_threads tool, run through a real in-memory MCP client 🧵."""
 
 import base64
+import hashlib
 import json
 from typing import Any
 lazy from collections.abc import Callable
@@ -15,6 +16,7 @@ from gitlab_mcp import mcp
 from gitlab_mcp.common import MAX_BATCH_MERGE_REQUESTS, MAX_PAGES
 from gitlab_mcp.tools.mr_threads import (
     NOTE_CAP,
+    THREAD_BODY_BUDGET,
     THREAD_CUT_MARKER,
     THREAD_HEADING_BUDGET,
     THREAD_HEADING_CAP,
@@ -39,16 +41,18 @@ def make_position(old_path: str, new_path: str | None = None) -> dict[str, Any]:
     return {"oldPath": old_path, "newPath": new_path or old_path, "oldLine": None, "newLine": 212}
 
 
-def make_note(
+def make_note(  # noqa: PLR0913 - optional note fields keep GraphQL fixtures readable.
     body: str = "Please rename this.",
     *,
     system: bool = False,
+    note_id: int = 1,
     author: str | None = "mhayden",
     created_at: str = "2026-10-20T19:43:02Z",
     position: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one note. A null position means a general note, not a diff comment."""
     return {
+        "id": f"gid://gitlab/Note/{note_id}",
         "system": system,
         "body": body,
         "createdAt": created_at,
@@ -375,7 +379,7 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
                     "t1",
                     make_note("assigned to @mhayden", system=True, author="bot"),  # Skipped, even though it is first.
                     make_note("Rename this.", created_at="2026-10-21T08:00:00Z", position=make_position("docs/sop.md")),
-                    make_note("Done.", author="bkearney", created_at="2026-10-22T09:30:00Z"),
+                    make_note("Done.", note_id=2, author="bkearney", created_at="2026-10-22T09:30:00Z"),
                 ),
             ),
         ),
@@ -394,12 +398,125 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
                 "path": "docs/sop.md",
                 "line": 212,
                 "notes": [
-                    {"by": "mhayden", "body": "Rename this.", "at": "2026-10-21"},
-                    {"by": "bkearney", "body": "Done.", "at": "2026-10-22"},
+                    {
+                        "note_id": 1,
+                        "body_hash": hashlib.sha256(b"Rename this.").hexdigest(),
+                        "by": "mhayden",
+                        "body": "Rename this.",
+                        "at": "2026-10-21",
+                    },
+                    {
+                        "note_id": 2,
+                        "body_hash": hashlib.sha256(b"Done.").hexdigest(),
+                        "by": "bkearney",
+                        "body": "Done.",
+                        "at": "2026-10-22",
+                    },
                 ],
             },
         ],
     }
+
+
+@respx.mock
+async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env):
+    """Note and DiffNote GIDs become distinct REST IDs with hashes of the untouched UTF-8 bodies."""
+    # Arrange
+    root_body = "Résumé 🧪\n\n<!-- review-bot:finding hidden -->\n"
+    reply_body = "Reply with trailing space  "
+    root = make_note(root_body, author="alice") | {"id": "gid://gitlab/DiffNote/123"}
+    reply = make_note(reply_body, author="bob") | {"id": "gid://gitlab/Note/456"}
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", root, reply))))
+
+    # Act
+    results = [
+        await call_tool(view="full"),
+        await call_tool(view="finding"),
+        await call_tool(view="full", max_body_chars=3),
+        await call_tool(view="finding", max_body_chars=0),
+    ]
+    headings = await call_tool(view="headings")
+
+    # Assert
+    expected_hashes = [hashlib.sha256(body.encode("utf-8")).hexdigest() for body in (root_body, reply_body)]
+    for result in results:
+        notes = result["threads"][0]["notes"]
+        assert [note["note_id"] for note in notes] == [123, 456]
+        assert [note["body_hash"] for note in notes] == expected_hashes
+        assert [note["by"] for note in notes] == ["alice", "bob"]
+        assert [note["at"] for note in notes] == ["2026-10-20", "2026-10-20"]
+    assert results[0]["threads"][0]["notes"][0]["body"] == "Résumé 🧪"
+    assert results[2]["threads"][0]["notes"][0]["body"] == "Rés [truncated]"
+    assert all(note["body"] == "" for note in results[3]["threads"][0]["notes"])
+    assert "notes" not in headings["threads"][0]
+    assert route.call_count == len(results) + 1
+    assert "id system body createdAt" in json.loads(route.calls[0].request.content)["query"]
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "missing",
+        None,
+        True,
+        123,
+        "123",
+        "gid://gitlab/User/123",
+        "gid://other/Note/123",
+        "gid://gitlab/Note/0",
+        "gid://gitlab/Note/-1",
+        "gid://gitlab/Note/1/2",
+        "gid://gitlab/Note/\uff11\uff12\uff13",
+        "gid://gitlab/Note/" + "9" * 5000,
+    ],
+    ids=[
+        "missing",
+        "null",
+        "bool",
+        "integer",
+        "bare",
+        "wrong-type",
+        "wrong-host",
+        "zero",
+        "negative",
+        "extra-path",
+        "unicode-digits",
+        "too-large",
+    ],
+)
+@respx.mock
+async def test_malformed_graphql_note_ids_are_rejected(gitlab_env, bad_id):
+    """Invalid note identities never turn into plausible but wrong REST note IDs."""
+    # Arrange
+    note = make_note() | {"id": bad_id}
+    if bad_id == "missing":
+        del note["id"]
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", note))))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="invalid note ID"):
+        await call_tool()
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize("view", ["full", "finding"])
+@respx.mock
+async def test_zero_body_output_budget_accounts_for_note_metadata(gitlab_env, view):
+    """Large metadata-only pages remain bounded and resume without missing or repeating threads."""
+    # Arrange
+    discussions = [make_discussion(f"t{index}", *(make_note("content") for _ in range(25))) for index in range(12)]
+    route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
+
+    # Act
+    first = await call_tool(view=view, max_body_chars=0)
+    second = await call_tool(view=view, max_body_chars=0, cursor=first["next_cursor"])
+
+    # Assert
+    assert len(json.dumps(first["threads"], ensure_ascii=False, separators=(",", ":"))) <= THREAD_BODY_BUDGET
+    assert len(json.dumps(second["threads"], ensure_ascii=False, separators=(",", ":"))) <= THREAD_BODY_BUDGET
+    assert thread_ids(first) + thread_ids(second) == [f"t{index}" for index in range(len(discussions))]
+    assert "next_cursor" not in second
+    assert route.call_count == len((first, second))
 
 
 @pytest.mark.parametrize("view", ["full", "headings"])
@@ -870,7 +987,14 @@ async def test_null_author_and_general_note_leave_out_fields(gitlab_env):
     # Assert
     thread = data["threads"][0]
     assert set(thread) == {"id", "status", "notes"}
-    assert thread["notes"] == [{"body": "Please rename this.", "at": "2026-10-20"}]
+    assert thread["notes"] == [
+        {
+            "note_id": 1,
+            "body_hash": hashlib.sha256(b"Please rename this.").hexdigest(),
+            "body": "Please rename this.",
+            "at": "2026-10-20",
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1271,6 +1395,9 @@ async def test_finding_view_compacts_bot_greeting_and_signoff_preserving_finding
     # Assert
     assert full["threads"][0]["notes"][0]["body"] == body
     assert finding["threads"][0]["notes"][0]["body"] == expected
+    expected_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert full["threads"][0]["notes"][0]["body_hash"] == expected_hash
+    assert finding["threads"][0]["notes"][0]["body_hash"] == expected_hash
 
 
 @respx.mock
@@ -1717,8 +1844,8 @@ async def test_marker_is_removed_before_body_budget_and_cursor_accounting(gitlab
 @respx.mock
 async def test_custom_body_cap_is_used_when_resuming_budget_cursor(gitlab_env):
     """A resumed scan uses the caller's cap to budget bodies and return the remaining threads."""
-    # Arrange: each of 50 threads has 50 notes, so a cap of three allows exactly 40 threads in the first result.
-    discussions = [make_discussion(f"t{index}", *(make_note("xxxx") for _ in range(50))) for index in range(50)]
+    # Arrange: note metadata and the capped bodies together exceed the serialized output budget.
+    discussions = [make_discussion(f"t{index}", *(make_note("xxxx") for _ in range(25))) for index in range(12)]
     route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
 
     # Act
@@ -1726,8 +1853,8 @@ async def test_custom_body_cap_is_used_when_resuming_budget_cursor(gitlab_env):
     second = await call_tool(max_body_chars=3, cursor=first["next_cursor"])
 
     # Assert
-    assert thread_ids(first) == [f"t{index}" for index in range(40)]
-    assert thread_ids(second) == [f"t{index}" for index in range(40, 50)]
+    assert thread_ids(first) + thread_ids(second) == [f"t{index}" for index in range(len(discussions))]
+    assert 0 < len(first["threads"]) < len(discussions)
     assert all(note["body"] == "xxx [truncated]" for thread in second["threads"] for note in thread["notes"])
     assert not second.get("next_cursor")
     assert requested_afters(route) == [None, None]

@@ -822,7 +822,7 @@ async def _post_one_review_note(  # noqa: PLR0913, PLR0917 - each argument ident
             ),
             f"The post may have succeeded. {reason} Check GitLab before retrying.",
         )
-    return ReviewNotePostResult(index=index, status="posted", discussion_id=discussion_id), ""
+    return ReviewNotePostResult(index=index, status="posted", note_id=note_id, discussion_id=discussion_id), ""
 
 
 def _review_preflight_result(checks: list[_CheckedNote]) -> PostReviewNotesResult:
@@ -1093,9 +1093,9 @@ async def post_review_notes(  # noqa: PLR0913, PLR0917 - the user-facing argumen
     only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
     and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check every result
     before deciding what to do next.
-    Normal posted rows contain only `index`, `status`, and `discussion_id`. Failed, unknown, and unverified rows
-    include a `reason` and any available `position`. `add_reviewers` and `add_assignees` add people only after every
-    note posts, in the same call. They are ignored when `validate_only` is true.
+    Normal posted rows contain only `index`, `status`, `note_id`, and `discussion_id`. Failed, unknown, and unverified
+    rows include a `reason` and any available `position`. `add_reviewers` and `add_assignees` add people only after
+    every note posts, in the same call. They are ignored when `validate_only` is true.
     Set `compact` to true to omit verified posted rows and return their count. All other result rows and batch details
     remain unchanged.
     """

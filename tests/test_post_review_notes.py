@@ -411,6 +411,7 @@ async def test_file_level_post_sends_file_position_and_verifies_echo(gitlab_env,
         {
             "index": 0,
             "status": "posted",
+            "note_id": POSTED_NOTE_ID,
             "discussion_id": "discussion-1",
         },
     ]
@@ -502,7 +503,8 @@ async def test_validates_lines_and_derives_positions_from_added_context_removed_
     assert [item["position"] for item in sent] == expected_positions
     assert sent[-1]["body"] == "Read from the server.\n"
     assert data["results"] == [
-        {"index": index, "status": "posted", "discussion_id": "discussion-1"} for index in range(5)
+        {"index": index, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
+        for index in range(5)
     ]
     assert not raw_blob_calls()
 
@@ -763,7 +765,7 @@ async def test_http_error_stops_batch_and_preserves_earlier_posted_result(gitlab
 
     # Assert
     assert [item["status"] for item in data["results"]] == ["posted", "failed", "unattempted"]
-    assert set(data["results"][0]) == {"index", "status", "discussion_id"}
+    assert set(data["results"][0]) == {"index", "status", "note_id", "discussion_id"}
     assert data["results"][1]["position"] == {"path": "src.py", "line": 2}
     assert "GitLab rejected the post" in data["results"][1]["reason"]
     assert "bad position" in data["results"][1]["reason"]
@@ -795,7 +797,7 @@ async def test_server_http_errors_have_unknown_outcome_and_stop_batch(gitlab_env
 
     # Assert
     assert [item["status"] for item in data["results"]] == ["posted", "unknown", "unattempted"]
-    assert set(data["results"][0]) == {"index", "status", "discussion_id"}
+    assert set(data["results"][0]) == {"index", "status", "note_id", "discussion_id"}
     assert data["results"][1]["position"] == {"path": "src.py", "line": 2}
     assert "outcome is unknown" in data["results"][1]["reason"]
     assert "outcome is unknown" in data["warning"]
@@ -1132,7 +1134,12 @@ async def test_old_side_context_position_contains_both_coordinates(gitlab_env):
     position = json.loads(post_route.calls[0].request.content)["position"]
     assert position["old_line"] == OLD_CONTEXT_LINE
     assert position["new_line"] == NEW_CONTEXT_LINE
-    assert data["results"][0] == {"index": 0, "status": "posted", "discussion_id": "discussion-1"}
+    assert data["results"][0] == {
+        "index": 0,
+        "status": "posted",
+        "note_id": POSTED_NOTE_ID,
+        "discussion_id": "discussion-1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1687,7 +1694,7 @@ async def test_compact_preserves_people_write_failure(gitlab_env):
 
 @respx.mock
 async def test_general_note_posts_body_without_position_and_verifies_ids(gitlab_env):
-    """A general discussion verifies both response IDs but returns only the discussion ID."""
+    """A general discussion returns both verified response IDs."""
     # Arrange
     mr_route, diff_route = add_preflight([([], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(
@@ -1703,6 +1710,7 @@ async def test_general_note_posts_body_without_position_and_verifies_ids(gitlab_
         {
             "index": 0,
             "status": "posted",
+            "note_id": POSTED_NOTE_ID,
             "discussion_id": "general-discussion",
         }
     ]
@@ -1770,7 +1778,7 @@ async def test_mixed_general_file_and_line_notes_keep_order_and_scan_only_file_p
     def echo_general_or_position(request: httpx.Request) -> httpx.Response:
         """Return matching IDs and include a position only when the request supplied one."""
         payload = json.loads(request.content)
-        note: dict[str, Any] = {"id": POSTED_NOTE_ID}
+        note: dict[str, Any] = {"id": POSTED_NOTE_ID + len(post_route.calls)}
         if "position" in payload:
             note["position"] = payload["position"]
         return response({"id": f"discussion-{len(post_route.calls) + 1}", "notes": [note]}, status=201)
@@ -1801,7 +1809,13 @@ async def test_mixed_general_file_and_line_notes_keep_order_and_scan_only_file_p
     assert [item["index"] for item in data["results"]] == [0, 1, 2]
     assert [item["status"] for item in data["results"]] == ["posted"] * 3
     assert data["results"] == [
-        {"index": index, "status": "posted", "discussion_id": f"discussion-{index + 1}"} for index in range(3)
+        {
+            "index": index,
+            "status": "posted",
+            "note_id": POSTED_NOTE_ID + index,
+            "discussion_id": f"discussion-{index + 1}",
+        }
+        for index in range(3)
     ]
     assert len(diff_route.calls) == 1
 
@@ -1919,7 +1933,9 @@ async def test_unchanged_lines_map_before_between_and_after_hunks_on_both_sides(
     # Assert
     assert data["results"] == [{"index": 0, "status": "validated"}]
     assert data["batch_id"]
-    assert posted["results"] == [{"index": 0, "status": "posted", "discussion_id": "discussion-1"}]
+    assert posted["results"] == [
+        {"index": 0, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
+    ]
     assert json.loads(post_route.calls[0].request.content)["position"] == {
         "position_type": "text",
         "old_path": "src.py",
@@ -1961,7 +1977,12 @@ async def test_posted_unchanged_line_uses_resolved_coordinates_and_immutable_ref
         "start_sha": START_SHA,
         "head_sha": HEAD,
     }
-    assert data["results"][0] == {"index": 0, "status": "posted", "discussion_id": "discussion-1"}
+    assert data["results"][0] == {
+        "index": 0,
+        "status": "posted",
+        "note_id": POSTED_NOTE_ID,
+        "discussion_id": "discussion-1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1997,7 +2018,9 @@ async def test_zero_count_hunks_preserve_insertion_and_deletion_boundaries(
     # Assert
     assert data["results"] == [{"index": 0, "status": "validated"}]
     assert data["batch_id"]
-    assert posted["results"] == [{"index": 0, "status": "posted", "discussion_id": "discussion-1"}]
+    assert posted["results"] == [
+        {"index": 0, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
+    ]
     assert json.loads(post_route.calls[0].request.content)["position"] == {
         "position_type": "text",
         "old_path": "src.py",
@@ -2202,7 +2225,9 @@ async def test_rename_uses_old_and_new_paths_and_base_head_refs(gitlab_env):
     # Assert
     assert data["results"] == [{"index": 0, "status": "validated"}]
     assert data["batch_id"]
-    assert posted["results"] == [{"index": 0, "status": "posted", "discussion_id": "discussion-1"}]
+    assert posted["results"] == [
+        {"index": 0, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
+    ]
     assert json.loads(post_route.calls[0].request.content)["position"] == {
         "position_type": "text",
         "old_path": old_path,
