@@ -1830,3 +1830,76 @@ async def test_graphql_errors_are_reported(gitlab_env):
     # Act / Assert
     with pytest.raises(ToolError, match="GitLab GraphQL error: Query is too complex"):
         await call_tool()
+
+
+SECTIONED_DESCRIPTION = (
+    "Intro\n\n## Summary\n\nShort summary.\n\n## Scope\n\nTwo files.\n\n```md\n## Not a heading\n```\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("description", "arguments", "expected"),
+    [
+        pytest.param(SECTIONED_DESCRIPTION, {"headings_only": True}, {"headings": ["Summary", "Scope"]}, id="headings"),
+        pytest.param("No headings here.", {"headings_only": True}, {"headings": []}, id="no-headings"),
+        pytest.param(
+            SECTIONED_DESCRIPTION,
+            {"section": "scope"},
+            {"description": "Two files.\n\n```md\n## Not a heading\n```"},
+            id="one-section",
+        ),
+        pytest.param(
+            SECTIONED_DESCRIPTION,
+            {"section": ["Summary", "Scope"], "description_limit": 20},
+            {
+                "sections": [
+                    {"heading": "Summary", "content": "Short summary."},
+                    {"heading": "Scope", "content": "Two fi", "truncated": True},
+                ]
+            },
+            id="section-list-shares-limit",
+        ),
+    ],
+)
+@respx.mock
+async def test_focused_description_reads_return_only_requested_parts(gitlab_env, description, arguments, expected):
+    """headings_only and section return only the requested parts, matched like work item sections."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, **arguments)
+
+    # Assert
+    focused_fields = {"description", "description_truncated", "next_description_offset", "headings", "sections"}
+    assert {key: value for key, value in data.items() if key in focused_fields} == expected
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message", "reaches_gitlab"),
+    [
+        pytest.param(
+            {"include_description": True, "section": "Missing"},
+            "Available headings: 'Summary', 'Scope'",
+            True,
+            id="no-match",
+        ),
+        pytest.param(
+            {"include_description": True, "section": "Scope", "description_offset": 5},
+            "read the whole description",
+            False,
+            id="continuation-page",
+        ),
+        pytest.param({"headings_only": True}, "require include_description=true", False, id="no-description"),
+    ],
+)
+@respx.mock
+async def test_focused_description_errors_are_clear(gitlab_env, arguments, message, reaches_gitlab):
+    """Bad focused reads fail with an actionable message, and option errors fail before any request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=SECTIONED_DESCRIPTION)))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=re.escape(message)):
+        await call_tool(**arguments)
+    assert route.called is reaches_gitlab
