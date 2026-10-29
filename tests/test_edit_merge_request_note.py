@@ -730,7 +730,14 @@ async def test_read_then_edit_uses_hash_of_raw_body_not_transformed_preview(gitl
     # Act
     threads = await call_tool(
         "get_merge_request_threads",
-        {"project": "group/project", "iid": 42, "view": "full", "include_mr_status": False, "max_body_chars": 16},
+        {
+            "project": "group/project",
+            "iid": 42,
+            "view": "full",
+            "include_mr_status": False,
+            "max_body_chars": 16,
+            "include_hashes": True,
+        },
     )
     thread = threads["threads"][0]
     discovered = thread["notes"][0]
