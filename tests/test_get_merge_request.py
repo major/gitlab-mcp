@@ -1359,12 +1359,16 @@ async def test_issue_keys_deduplicate_in_source_order_before_description_truncat
             ["JIRA-42", "JIRA-43"],
         ),
         ("Fix JIRA-42.", "", {}, ["JIRA-42"]),
+        (
+            "ALAS-2026-1234, DSA-5432-1, RHSA-2026:1234",
+            "PROJ-3880 fixes ABC-2026-0501 and CVE-2022-41946. See PROJ-3445.",
+            {"include_description": True},
+            ["PROJ-3880", "PROJ-3445"],
+        ),
         ("CVE-123 and CVE-2024", "", {}, ["CVE-123", "CVE-2024"]),
         ("CVE-2024-12345 and CVE-2024", "", {}, ["CVE-2024"]),
         ("CVE-2024 and CVE-2024-12345", "", {}, ["CVE-2024"]),
-        ("CVE-123-456 and JIRA-123-456", "", {}, ["CVE-123", "JIRA-123"]),
-        ("CVE-20240-123 and CVE-2024-abc", "", {}, ["CVE-20240", "CVE-2024"]),
-        ("CVE-2024-123abc", "", {}, ["CVE-2024"]),
+        ("CVE-2024-abc and JIRA-7-123abc", "", {}, ["CVE-2024", "JIRA-7"]),
         (
             "CVE-2024-12345 and JIRA-42",
             "CVE-2023-9876",
@@ -1379,11 +1383,10 @@ async def test_issue_keys_deduplicate_in_source_order_before_description_truncat
         "cve-in-description",
         "jira-keys-next-to-cves",
         "jira-at-sentence-end",
+        "advisory-ids-next-to-jira-keys",
         "bare-cve-keys",
         "full-cve-before-bare-key",
         "bare-key-before-full-cve",
-        "other-hyphenated-keys",
-        "non-cve-year-or-suffix",
         "suffix-with-letters",
         "explicit-cve-prefix",
         "custom-partial-cve-pattern",
@@ -1391,8 +1394,8 @@ async def test_issue_keys_deduplicate_in_source_order_before_description_truncat
     ],
 )
 @respx.mock
-async def test_issue_key_extraction_handles_cve_identifiers(gitlab_env, title, description, arguments, expected):
-    """Default extraction skips full CVEs while preserving caller-selected issue key behavior."""
+async def test_issue_key_extraction_skips_advisory_ids(gitlab_env, title, description, arguments, expected):
+    """Default extraction skips advisory IDs while preserving caller-selected issue key behavior."""
     # Arrange
     node = make_mr(title=title, description=description)
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))

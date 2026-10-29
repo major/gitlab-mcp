@@ -164,7 +164,8 @@ DESCRIPTION_CAP = 4000
 ISSUE_KEY_CAP = 100
 ISSUE_KEY_PREFIX_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
 ISSUE_KEY_PATTERN = re.compile(r"\b([A-Z][A-Z0-9_]{0,31}-[0-9]+)\b")
-CVE_SUFFIX_PATTERN = re.compile(r"-[0-9]+\b")
+# Advisory IDs like CVE-2024-1, DSA-5432-1, and RHSA-2026:1234 continue past a key-shaped prefix. 🛡️
+ID_CONTINUATION_PATTERN = re.compile(r"[-:][0-9]+\b")
 # Caller-authored regexes have bounded scans and matches. The timeout limits matching, not pattern compilation.
 ISSUE_KEY_SCAN_CAP = 65_536
 ISSUE_KEY_MAX_LENGTH = 256
@@ -744,8 +745,8 @@ def _extract_issue_keys(
     seen: set[str] = set()
     for match in ISSUE_KEY_PATTERN.finditer(text):
         key = match[1]
-        # Skip the year portion of a full CVE only for default extraction.
-        if prefixes is None and re.fullmatch(r"CVE-[0-9]{4}", key) and CVE_SUFFIX_PATTERN.match(text, match.end()):
+        # Skip the first half of an advisory ID only for default extraction. Explicit prefixes keep every match.
+        if prefixes is None and ID_CONTINUATION_PATTERN.match(text, match.end()):
             continue
         if prefixes is not None and not any(key.startswith(f"{prefix}-") for prefix in prefixes):
             continue
@@ -1168,9 +1169,10 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       SHA means the pipeline is stale. A missing SHA means the tested commit is unknown; a missing pipeline may not
       have been created yet.
     - `issue_keys` lists unique uppercase-prefix-number keys from the title on the first page and from the raw
-      description when included, up to 100. By default, partial matches from full CVE identifiers are skipped.
-      `issue_key_prefixes` filters by literal prefixes, not regular expressions, and keeps matching CVE partials. Set
-      `issue_key_pattern` to replace that extraction with a caller-authored regex; it cannot be combined with prefixes.
+      description when included, up to 100. By default, a match followed by `-<digits>` or `:<digits>` is skipped,
+      so advisory IDs like `CVE-2024-1`, `DSA-5432-1`, and `RHSA-2026:1234` add no key. `issue_key_prefixes`
+      filters by literal prefixes, not regular expressions, and keeps those partials. Set `issue_key_pattern` to
+      replace that extraction with a caller-authored regex; it cannot be combined with prefixes.
       Custom patterns return full matches, preserve case, and use a bounded scan with a matching timeout.
       `issue_keys_truncated=true` means a result, scan, or match-length limit excluded content.
     - `description_limit` controls description length when the description is included. Zero skips it; the default is
