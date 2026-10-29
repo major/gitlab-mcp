@@ -144,10 +144,16 @@ class PeopleResult(BaseModel):
 
 
 class PostReviewNotesResult(BaseModel):
-    """One bounded result per requested note and a reason when the batch stops."""
+    """The reply for one review-note call: rows only for notes that need attention, plus counts and IDs.
 
-    results: list[ReviewNotePostResult]
+    Internal code fills `results` with one row per note. `_lean_review_result` shapes the reply once, at the end.
+    """
+
+    results: list[ReviewNotePostResult] = Field(default_factory=list, exclude_if=lambda value: not value)
+    unattempted: list[int] = Field(default_factory=list, exclude_if=lambda value: not value)
+    validated_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
     posted_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    note_ids: list[int] = Field(default_factory=list, exclude_if=lambda value: not value)
     warning: str = Field(default="", exclude_if=lambda value: not value)
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -157,15 +163,27 @@ class PostReviewNotesResult(BaseModel):
         description="Upper bound in seconds until a validated batch expires; use, eviction, or restart may shorten it.",
         exclude_if=lambda value: value is None,
     )
-    hint: str = Field(default="", exclude_if=lambda value: not value)  # Next-step guidance after a validated batch.
     batch_error: Literal["unavailable"] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
-def _compact_review_result(result: PostReviewNotesResult) -> PostReviewNotesResult:
-    """Count verified posts and omit only their rows from the returned batch."""
-    posted_count = sum(row.status == "posted" for row in result.results)
-    remaining_results = [row for row in result.results if row.status != "posted"]
-    return result.model_copy(update={"results": remaining_results, "posted_count": posted_count})
+def _lean_review_result(result: PostReviewNotesResult, *, validate_only: bool) -> PostReviewNotesResult:
+    """Keep rows for notes that need attention, and turn the other outcomes into counts, IDs, and indices.
+
+    Run this last, after index remapping and people changes, so those steps still see every row. 🧹
+    Validation always reports `validated_count`, even zero. A posting call reports it only when a preflight block
+    left some notes validated, and always reports `posted_count`, even zero.
+    """
+    validated_count = sum(row.status == "validated" for row in result.results)
+    posted_rows = [row for row in result.results if row.status == "posted"]
+    return result.model_copy(
+        update={
+            "results": [row for row in result.results if row.status in ("failed", "unknown", "unverified")],
+            "unattempted": [row.index for row in result.results if row.status == "unattempted"],
+            "validated_count": validated_count if validate_only or validated_count else None,
+            "posted_count": None if validate_only else len(posted_rows),
+            "note_ids": [row.note_id for row in posted_rows if row.note_id is not None],
+        }
+    )
 
 
 def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int, head_sha: str) -> CachedReviewBatch:
@@ -1050,17 +1068,7 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
             )
             cache = get_review_batch_cache(ctx)
             batch_id = cache.put(project, iid, refs["head_sha"], cached_notes)
-            result = result.model_copy(
-                update={
-                    "batch_id": batch_id,
-                    "ttl_seconds": cache.TTL_SECONDS,
-                    "hint": (
-                        "Post all notes with this batch_id, a subset with indices, or edited text with "
-                        "body_overrides. No new validation is needed."
-                    ),
-                    "results": [row.model_copy(update={"position": {}}) for row in result.results],
-                }
-            )
+            result = result.model_copy(update={"batch_id": batch_id, "ttl_seconds": cache.TTL_SECONDS})
         return result
     return await _post_review_note_batch(client, project, iid, checks, refs)
 
@@ -1147,11 +1155,7 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     ] = None,
     validate_only: Annotated[
         bool,
-        Field(description="Run all preflight checks and return positions without posting any notes."),
-    ] = False,
-    compact: Annotated[
-        bool,
-        Field(description="Omit verified posted rows and return their count, while keeping all other outcomes."),
+        Field(description="Run all checks without posting. Counts validated notes and returns a batch_id if all pass."),
     ] = False,
     batch_id: Annotated[
         str | None,
@@ -1220,9 +1224,9 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     changed final text to the user and obtain explicit `APPROVE` before posting. The warning states whether the
     supplied head is current, stale, or unknown; even a current head cannot recover the cached notes or positions.
     `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
-    Each note is checked on its own. If any note fails, nothing is posted: every note returns a row, with `validated`
-    for notes that passed and `failed` plus a `reason` for notes that did not. A batch-wide problem, such as a stale
-    `head_sha`, returns `unattempted` for every note and a `warning`.
+    Each note is checked on its own. If any note fails, nothing is posted. `results` lists each failed note with a
+    `reason`, and `validated_count` counts the notes that passed. A batch-wide problem, such as a stale `head_sha`,
+    lists every note index in `unattempted` and adds a `warning`.
     A file-level note needs only the file's path in the diff, so it works for findings outside diff hunks and for
     collapsed or too-large diffs. General notes do not read diff pages, but still check the merge request head twice.
     A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
@@ -1231,11 +1235,13 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     preflight only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are
     sequential and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check
     every result before deciding what to do next.
-    Normal posted rows contain only `index`, `status`, `note_id`, and `discussion_id`. Failed, unknown, and unverified
-    rows include a `reason` and any available `position`. `add_reviewers` and `add_assignees` add people only after
-    every note posts, in the same call. They are ignored when `validate_only` is true.
-    Set `compact` to true to omit verified posted rows and return their count. All other result rows and batch details
-    remain unchanged.
+    Posted notes are not listed in `results`. `posted_count` counts them, and `note_ids[k]` is the ID of the k-th posted
+    note in posting order: the selected `indices` order, then `extra_notes`. Failed, unknown, and unverified rows in
+    `results` include a `reason` and any available `position`. Unverified rows may also include `note_id` and
+    `discussion_id`. `unattempted` lists the indices of notes that were not tried, after a stop or a batch-wide
+    problem. Thread and discussion IDs for `reply_to_thread` come from `get_merge_request_threads`.
+    `add_reviewers` and `add_assignees` add people only after every note posts, in the same call. They are ignored
+    when `validate_only` is true.
     """
     if (notes is None) == (batch_id is None):
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
@@ -1258,7 +1264,7 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
             cached_batch = _claim_review_batch(ctx, batch_id, project, iid, head_sha)
         except ReviewBatchUnavailableError:
             result = await _unavailable_review_batch(ctx, project, iid, head_sha)
-            return _compact_review_result(result) if compact else result
+            return _lean_review_result(result, validate_only=validate_only)
         cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
         notes, selected_indices = _select_review_notes(cached_notes, indices)
         notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
@@ -1273,6 +1279,4 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     )
     if not validate_only:
         result = await _add_people_after_posts(ctx, project, iid, result, add_reviewers, add_assignees)
-    if compact:
-        result = _compact_review_result(result)
-    return result
+    return _lean_review_result(result, validate_only=validate_only)

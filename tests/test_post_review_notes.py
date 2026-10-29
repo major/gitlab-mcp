@@ -24,6 +24,7 @@ POSTED_NOTE_ID = 101
 RESPONSE_NOTE_ID = 909
 MISMATCHED_LINE = 99
 TWO_POSTS = 2
+THREE_POSTS = 3
 FOUR_PREFLIGHT_REQUESTS = 4
 THREE_PAGES = 3
 REASON_CAP = 200
@@ -218,13 +219,11 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
     data = await call_tool(notes=notes, validate_only=True)
 
     # Assert
-    assert data["results"] == [
-        {"index": 0, "status": "validated"},
-        {"index": 1, "status": "validated"},
-    ]
+    assert data["validated_count"] == TWO_POSTS
     assert data["batch_id"]
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
-    assert "expires_at" not in data
+    assert "results" not in data
+    assert "hint" not in data
     assert "warning" not in data
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -243,7 +242,7 @@ async def test_validate_only_stale_head_sha_remains_unattempted_without_posting(
     data = await call_tool(notes=[review_note("src.py", 1)], head_sha="d" * 40, validate_only=True)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "stale" in data["warning"]
     assert "ttl_seconds" not in data
     assert "batch_id" not in data
@@ -271,7 +270,6 @@ async def test_every_bad_note_is_reported_and_no_note_is_posted(gitlab_env, vali
 
     # Assert
     assert data["results"] == [
-        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}},
         {
             "index": 1,
             "status": "failed",
@@ -289,6 +287,7 @@ async def test_every_bad_note_is_reported_and_no_note_is_posted(gitlab_env, vali
             ),
         },
     ]
+    assert data["validated_count"] == 1
     assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -327,8 +326,9 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
                 "GitLab returned HTTP 404. Nearest new-side diff lines: 1."
             ),
         },
-        {"index": 2, "status": "validated", "position": {"path": "src.py", "line": 1}},
     ]
+    assert data["validated_count"] == 1
+    assert data["posted_count"] == 0
     assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -349,7 +349,7 @@ async def test_file_level_note_is_validated_from_its_path_alone(gitlab_env):
     )
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
     assert "warning" not in data
     assert len(diff_route.calls) == 1
@@ -376,7 +376,7 @@ async def test_file_level_note_ignores_patch_usability(gitlab_env, file_diff):
     data = await call_tool(notes=[{"file": "src.py", "body": "File finding."}], validate_only=True)
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["validated"]
+    assert data["validated_count"] == 1
     assert not post_route.called
 
 
@@ -412,15 +412,8 @@ async def test_file_level_post_sends_file_position_and_verifies_echo(gitlab_env,
         "start_sha": START_SHA,
         "head_sha": HEAD,
     }
-    assert data["results"] == [
-        {
-            "index": 0,
-            "status": "posted",
-            "note_id": POSTED_NOTE_ID,
-            "discussion_id": "discussion-1",
-        },
-    ]
-    assert "posted_count" not in data
+    assert data["note_ids"] == [POSTED_NOTE_ID]
+    assert data["posted_count"] == 1
     assert len(post_route.calls) == 1
 
 
@@ -507,10 +500,9 @@ async def test_validates_lines_and_derives_positions_from_added_context_removed_
     sent = [json.loads(call.request.content) for call in post_route.calls]
     assert [item["position"] for item in sent] == expected_positions
     assert sent[-1]["body"] == "Read from the server.\n"
-    assert data["results"] == [
-        {"index": index, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
-        for index in range(5)
-    ]
+    assert "results" not in data
+    assert data["note_ids"] == [POSTED_NOTE_ID] * len(notes)
+    assert data["posted_count"] == len(notes)
     assert not raw_blob_calls()
 
 
@@ -531,8 +523,10 @@ async def test_missing_body_file_fails_only_its_note_and_posts_nothing(gitlab_en
     data = await call_tool(notes=notes)
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["validated", "failed"]
-    assert data["results"][1]["reason"].startswith("body_path could not be read: ")
+    assert data["results"][0]["index"] == 1
+    assert data["results"][0]["status"] == "failed"
+    assert data["results"][0]["reason"].startswith("body_path could not be read: ")
+    assert data["validated_count"] == 1
     assert data["warning"] == "1 of 2 notes failed preflight. No notes were posted."
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -559,7 +553,7 @@ async def test_body_dir_resolves_relative_paths_and_keeps_absolute_paths(gitlab_
     data = await call_tool(notes=notes, body_dir=str(notes_dir))
 
     # Assert
-    assert [row["status"] for row in data["results"]] == ["posted", "posted"]
+    assert data["posted_count"] == TWO_POSTS
     assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["relative body", "absolute body"]
 
 
@@ -593,7 +587,8 @@ async def test_stale_head_sha_stops_before_diff_scan_or_post(gitlab_env):
     data = await call_tool(notes=[review_note("src.py", 1)], head_sha="d" * 40)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
+    assert data["posted_count"] == 0
     assert "stale" in data["warning"]
     assert data["current_head_sha"] == HEAD
     assert len(mr_route.calls) == 1
@@ -617,10 +612,7 @@ async def test_stale_head_sha_reports_source_sha_when_diff_head_differs(gitlab_e
     data = await call_tool(notes=notes, head_sha=HEAD)
 
     # Assert
-    assert data["results"] == [
-        {"index": 0, "status": "unattempted"},
-        {"index": 1, "status": "unattempted"},
-    ]
+    assert data["unattempted"] == [0, 1]
     assert data["current_head_sha"] == source_sha
     assert len(mr_route.calls) == 1
     assert not diff_route.called
@@ -643,7 +635,7 @@ async def test_rechecks_diff_refs_after_scan_before_first_post(gitlab_env):
 
     # Assert
     assert len(mr_route.calls) == TWO_POSTS
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "changed during preflight" in data["warning"]
     assert not post_route.called
 
@@ -665,7 +657,7 @@ async def test_diff_scan_checks_all_pages_to_confirm_path_is_unique(gitlab_env):
     found = await call_tool(notes=[review_note("wanted.py", 1)])
 
     # Assert
-    assert [item["status"] for item in found["results"]] == ["posted"]
+    assert found["note_ids"] == [POSTED_NOTE_ID]
     assert len(diff_route.calls) == THREE_PAGES
     assert len(mr_route.calls) == TWO_POSTS
     assert len(first_post.calls) == 1
@@ -740,7 +732,7 @@ async def test_matching_path_at_page_cap_is_rejected_when_more_pages_remain(gitl
     data = await call_tool(notes=[review_note("wanted.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "incomplete" in data["warning"]
     assert len(diff_route.calls) == MAX_PAGES
     assert len(mr_route.calls) == 1
@@ -787,18 +779,22 @@ async def test_http_error_stops_batch_and_preserves_earlier_posted_result(gitlab
         return create_response(request)
 
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=reject_second_post)
+    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
     notes = [review_note("src.py", line, f"Note {line}") for line in (1, 2, 3)]
 
     # Act
-    data = await call_tool(notes=notes)
+    data = await call_tool(notes=notes, add_reviewers=["alice"])
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["posted", "failed", "unattempted"]
-    assert set(data["results"][0]) == {"index", "status", "note_id", "discussion_id"}
-    assert data["results"][1]["position"] == {"path": "src.py", "line": 2}
-    assert "GitLab rejected the post" in data["results"][1]["reason"]
-    assert "bad position" in data["results"][1]["reason"]
-    assert "note index 1" in data["warning"]
+    assert data["results"][0]["index"] == 1
+    assert data["results"][0]["status"] == "failed"
+    assert data["results"][0]["position"] == {"path": "src.py", "line": 2}
+    assert "GitLab rejected the post" in data["results"][0]["reason"]
+    assert "bad position" in data["results"][0]["reason"]
+    assert data["note_ids"] == [POSTED_NOTE_ID]
+    assert data["unattempted"] == [2]
+    assert data["warning"].endswith("Reviewers and assignees were not changed because not every note posted.")
+    assert not graphql_route.called
     assert len(post_route.calls) == TWO_POSTS
 
 
@@ -825,10 +821,12 @@ async def test_server_http_errors_have_unknown_outcome_and_stop_batch(gitlab_env
     data = await call_tool(notes=notes)
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["posted", "unknown", "unattempted"]
-    assert set(data["results"][0]) == {"index", "status", "note_id", "discussion_id"}
-    assert data["results"][1]["position"] == {"path": "src.py", "line": 2}
-    assert "outcome is unknown" in data["results"][1]["reason"]
+    assert data["results"][0]["index"] == 1
+    assert data["results"][0]["status"] == "unknown"
+    assert data["results"][0]["position"] == {"path": "src.py", "line": 2}
+    assert "outcome is unknown" in data["results"][0]["reason"]
+    assert data["note_ids"] == [POSTED_NOTE_ID]
+    assert data["unattempted"] == [2]
     assert "outcome is unknown" in data["warning"]
     assert "rejected" not in data["warning"]
     assert len(post_route.calls) == TWO_POSTS
@@ -856,9 +854,12 @@ async def test_transport_error_is_unknown_and_later_notes_are_not_attempted(gitl
     data = await call_tool(notes=notes)
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["posted", "unknown", "unattempted"]
-    assert data["results"][1]["position"] == {"path": "src.py", "line": 2}
-    assert "outcome is unknown" in data["results"][1]["reason"]
+    assert data["results"][0]["index"] == 1
+    assert data["results"][0]["status"] == "unknown"
+    assert data["results"][0]["position"] == {"path": "src.py", "line": 2}
+    assert "outcome is unknown" in data["results"][0]["reason"]
+    assert data["note_ids"] == [POSTED_NOTE_ID]
+    assert data["unattempted"] == [2]
     assert "outcome is unknown" in data["warning"]
     assert len(post_route.calls) == TWO_POSTS
 
@@ -967,7 +968,7 @@ async def test_invalid_head_sha_returns_unattempted_without_requests(gitlab_env,
     data = await call_tool(notes=[review_note("src.py", 1)], head_sha=head_sha)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "full 40-character" in data["warning"]
     assert not mr_route.called
     assert not post_route.called
@@ -1066,7 +1067,7 @@ async def test_missing_refs_or_malformed_merge_request_stops_preflight(gitlab_en
     data = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "preflight failed" in data["warning"]
     assert len(mr_route.calls) == 1
     assert not diff_route.called
@@ -1180,12 +1181,7 @@ async def test_old_side_context_position_contains_both_coordinates(gitlab_env):
     position = json.loads(post_route.calls[0].request.content)["position"]
     assert position["old_line"] == OLD_CONTEXT_LINE
     assert position["new_line"] == NEW_CONTEXT_LINE
-    assert data["results"][0] == {
-        "index": 0,
-        "status": "posted",
-        "note_id": POSTED_NOTE_ID,
-        "discussion_id": "discussion-1",
-    }
+    assert data["note_ids"] == [POSTED_NOTE_ID]
 
 
 @pytest.mark.parametrize(
@@ -1222,7 +1218,7 @@ async def test_added_line_content_delimiters_do_not_change_diff_line_parsing(git
     position = json.loads(post_route.calls[0].request.content)["position"]
     assert position["new_line"] == 1
     assert position["old_line"] is None
-    assert data["results"][0]["status"] == "posted"
+    assert data["posted_count"] == 1
 
 
 @respx.mock
@@ -1276,7 +1272,8 @@ async def test_malformed_success_response_is_unverified_and_stops_batch(gitlab_e
     data = await call_tool(notes=[review_note("src.py", 1), review_note("src.py", 2)])
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["unverified", "unattempted"]
+    assert data["results"][0]["status"] == "unverified"
+    assert data["unattempted"] == [1]
     assert "note index 0" in data["warning"]
     assert len(post_route.calls) == 1
 
@@ -1324,7 +1321,7 @@ async def test_preflight_http_error_stops_without_posting(gitlab_env, failed_end
     data = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "preflight failed" in data["warning"]
     assert mr_route.called
     if failed_endpoint == "merge-request":
@@ -1347,7 +1344,7 @@ async def test_missing_gitlab_configuration_stops_before_requests(monkeypatch):
     data = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert "setup failed" in data["warning"]
     assert not mr_route.called
     assert not post_route.called
@@ -1366,7 +1363,7 @@ async def test_people_change_after_every_note_posts_in_gitlab_spelling(gitlab_en
     data = await call_tool(notes=notes, add_reviewers=["Alice"], add_assignees=["bob"])
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["posted", "posted"]
+    assert data["posted_count"] == TWO_POSTS
     assert data["people"] == {"applied": ["add_reviewers", "add_assignees"]}
     assert "warning" not in data
     assert graphql_variables(graphql_route, "mergeRequestSetReviewers") == [
@@ -1452,7 +1449,7 @@ async def test_connection_error_on_a_people_write_is_unknown(gitlab_env):
     data = await call_tool(notes=[review_note("src.py", 1)], add_reviewers=["alice"])
 
     # Assert
-    assert data["results"][0]["status"] == "posted"
+    assert data["posted_count"] == 1
     assert data["people"] == {"applied": [], "unknown": ["add_reviewers"]}
 
 
@@ -1473,7 +1470,7 @@ async def test_gitlab_error_on_a_people_write_is_failed_with_its_reason(gitlab_e
     data = await call_tool(notes=[review_note("src.py", 1)], add_reviewers=["alice"])
 
     # Assert
-    assert data["results"][0]["status"] == "posted"
+    assert data["posted_count"] == 1
     assert data["people"]["applied"] == []
     assert "HTTP 500" in data["people"]["failed"]["add_reviewers"]
 
@@ -1495,7 +1492,7 @@ async def test_validate_only_ignores_people_and_sends_no_people_requests(gitlab_
     )
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
     assert "people" not in data
     assert "warning" not in data
@@ -1514,15 +1511,15 @@ async def test_general_note_validation_skips_diff_scan(gitlab_env):
     data = await call_tool(notes=[{"body": "A general review comment."}], validate_only=True)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert len(mr_route.calls) == TWO_POSTS
     assert not diff_route.called
     assert not post_route.called
 
 
 @respx.mock
-async def test_compact_success_counts_posted_notes_after_people_changes(gitlab_env):
-    """Compact output removes posted rows only after reviewer changes use the full result."""
+async def test_post_all_pass_reports_counts_and_note_ids_after_people_changes(gitlab_env):
+    """When every note posts, the reply has counts and note IDs, and reviewer changes still see every row."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -1531,12 +1528,11 @@ async def test_compact_success_counts_posted_notes_after_people_changes(gitlab_e
     # Act
     data = await call_tool(
         notes=[{"file": "src.py", "body": "Review this file."}],
-        compact=True,
         add_reviewers=["Alice"],
     )
 
     # Assert
-    assert data == {"results": [], "posted_count": 1, "people": {"applied": ["add_reviewers"]}}
+    assert data == {"posted_count": 1, "note_ids": [POSTED_NOTE_ID], "people": {"applied": ["add_reviewers"]}}
     assert len(post_route.calls) == 1
     assert json.loads(post_route.calls[0].request.content) == {
         "body": "Review this file.",
@@ -1555,70 +1551,10 @@ async def test_compact_success_counts_posted_notes_after_people_changes(gitlab_e
     ]
 
 
-@respx.mock
-async def test_compact_mixed_failure_keeps_failure_and_unattempted_rows(gitlab_env):
-    """A rejected note keeps failure details and later unattempted rows, while posted rows are counted."""
-    # Arrange
-    add_preflight([([diff_file("src.py")], None)])
-    post_count = 0
-
-    def reject_second_post(request: httpx.Request) -> httpx.Response:
-        """Create the first note, then reject the second request."""
-        nonlocal post_count
-        post_count += 1
-        if post_count == TWO_POSTS:
-            return response({"message": "bad position"}, status=422)
-        return create_response(request)
-
-    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=reject_second_post)
-    graphql_route = respx.post(GRAPHQL).mock(side_effect=serve_people)
-    notes = [{"file": "src.py", "body": f"Review {index}."} for index in range(3)]
-
-    # Act
-    data = await call_tool(notes=notes, compact=True, add_reviewers=["alice"])
-
-    # Assert
-    assert [item["status"] for item in data["results"]] == ["failed", "unattempted"]
-    assert [item["index"] for item in data["results"]] == [1, 2]
-    assert data["posted_count"] == 1
-    assert "note index 1" in data["warning"]
-    assert data["warning"].endswith("Reviewers and assignees were not changed because not every note posted.")
-    assert len(post_route.calls) == TWO_POSTS
-    assert not graphql_route.called
-
-
-@respx.mock
-async def test_compact_preflight_keeps_validated_and_failed_details(gitlab_env):
-    """A preflight failure preserves both its reason and the validated row, with no posts counted."""
-    # Arrange
-    add_preflight([([diff_file("src.py")], None)])
-    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
-    notes = [review_note("src.py", 1), review_note("missing.py", 1)]
-
-    # Act
-    data = await call_tool(notes=notes, compact=True)
-
-    # Assert
-    assert data["results"] == [
-        {"index": 0, "status": "validated", "position": {"path": "src.py", "line": 1}},
-        {
-            "index": 1,
-            "status": "failed",
-            "reason": (
-                f"Diff preflight could not find 'missing.py' within {MAX_PAGES} pages. "
-                "Nearest line hints are unavailable; use a file-level note."
-            ),
-        },
-    ]
-    assert data["posted_count"] == 0
-    assert data["warning"] == "1 of 2 notes failed preflight. No notes were posted."
-    assert not post_route.called
-
-
 @pytest.mark.parametrize("outcome", ["unknown", "unverified"], ids=["unknown", "unverified"])
 @respx.mock
-async def test_compact_preserves_unknown_or_unverified_and_unattempted_rows(gitlab_env, outcome):
-    """Uncertain outcomes and later unattempted rows remain visible in compact mode."""
+async def test_uncertain_outcome_stops_batch_and_lists_later_notes_as_unattempted(gitlab_env, outcome):
+    """An unknown or unverified note stays in results, and later notes appear only as unattempted indices."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)])
 
@@ -1634,10 +1570,11 @@ async def test_compact_preserves_unknown_or_unverified_and_unattempted_rows(gitl
     notes = [{"file": "src.py", "body": f"Review {index}."} for index in range(2)]
 
     # Act
-    data = await call_tool(notes=notes, compact=True)
+    data = await call_tool(notes=notes)
 
     # Assert
-    assert [item["status"] for item in data["results"]] == [outcome, "unattempted"]
+    assert [item["status"] for item in data["results"]] == [outcome]
+    assert data["unattempted"] == [1]
     uncertain = data["results"][0]
     assert uncertain["position"] == (
         {"path": "src.py"} if outcome == "unknown" else {"path": "src.py", "line": MISMATCHED_LINE}
@@ -1649,31 +1586,8 @@ async def test_compact_preserves_unknown_or_unverified_and_unattempted_rows(gitl
 
 
 @respx.mock
-async def test_compact_stale_sha_keeps_current_head_and_unattempted_results(gitlab_env):
-    """Compaction does not remove stale-SHA details or unattempted note rows."""
-    # Arrange
-    mr_route, diff_route = add_preflight(
-        [([diff_file("src.py")], None)],
-        merge_requests=[merge_request()],
-    )
-    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
-
-    # Act
-    data = await call_tool(notes=[review_note("src.py", 1)], head_sha="d" * 40, compact=True)
-
-    # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
-    assert data["posted_count"] == 0
-    assert data["current_head_sha"] == HEAD
-    assert "stale" in data["warning"]
-    assert len(mr_route.calls) == 1
-    assert not diff_route.called
-    assert not post_route.called
-
-
-@respx.mock
-async def test_compact_validation_keeps_batch_id_and_reposting_counts_success(gitlab_env):
-    """Validation keeps all rows and its batch handle, then compact posting returns the count."""
+async def test_validated_batch_reposting_reports_counts_and_note_ids(gitlab_env):
+    """Validation returns a batch handle and a count, then posting the handle returns posted_count and note_ids."""
     # Arrange
     mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
     diff_route = respx.get(DIFF_URL).mock(return_value=response([diff_file("src.py")]))
@@ -1690,52 +1604,26 @@ async def test_compact_validation_keeps_batch_id_and_reposting_counts_success(gi
                 "head_sha": HEAD,
                 "notes": [note],
                 "validate_only": True,
-                "compact": True,
             },
             raise_on_error=False,
         )
         validated = validated_result.structured_content
         posted = await client.call_tool(
             "post_review_notes",
-            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": validated["batch_id"], "compact": True},
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": validated["batch_id"]},
             raise_on_error=False,
         )
         posted_data = posted.structured_content
 
     # Assert
-    assert validated["results"] == [{"index": 0, "status": "validated"}]
-    assert validated["posted_count"] == 0
+    assert validated["validated_count"] == 1
+    assert "posted_count" not in validated
     assert validated["batch_id"]
-    assert posted_data == {"results": [], "posted_count": 1}
+    assert posted_data == {"posted_count": 1, "note_ids": [POSTED_NOTE_ID]}
     assert len(mr_route.calls) == FOUR_PREFLIGHT_REQUESTS
     assert len(diff_route.calls) == TWO_POSTS
     assert len(post_route.calls) == 1
     assert json.loads(post_route.calls[0].request.content)["body"] == "Please check this."
-
-
-@respx.mock
-async def test_compact_preserves_people_write_failure(gitlab_env):
-    """A failed people update remains visible after successful note rows are compacted."""
-    # Arrange
-    add_preflight([([diff_file("src.py")], None)])
-    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
-    graphql_route = respx.post(GRAPHQL).mock(
-        side_effect=[
-            response({"data": {"users": {"nodes": [{"username": "alice"}]}}}),
-            response({"message": "Boom"}, status=500),
-        ]
-    )
-
-    # Act
-    data = await call_tool(notes=[review_note("src.py", 1)], compact=True, add_reviewers=["alice"])
-
-    # Assert
-    assert data["results"] == []
-    assert data["posted_count"] == 1
-    assert data["people"]["applied"] == []
-    assert "HTTP 500" in data["people"]["failed"]["add_reviewers"]
-    assert len(post_route.calls) == 1
-    assert len(graphql_route.calls) == TWO_POSTS
 
 
 @respx.mock
@@ -1752,14 +1640,7 @@ async def test_general_note_posts_body_without_position_and_verifies_ids(gitlab_
 
     # Assert
     assert json.loads(post_route.calls[0].request.content) == {"body": "A general review comment."}
-    assert data["results"] == [
-        {
-            "index": 0,
-            "status": "posted",
-            "note_id": POSTED_NOTE_ID,
-            "discussion_id": "general-discussion",
-        }
-    ]
+    assert data["note_ids"] == [POSTED_NOTE_ID]
     assert len(mr_route.calls) == TWO_POSTS
     assert not diff_route.called
 
@@ -1784,7 +1665,8 @@ async def test_general_note_with_malformed_returned_position_is_unverified_and_s
     )
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["unverified", "unattempted"]
+    assert [item["status"] for item in data["results"]] == ["unverified"]
+    assert data["unattempted"] == [1]
     assert data["results"][0]["note_id"] == POSTED_NOTE_ID
     assert data["results"][0]["discussion_id"] == "general-discussion"
     assert "position did not match" in data["results"][0]["reason"]
@@ -1852,17 +1734,9 @@ async def test_mixed_general_file_and_line_notes_keep_order_and_scan_only_file_p
         "head_sha": HEAD,
     }
     assert payloads[2]["position"]["new_line"] == MIXED_INLINE_LINE
-    assert [item["index"] for item in data["results"]] == [0, 1, 2]
-    assert [item["status"] for item in data["results"]] == ["posted"] * 3
-    assert data["results"] == [
-        {
-            "index": index,
-            "status": "posted",
-            "note_id": POSTED_NOTE_ID + index,
-            "discussion_id": f"discussion-{index + 1}",
-        }
-        for index in range(3)
-    ]
+    assert data["posted_count"] == THREE_POSTS
+    assert data["note_ids"] == [POSTED_NOTE_ID + index for index in range(THREE_POSTS)]
+    assert "results" not in data
     assert len(diff_route.calls) == 1
 
 
@@ -1889,7 +1763,7 @@ async def test_general_note_sha_checks_stop_before_post(gitlab_env, merge_reques
     data = await call_tool(notes=[{"body": "General comment."}])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "unattempted"}]
+    assert data["unattempted"] == [0]
     assert warning_part in data["warning"]
     assert len(mr_route.calls) == request_count
     assert not diff_route.called
@@ -1912,7 +1786,8 @@ async def test_invalid_file_note_in_mixed_batch_prevents_general_note_post(gitla
     )
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["validated", "failed"]
+    assert [item["status"] for item in data["results"]] == ["failed"]
+    assert data["validated_count"] == 1
     assert "No notes were posted" in data["warning"]
     assert not post_route.called
     assert not graphql_route.called
@@ -1977,11 +1852,9 @@ async def test_unchanged_lines_map_before_between_and_after_hunks_on_both_sides(
     data, posted = await validate_and_post_batch([note])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
-    assert posted["results"] == [
-        {"index": 0, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
-    ]
+    assert posted["note_ids"] == [POSTED_NOTE_ID]
     assert json.loads(post_route.calls[0].request.content)["position"] == {
         "position_type": "text",
         "old_path": "src.py",
@@ -2023,12 +1896,7 @@ async def test_posted_unchanged_line_uses_resolved_coordinates_and_immutable_ref
         "start_sha": START_SHA,
         "head_sha": HEAD,
     }
-    assert data["results"][0] == {
-        "index": 0,
-        "status": "posted",
-        "note_id": POSTED_NOTE_ID,
-        "discussion_id": "discussion-1",
-    }
+    assert data["note_ids"] == [POSTED_NOTE_ID]
 
 
 @pytest.mark.parametrize(
@@ -2062,11 +1930,9 @@ async def test_zero_count_hunks_preserve_insertion_and_deletion_boundaries(
     data, posted = await validate_and_post_batch([note])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
-    assert posted["results"] == [
-        {"index": 0, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
-    ]
+    assert posted["note_ids"] == [POSTED_NOTE_ID]
     assert json.loads(post_route.calls[0].request.content)["position"] == {
         "position_type": "text",
         "old_path": "src.py",
@@ -2110,7 +1976,7 @@ async def test_unchanged_gap_comparison_preserves_git_blob_line_terminators(
     data = await call_tool(notes=[review_note("src.py", target)], validate_only=True)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
 
 
@@ -2269,11 +2135,9 @@ async def test_rename_uses_old_and_new_paths_and_base_head_refs(gitlab_env):
     data, posted = await validate_and_post_batch([review_note(new_path, 3)])
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
-    assert posted["results"] == [
-        {"index": 0, "status": "posted", "note_id": POSTED_NOTE_ID, "discussion_id": "discussion-1"}
-    ]
+    assert posted["note_ids"] == [POSTED_NOTE_ID]
     assert json.loads(post_route.calls[0].request.content)["position"] == {
         "position_type": "text",
         "old_path": old_path,
@@ -2309,7 +2173,7 @@ async def test_raw_blobs_are_cached_for_successful_and_failed_fallbacks(gitlab_e
     )
 
     # Assert successful reads
-    assert [item["status"] for item in valid["results"]] == ["validated", "validated"]
+    assert valid["validated_count"] == TWO_POSTS
     assert len(old_route.calls) == 1
     assert len(new_route.calls) == 1
 
@@ -2364,7 +2228,7 @@ async def test_truncated_blob_is_rejected_and_final_ref_change_stops_batch(gitla
     changed_refs = await call_tool(notes=[review_note("src.py", 1)])
 
     # Assert changed refs after blob reads
-    assert changed_refs["results"] == [{"index": 0, "status": "unattempted"}]
+    assert changed_refs["unattempted"] == [0]
     assert "changed during preflight" in changed_refs["warning"]
     assert len(mr_route.calls) - calls_before == TWO_POSTS
     assert not post_route.called
@@ -2491,7 +2355,8 @@ async def test_raw_blob_read_failures_are_cached_per_note(gitlab_env, failure):
     )
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["failed", "failed", "validated"]
+    assert [item["status"] for item in data["results"]] == ["failed", "failed"]
+    assert data["validated_count"] == 1
     assert len(old_route.calls) == 1
     assert not new_route.called
     assert "could not be read safely" in data["results"][0]["reason"]
@@ -2515,7 +2380,8 @@ async def test_new_blob_http_error_is_cached_without_hiding_in_hunk_note(gitlab_
     )
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["failed", "failed", "validated"]
+    assert [item["status"] for item in data["results"]] == ["failed", "failed"]
+    assert data["validated_count"] == 1
     assert len(old_route.calls) == 1
     assert len(new_route.calls) == 1
     assert "new file content could not be read safely" in data["results"][0]["reason"]
@@ -2538,7 +2404,7 @@ async def test_invalid_diff_records_do_not_make_a_valid_expansion_ambiguous(gitl
     data = await call_tool(notes=[review_note("src.py", 2)], validate_only=True)
 
     # Assert
-    assert data["results"] == [{"index": 0, "status": "validated"}]
+    assert data["validated_count"] == 1
     assert data["batch_id"]
     assert len(old_route.calls) == 1
     assert len(new_route.calls) == 1
@@ -2559,7 +2425,8 @@ async def test_unknown_general_note_outcome_stops_later_notes_and_people(gitlab_
     )
 
     # Assert
-    assert [item["status"] for item in data["results"]] == ["unknown", "unattempted"]
+    assert [item["status"] for item in data["results"]] == ["unknown"]
+    assert data["unattempted"] == [1]
     assert "outcome is unknown" in data["warning"]
     assert len(post_route.calls) == 1
     assert len(mr_route.calls) == TWO_POSTS
