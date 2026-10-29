@@ -175,6 +175,7 @@ async def test_file_list_mode_maps_diff_stats_and_head_sha(gitlab_env, arguments
     assert requested_pages(rest) == [1]
     assert data == {
         "head_sha": HEAD_SHA,
+        "hint": "Pass paths=[...] to read patches.",
         "files": [
             {"path": "a.py", "additions": 3, "deletions": 1, "new_line_ranges": [[1, 1]], "ranges_complete": True},
             {

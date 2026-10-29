@@ -44,6 +44,7 @@ query($fullPath: ID!, $iid: String!) {
 # Total patch characters that one diff call may return. A single patch is cut to this too.
 DIFF_BUDGET = 40000
 DIFF_HUNK_NORMALIZE_PATTERN = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
+FILE_LIST_HINT = "Pass paths=[...] to read patches."
 INVALID_SINCE_SHA_MESSAGE = "since_sha must be a full 40-character commit SHA."
 
 
@@ -90,6 +91,7 @@ class MergeRequestDiff(BaseModel):
     next_cursor: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the scan finished.
     paths_not_found: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     warning: str = Field(default="", exclude_if=lambda value: not value)
+    hint: str = Field(default="", exclude_if=lambda value: not value)  # Tells a file-list caller how to get patches.
 
 
 def _new_line_ranges(diff: str) -> list[tuple[int, int]]:
@@ -578,7 +580,8 @@ async def get_merge_request_diff(  # noqa: PLR0913, PLR0917 - these are the publ
     if not wanted:
         stats = node["diffStats"]
         patch_ranges = await _scan_file_stat_ranges(client, project, iid, stats) if stats else {}
-        return MergeRequestDiff(head_sha=head_sha, files=_to_file_stats(stats, patch_ranges))
+        files = _to_file_stats(stats, patch_ranges)
+        return MergeRequestDiff(head_sha=head_sha, files=files, hint=FILE_LIST_HINT if files else "")
 
     diffs, next_cursor, matched = await _scan_diffs(client, project, iid, set(wanted), start)
     # A resumed call did not read the first page, so it cannot prove a path is missing.
