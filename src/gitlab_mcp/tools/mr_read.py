@@ -26,6 +26,7 @@ from gitlab_mcp.common import (
     lower_or_empty,
     page_text,
 )
+from gitlab_mcp.description_sections import DescriptionSection, focused_description, validate_focus_options
 from gitlab_mcp.errors import ProjectNotFoundError
 from gitlab_mcp.mr_common import (
     ThreadIndex,
@@ -288,6 +289,8 @@ class MergeRequestDetail(BaseModel):
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
     next_description_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
     description_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    headings: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)  # headings_only=true
+    sections: list[DescriptionSection] | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys_truncated: bool | None = Field(
         default=None,
@@ -761,6 +764,36 @@ def _cap_description(description: str | None, limit: int = DESCRIPTION_CAP) -> t
 def _description_hash(description: str | None) -> str:
     """Hash the full raw description as UTF-8, treating null as empty text."""
     return hashlib.sha256((description or "").encode("utf-8")).hexdigest()
+
+
+def _validate_focus(
+    section: str | list[str] | None,
+    headings_only: bool,
+    include_description: bool,
+    description_limit: int,
+    description_offset: int,
+) -> bool:
+    """Check the shared focused-read options, then reject them on a continuation page."""
+    focused = validate_focus_options(section, headings_only, include_description, description_limit)
+    if focused and description_offset > 0:
+        raise ToolError("section and headings_only read the whole description, so description_offset must be 0.")  # noqa: TRY003
+    return focused
+
+
+def _focus_description(
+    detail: MergeRequestDetail,
+    description: str,
+    section: str | list[str] | None,
+    headings_only: bool,
+    description_limit: int,
+) -> None:
+    """Replace the first description page with only the requested headings or sections."""
+    text, truncated, headings, sections = focused_description(description, section, headings_only, description_limit)
+    detail.description = text or ""
+    detail.description_truncated = truncated
+    detail.next_description_offset = None  # 📑 Focused reads are complete, so there is no page to continue.
+    detail.headings = headings
+    detail.sections = sections
 
 
 def _validate_description_options(
@@ -1337,6 +1370,26 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
             ),
         ),
     ] = False,
+    section: Annotated[
+        str | list[str] | None,
+        Field(
+            description=(
+                "One heading or a list of headings to read instead of the whole description: exact text, or a unique "
+                "leading word or ID such as AC-2. A string returns "
+                "description and, when cut, description_truncated. A list returns sections with heading, content, "
+                "and, when cut, truncated. Requires include_description=true and description_offset=0."
+            ),
+        ),
+    ] = None,
+    headings_only: Annotated[
+        bool,
+        Field(
+            description=(
+                "Return only the description's ATX heading names in headings. Requires include_description=true "
+                "and description_offset=0."
+            ),
+        ),
+    ] = False,
 ) -> MergeRequestDetail | MergeRequestDescriptionPage:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
@@ -1379,6 +1432,12 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       `include_description_hash=true` on the first page to compare hashes
       across all pages and restart paging if the description changes. The hash is SHA-256 of the full raw description
       encoded as UTF-8, with null treated as empty text.
+    - `headings_only=true` lists the description's ATX headings in `headings` (empty when there are none). `section`
+      reads only matching headings, matched the same way as `get_work_item`: an exact heading, ignoring case, or a
+      unique leading word or ID such as `AC-2`. Fenced code is ignored. A string returns `description` (left out
+      when the section is empty); a list returns `sections`. `description_limit` caps the total content, and an
+      unknown heading lists the available headings. Both need `include_description=true` and a positive
+      `description_limit`, and reject `description_offset`.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
       the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
     - Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are not visible to the token.
@@ -1386,6 +1445,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
     """
     _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
+    focused = _validate_focus(section, headings_only, include_description, description_limit, description_offset)
     include_description = include_description and description_limit > 0
     custom_issue_key_pattern = _compile_issue_key_pattern(issue_key_pattern, issue_key_prefixes)
     client = get_client(ctx)
@@ -1421,6 +1481,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         description_offset=description_offset,
         custom_issue_key_pattern=custom_issue_key_pattern,
     )
+    if focused:
+        _focus_description(detail, node.get("description") or "", section, headings_only, description_limit)
     if include_description_hash:
         detail.description_hash = _description_hash(node.get("description"))
     await _add_blockers(client, project, [detail])

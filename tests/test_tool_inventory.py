@@ -125,6 +125,8 @@ async def test_server_instructions_list_real_main_arguments(gitlab_env):
             "include_description",
             "description_limit",
             "description_offset",
+            "section",
+            "headings_only",
         },
         "get_merge_request_threads": {
             "project",
