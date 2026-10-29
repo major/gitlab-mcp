@@ -72,6 +72,21 @@ def is_int_at_least(value: Any, minimum: int) -> bool:
     return type(value) is int and value >= minimum
 
 
+def page_text(text: str, limit: int, offset: int) -> tuple[str, bool, int | None]:
+    """Return one page of `text` from `offset`, whether more text follows, and the offset that continues it.
+
+    Offsets count characters. A page holds up to `limit` characters, plus a final tail of up to a quarter
+    of `limit`, so a short tail costs no extra call. Past-the-end offsets return an empty page.
+    """
+    if offset >= len(text):
+        return "", False, None
+    end = offset + limit
+    # 25% slack, rounded down: limits 1 to 3 add no characters, and limits 4 to 7 add one.
+    if len(text) - end <= limit // 4:
+        return text[offset:], False, None
+    return text[offset:end], True, end
+
+
 def read_server_local_utf8_file(
     path_value: str,
     *,

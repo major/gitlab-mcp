@@ -861,13 +861,15 @@ async def test_auto_merge_strategy_is_returned_raw(gitlab_env, strategy):
     [
         (1, 1, (1, False, None)),
         (1, 2, (1, True, 1)),
+        (4, 5, (5, False, None)),  # A limit of 4 leaves room for 1 extra character (4 // 4).
         (DESCRIPTION_CAP, DESCRIPTION_CAP, (DESCRIPTION_CAP, False, None)),
-        (DESCRIPTION_CAP, DESCRIPTION_CAP + 1, (DESCRIPTION_CAP, True, DESCRIPTION_CAP)),
+        (DESCRIPTION_CAP, DESCRIPTION_CAP + 1000, (DESCRIPTION_CAP + 1000, False, None)),
+        (DESCRIPTION_CAP, DESCRIPTION_CAP + 1001, (DESCRIPTION_CAP, True, DESCRIPTION_CAP)),
     ],
 )
 @respx.mock
 async def test_description_obeys_requested_limit(gitlab_env, description_limit, length, expected):
-    """Descriptions stop at the requested limit and report whether more text can be fetched."""
+    """Descriptions stop near the requested limit, with a tail up to a quarter of it, and report any continuation."""
     expected_length, expected_truncated, next_offset = expected
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description="d" * length)))
@@ -923,7 +925,8 @@ async def test_description_pages_reconstruct_unicode_text_without_gaps_or_overla
 async def test_default_description_cap_pages_reconstruct_long_text(gitlab_env):
     """Default-sized pages reconstruct descriptions longer than 8000 characters in exactly three calls."""
     # Arrange
-    description = "a" * DESCRIPTION_CAP + "b" * DESCRIPTION_CAP + "c"
+    # The 1001-character tail is just over a quarter of the cap, so it cannot ride along with the second page.
+    description = "a" * DESCRIPTION_CAP + "b" * DESCRIPTION_CAP + "c" * 1001
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
 
     # Act
@@ -934,7 +937,7 @@ async def test_default_description_cap_pages_reconstruct_long_text(gitlab_env):
 
     # Assert
     assert route.call_count == len(pages)
-    assert [len(page) for page in pages] == [DESCRIPTION_CAP, DESCRIPTION_CAP, 1]
+    assert [len(page) for page in pages] == [DESCRIPTION_CAP, DESCRIPTION_CAP, 1001]
     assert first["next_description_offset"] == DESCRIPTION_CAP
     assert second["next_description_offset"] == DESCRIPTION_CAP * 2
     assert {"description_truncated", "next_description_offset"}.isdisjoint(third)

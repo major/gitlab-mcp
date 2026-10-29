@@ -33,6 +33,9 @@ SECOND_WRITE = 2
 SECOND_CACHED_NOTE_NEW_LINE = 2
 PEOPLE_REQUESTS = 3
 WARNING_CAP = 500
+VALIDATED_BATCH_HINT = (
+    "To change note text before posting, pass body_overrides with this batch_id. No new validation is needed."
+)
 
 
 @pytest.fixture
@@ -164,6 +167,7 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     token_data = prepared.structured_content
     assert token_data["batch_id"]
     assert token_data["ttl_seconds"] == review_batches.ReviewBatchCache.TTL_SECONDS
+    assert token_data["hint"] == VALIDATED_BATCH_HINT
     assert "expires_at" not in token_data
     assert "batch_error" not in token_data
     assert [row["status"] for row in token_data["results"]] == ["validated"] * 3
@@ -175,6 +179,7 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     # Assert
     assert not posted.is_error
     assert "ttl_seconds" not in posted.structured_content
+    assert "hint" not in posted.structured_content
     assert "batch_error" not in posted.structured_content
     assert [row["status"] for row in posted.structured_content["results"]] == ["posted"] * 3
     requests = [json.loads(call.request.content) for call in post_route.calls]
@@ -616,6 +621,7 @@ async def test_failed_validation_does_not_return_a_batch_token(review_client: Cl
     assert not result.is_error
     assert "batch_id" not in result.structured_content
     assert "ttl_seconds" not in result.structured_content
+    assert "hint" not in result.structured_content
     assert result.structured_content["results"][0]["status"] == "failed"
     assert len(mr_route.calls) == MR_CALLS_PER_PREFLIGHT
     assert len(diff_route.calls) == 1
