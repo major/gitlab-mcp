@@ -11,7 +11,15 @@ lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
-from gitlab_mcp.common import MAX_PAGES, Iid, Project, lower_or_empty, validate_project_labels
+from gitlab_mcp.common import (
+    MAX_PAGES,
+    REVIEW_NOTE_BODY_CAP,
+    Iid,
+    Project,
+    has_quick_action,
+    lower_or_empty,
+    validate_project_labels,
+)
 from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_blockers, fetch_merge_request, mr_rest_path, set_people
 
 # Queries and mutations for update_merge_request. Each one changes one thing, so each step can fail on its own. 🔧
@@ -118,6 +126,17 @@ class ApprovalSeparateError(ToolError):
         super().__init__("Approve in a separate call. Approval may not survive a rebase or a target branch change.")
 
 
+class CommentBodyError(ToolError):
+    """The comment is blank, too long, or may run a GitLab quick action."""
+
+    def __init__(self) -> None:
+        """Explain the comment rules, so the agent can fix the text."""
+        super().__init__(
+            f"comment must be nonblank, at most {REVIEW_NOTE_BODY_CAP} characters, and have no line that starts "
+            "like a quick action (/close). Use state for close or reopen. No write was made."
+        )
+
+
 def _check_overlap(add: Sequence[Any], remove: Sequence[Any], label: str) -> None:
     """Raise OverlapError when one item is both added and removed in the same call."""
     overlap = sorted(str(item) for item in set(add) & set(remove))
@@ -131,6 +150,7 @@ class _Changes:
 
     approve: bool | None
     sha: str | None
+    comment: str | None
     state: Literal["close", "reopen"] | None
     draft: bool | None
     title: str | None
@@ -157,6 +177,10 @@ class _Changes:
         _check_overlap(self.add_reviewers, self.remove_reviewers, "reviewer")
         _check_overlap(self.add_assignees, self.remove_assignees, "assignee")
         _check_overlap(self.add_blocked_by, self.remove_blocked_by, "blocking merge request")
+        if self.comment is not None and (
+            not self.comment.strip() or len(self.comment) > REVIEW_NOTE_BODY_CAP or has_quick_action(self.comment)
+        ):
+            raise CommentBodyError
         if self.approve and not self.sha:
             raise ApprovalShaError
         # Approval may not survive a rebase or a target branch change, so GitLab needs them in separate calls.
@@ -183,7 +207,7 @@ class _Changes:
 
     def _has_change(self) -> bool:
         """Return True when at least one field, list, or rebase was requested."""
-        given = (self.approve, self.state, self.draft, self.title, self.description, self.target_branch)
+        given = (self.approve, self.comment, self.state, self.draft, self.title, self.description, self.target_branch)
         lists = (
             self.add_labels,
             self.remove_labels,
@@ -248,7 +272,11 @@ class _Update:
         return mr_rest_path(self.project, self.iid)
 
     async def run(self) -> None:
-        """Run every requested step, in the order the docs describe."""
+        """Run every requested step, in the order the docs describe.
+
+        The comment goes first, so a note like "replaced by !12" lands before the MR closes. 💬
+        """
+        await self._comment()
         await self._labels()
         await self._fields()
         await self._draft()
@@ -311,6 +339,12 @@ class _Update:
         except ToolError as exc:
             return None, f"Could not read the blockers back. Check them with get_merge_request. {exc}"
         return blockers[self.iid].iids, ""
+
+    async def _comment(self) -> None:
+        """Post one top-level MR comment, like `glab mr note`."""
+        if self.changes.comment is not None:
+            request = self.client.request("POST", f"{self.path}/notes", json={"body": self.changes.comment})
+            await self.attempt("comment", request)
 
     async def _fields(self) -> None:
         """Send one PUT with every plain field that was given."""
@@ -459,6 +493,10 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
         str | None,
         Field(description="Full head SHA, required to approve."),
     ] = None,
+    comment: Annotated[
+        str | None,
+        Field(description="Top-level MR comment, posted before the other changes. Needs the user's APPROVE."),
+    ] = None,
     state: Annotated[Literal["close", "reopen"] | None, Field(description="Close or reopen.")] = None,
     draft: Annotated[bool | None, Field(description="Set draft status.")] = None,
     title: Annotated[str | None, Field(description="New title.")] = None,
@@ -482,12 +520,14 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
 ) -> MergeRequestUpdate:
     """Reviewer and assignee changes for merge request review. Like `glab mr update`.
 
-    Also like `glab mr approve` and `glab mr rebase`.
+    Also like `glab mr note`, `glab mr close`, `glab mr reopen`, `glab mr approve`, and `glab mr rebase`.
 
     Lower risk than a merge, but not always reversible. A rebase rewrites the
     source branch. An approval can let an auto-merge that is already enabled go through.
 
     - Several changes go in one call. Each step runs even when an earlier step failed.
+    - `comment` posts one general MR comment first, so "comment + close" is one call. Show the user the final
+      text and get explicit APPROVE before posting. A line that starts like a quick action is rejected.
     - `applied`: GitLab confirmed the change. `pending`: the rebase was still running after about 10 seconds.
       Check get_merge_request later. A rebase reports `applied` with the new `head_sha`,
       or `failed` with GitLab's reason.
@@ -499,7 +539,7 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
       approval may not survive a rebase or a target_branch change.
     - Usernames must be real users. Blockers are IIDs of MRs in this same project.
     - After a blocker change, `blocked_by` lists the visible blocker IIDs. An empty list means none are left.
-    - An invalid request sends nothing: no changes, the same item in an add and a remove list,
+    - An invalid request sends nothing: no changes, a bad comment, the same item in an add and a remove list,
       or approve with rebase or target_branch.
     - Needs a token with the `api` scope.
     """
@@ -507,6 +547,7 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
     changes = _Changes(
         approve=approve,
         sha=sha,
+        comment=comment,
         state=state,
         draft=draft,
         title=title,

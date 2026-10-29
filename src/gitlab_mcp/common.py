@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Annotated, Any
@@ -32,6 +33,8 @@ DIFF_PAGE_SIZE = 100
 PROJECT_LABELS_PAGE_SIZE = 100
 # Bodies are small enough to bound memory and request size, including file-backed notes.
 REVIEW_NOTE_BODY_CAP = 100000
+# A line that starts with a slash and a letter may be a GitLab quick action.
+_QUICK_ACTION = re.compile(r"/[A-Za-z]")
 # Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
 Project = Annotated[str, Field(description="Project path, like group/project.")]
 Iid = Annotated[int, Field(description="MR number.")]
@@ -70,6 +73,15 @@ def decode_cursor(cursor: str, tool: str) -> dict[str, Any]:
 def is_int_at_least(value: Any, minimum: int) -> bool:
     """Return True for an int of at least `minimum`. Booleans are ints in Python, so they are rejected too."""
     return type(value) is int and value >= minimum
+
+
+def has_quick_action(body: str) -> bool:
+    """Return True when any line starts like a GitLab quick action, such as `/close` or `/merge`.
+
+    GitLab runs quick actions in note bodies, so a stray line could change the MR. This also matches
+    lines inside code fences, so a harmless example can be rejected too.
+    """
+    return any(_QUICK_ACTION.match(line.lstrip()) for line in body.replace("\r", "").splitlines())
 
 
 def page_text(text: str, limit: int, offset: int) -> tuple[str, bool, int | None]:
