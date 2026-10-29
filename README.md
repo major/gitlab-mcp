@@ -161,4 +161,4 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `reply_to_threads` | Reply to or resolve up to 20 review threads in order. |
 | `resolve_open_threads` | Resolve open review threads on one merge request. |
 | `retry_ci` | Retry a failed or canceled CI job or pipeline after checking its expected SHA. |
-| `update_merge_request` | Update merge request details, people, labels, blockers, approval, state, or rebase status. |
+| `update_merge_request` | Comment on, close, or reopen a merge request, or update its details, people, labels, blockers, approval, or rebase status. |

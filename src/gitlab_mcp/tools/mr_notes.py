@@ -13,13 +13,20 @@ lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
-from gitlab_mcp.common import DISCUSSION_PREFIX, HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR, Iid, Project, is_int_at_least
+from gitlab_mcp.common import (
+    DISCUSSION_PREFIX,
+    HTTP_REQUEST_TIMEOUT,
+    HTTP_SERVER_ERROR,
+    Iid,
+    Project,
+    has_quick_action,
+    is_int_at_least,
+)
 from gitlab_mcp.mr_common import mr_rest_path
 
 DISCUSSION_BYTE_LIMIT = 1_048_576
 NOTE_BODY_LIMIT = 1_000_000
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
-_QUICK_ACTION = re.compile(r"/[A-Za-z]")
 
 
 class NoteEditResult(BaseModel):
@@ -189,7 +196,7 @@ def _validate_body(body: str) -> None:
     """Reject an unsafe complete body before it can be sent to GitLab."""
     if not body.strip() or len(body) > NOTE_BODY_LIMIT:
         raise ToolError("The final body must be nonblank and at most 1000000 characters. No write was made.")  # noqa: TRY003
-    if any(_QUICK_ACTION.match(line.lstrip()) for line in body.replace("\r", "").splitlines()):
+    if has_quick_action(body):
         raise ToolError("The final body may contain a GitLab quick action. No write was made.")  # noqa: TRY003
     try:
         _body_hash(body)

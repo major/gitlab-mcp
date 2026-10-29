@@ -117,6 +117,7 @@ def serve_writes(router: respx.MockRouter, replies: dict[str, Any] | None = None
         "rebase": router.put(f"{MR}/rebase").mock(return_value=httpx.Response(202, json={"message": "202 Accepted"})),
         "approve": router.post(f"{MR}/approve").mock(return_value=httpx.Response(201, json={})),
         "unapprove": router.post(f"{MR}/unapprove").mock(return_value=httpx.Response(201, json={})),
+        "comment": router.post(f"{MR}/notes").mock(return_value=httpx.Response(201, json={"id": 1})),
         "add_block": router.post(f"{MR}/blocks").mock(return_value=httpx.Response(201, json={})),
         "list_blocks": router.get(f"{MR}/blocks").mock(return_value=httpx.Response(200, json=[])),
         "graphql": router.post(GRAPHQL).mock(side_effect=graphql_mock(replies)),
@@ -769,13 +770,14 @@ async def test_failed_poll_keeps_the_accepted_rebase_pending(gitlab_env, router,
 
 
 async def test_steps_run_in_the_documented_order(gitlab_env, router):
-    """Steps run in order: fields, draft, people, blocks, approval, then the re-read."""
+    """Steps run in order: comment, fields, draft, people, blocks, approval, then the re-read."""
     """Each request is labeled by what it does, so the order reads at a glance."""
     # Arrange
     serve_writes(router)
 
     # Act
     await call_tool(
+        comment="Replaced by !12.",
         title="New",
         draft=True,
         add_reviewers=["alice"],
@@ -787,6 +789,7 @@ async def test_steps_run_in_the_documented_order(gitlab_env, router):
 
     # Assert
     assert [step_label(call.request) for call in router.calls] == [
+        "POST /notes",
         "PUT",
         "mergeRequestSetDraft",
         "users(",
@@ -809,6 +812,8 @@ async def test_steps_run_in_the_documented_order(gitlab_env, router):
         ({"add_reviewers": ["alice"], "remove_reviewers": ["alice"]}, "same reviewer in one call: alice"),
         ({"add_assignees": ["bob"], "remove_assignees": ["bob"]}, "same assignee in one call: bob"),
         ({"add_blocked_by": [5], "remove_blocked_by": [5]}, "same blocking merge request in one call: 5"),
+        ({"comment": "  "}, "comment must be nonblank"),
+        ({"comment": "Done.\n  /merge"}, "quick action"),
         ({"approve": True}, "needs sha"),
         ({"approve": True, "sha": SHA, "rebase": True}, "Approve in a separate call"),
         ({"approve": False, "target_branch": "main"}, "Approve in a separate call"),
@@ -1006,3 +1011,18 @@ async def test_failed_reread_keeps_the_outcomes_and_adds_a_warning(gitlab_env, r
     assert "reviewers" not in data
     assert "assignees" not in data
     assert data["warning"].startswith("Could not read the merge request back")
+
+
+async def test_comment_and_close_go_in_one_call(gitlab_env, router):
+    """A comment posts as a top-level MR note, and the close still goes in the fields PUT."""
+    # Arrange
+    routes = serve_writes(router, replies={"mergeRequest(": mr_body(state="closed")})
+
+    # Act
+    data = await call_tool(comment="Replaced by !12.", state="close")
+
+    # Assert
+    assert json.loads(routes["comment"].calls.last.request.content) == {"body": "Replaced by !12."}
+    assert json.loads(routes["fields"].calls.last.request.content) == {"state_event": "close"}
+    assert data["applied"] == ["comment", "fields"]
+    assert data["state"] == "closed"
