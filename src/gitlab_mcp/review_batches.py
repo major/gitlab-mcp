@@ -87,15 +87,20 @@ class ReviewBatchCache:
         self._cache_bytes += size_bytes
         return batch_id
 
-    def claim(self, batch_id: str, project: str, iid: int, head_sha: str) -> CachedReviewBatch:
-        """Consume a batch, even if its project, merge request, or head SHA does not match."""
+    def claim(self, batch_id: str, project: str, iid: int, head_sha: str | None) -> CachedReviewBatch:
+        """Consume a batch, even if its project, merge request, or head SHA does not match.
+
+        A `None` head SHA skips the SHA match and keeps the SHA stored at validation. The live head check
+        before posting still catches a push made after validation. 🔒
+        """
         self._purge_expired()
         batch = self._batches.pop(batch_id, None)
         if batch is None:
             raise ReviewBatchUnavailableError
         self._cache_bytes -= batch.size_bytes
 
-        if batch.project != project or batch.iid != iid or batch.head_sha.lower() != head_sha.lower():
+        head_mismatch = head_sha is not None and batch.head_sha.lower() != head_sha.lower()
+        if batch.project != project or batch.iid != iid or head_mismatch:
             raise ReviewBatchMismatchError
         return batch
 

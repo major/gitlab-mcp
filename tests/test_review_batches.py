@@ -148,7 +148,7 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     review_client: Client,
     tmp_path: Path,
 ) -> None:
-    """A token posts frozen inline, file-level, and general notes without rereading body files."""
+    """A token posts frozen inline, file-level, and general notes without rereading body files or head_sha."""
     # Arrange
     mr_route, diff_route = add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -173,7 +173,9 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     batch_id = token_data["batch_id"]
     changed_body_path.write_text("changed after validation", encoding="utf-8")
     deleted_body_path.unlink()
-    posted = await call_review(review_client, **note_args(batch_id=batch_id))
+    post_args = note_args(batch_id=batch_id)
+    del post_args["head_sha"]  # 🪙 The batch already stores the validated SHA.
+    posted = await call_review(review_client, **post_args)
 
     # Assert
     assert not posted.is_error
@@ -484,7 +486,7 @@ async def test_invalid_body_overrides_have_no_gitlab_writes(
 
 @respx.mock
 async def test_stale_live_head_consumes_token_without_writes(review_client: Client) -> None:
-    """Posting reruns preflight and refuses a token if the live merge-request head changed."""
+    """Posting without head_sha still reruns preflight and refuses a token if the live head changed."""
     # Arrange
     live_sha = HEAD
 
@@ -505,7 +507,7 @@ async def test_stale_live_head_consumes_token_without_writes(review_client: Clie
     prior_diff_calls = len(diff_route.calls)
 
     # Act
-    stale = await call_review(review_client, **note_args(batch_id=batch_id))
+    stale = await call_review(review_client, **note_args(batch_id=batch_id, head_sha=None))
 
     # Assert
     assert not stale.is_error
@@ -557,6 +559,7 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
     "arguments",
     [
         pytest.param({}, id="neither-input"),
+        pytest.param({"notes": [{"file": "src.py", "line": 1, "body": "review"}], "head_sha": None}, id="notes-no-sha"),
         pytest.param(
             {"notes": [{"file": "src.py", "line": 1, "body": "review"}], "batch_id": "token"},
             id="both-inputs",
@@ -829,14 +832,18 @@ async def test_concurrent_calls_claim_a_token_once(review_client: Client) -> Non
 
 @pytest.mark.parametrize(
     ("live_sha", "supplied_sha", "expected_status", "diff_refs"),
-    [(HEAD.upper(), HEAD, "current", {}), ("D" * 40, HEAD.upper(), "stale", {"diff_refs": None})],
-    ids=["current-no-diff-refs", "stale-null-diff-refs"],
+    [
+        (HEAD.upper(), HEAD, "current", {}),
+        ("D" * 40, HEAD.upper(), "stale", {"diff_refs": None}),
+        ("D" * 40, None, "validate the notes again", {}),
+    ],
+    ids=["current-no-diff-refs", "stale-null-diff-refs", "omitted-sha"],
 )
 @respx.mock
 async def test_unavailable_token_reports_live_sha_without_diff_refs(
     review_client: Client,
     live_sha: str,
-    supplied_sha: str,
+    supplied_sha: str | None,
     expected_status: str,
     diff_refs: dict[str, Any],
 ) -> None:
