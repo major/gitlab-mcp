@@ -124,6 +124,7 @@ query($fullPath: ID!, $iid: String!) {
 COMPACT_MERGE_REQUEST_FRAGMENT = """
 fragment CompactMergeRequest on MergeRequest {
   iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch
+  updatedAt @include(if: $includeActivity)
   author { username }
   mergedAt mergeUser { username }
   diffRefs { headSha }
@@ -177,6 +178,18 @@ THREAD_INDEX_CAP = 20
 # A Literal is sent to the agent as an enum, so this type replaces a separate
 # "list states" tool.
 MergeRequestState = Literal["opened", "closed", "locked", "merged", "all"]
+
+# Resource events, each with the activity kind it feeds. GitLab lists each list oldest first. 📜
+EventKind = Literal["label", "state", "milestone"]
+ACTIVITY_EVENT_READS: tuple[tuple[str, EventKind], ...] = (
+    ("resource_label_events", "label"),
+    ("resource_state_events", "state"),
+    ("resource_milestone_events", "milestone"),
+)
+# GitLab sends only "add" or "remove" for label and milestone events.
+ACTIVITY_VERBS = {"add": "added", "remove": "removed"}
+# System note text in last_activity is cut to this length, ellipsis included.
+ACTIVITY_SUMMARY_CAP = 80
 
 # Column order of the TSV output. Every row has every column, so agents
 # never have to guess whether a missing key means "empty" or "not sent".
@@ -357,6 +370,15 @@ GET_MERGE_REQUEST_OUTPUT_SCHEMA = {
 }
 
 
+class Activity(BaseModel):
+    """The newest comment, system note, or label, state, or milestone change on a merge request."""
+
+    at: str
+    by: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the user was deleted or banned.
+    kind: Literal["comment", "system"] | EventKind
+    summary: str
+
+
 class CompactMergeRequest(BaseModel):
     """One merge request's compact status facts, without reviewers or threads."""
 
@@ -387,6 +409,10 @@ class CompactMergeRequest(BaseModel):
     blocked_by: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)  # Blocked MRs only.
     hidden_blockers: int = Field(default=0, exclude_if=lambda v: not v)  # Blockers the token cannot see.
     commits_behind: int | None = Field(default=None, exclude_if=lambda value: value is None)  # Open MRs, when asked.
+    updated_at: str | None = Field(default=None, exclude_if=lambda value: value is None)  # UTC, to the second.
+    last_pushed_at: str | None = Field(default=None, exclude_if=lambda value: value is None)  # Newest diff version.
+    last_activity: Activity | None = Field(default=None, exclude_if=lambda value: value is None)  # Newest activity.
+    activity_incomplete: bool = Field(default=False, exclude_if=lambda value: not value)  # A read failed or was cut.
     description: str = Field(default="", exclude_if=lambda v: not v)
     description_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
 
@@ -1022,6 +1048,8 @@ def _to_compact_detail(
         state=node["state"],
         merged_at=merged_at,
         merged_by=merged_by,
+        # Only requested with include_activity, so the key is absent otherwise.
+        updated_at=_utc_second(node["updatedAt"]) if node.get("updatedAt") else None,
         draft=node["draft"],
         author=author["username"] if author else "",
         source_branch=node["sourceBranch"],
@@ -1081,6 +1109,133 @@ async def _add_commits_behind(
         except ToolError:
             continue
         detail.commits_behind = mr.get("diverged_commits_count")  # GitLab may send null.
+
+
+def _utc_second(value: str) -> str:
+    """Return an ISO time in UTC to the second, like `2026-10-21T09:00:00Z`.
+
+    GitLab always sends an offset, so the parsed time is timezone-aware and `astimezone` is safe. Milliseconds
+    are dropped to keep the output short. Two events in the same second then tie, and the first in list order wins.
+    """
+    return datetime.fromisoformat(value).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _username(user: dict[str, Any] | None) -> str:
+    """Return a user's username, or an empty string when GitLab sends null for a deleted or banned user."""
+    return user["username"] if user else ""
+
+
+def _one_line(text: str) -> str:
+    """Collapse runs of whitespace into single spaces, then cut the text to the summary cap.
+
+    The ellipsis counts toward the cap, so a cut summary is exactly `ACTIVITY_SUMMARY_CAP` characters long.
+    """
+    line = " ".join(text.split())
+    return f"{line[: ACTIVITY_SUMMARY_CAP - 1]}…" if len(line) > ACTIVITY_SUMMARY_CAP else line
+
+
+def _note_activity(note: dict[str, Any]) -> Activity:
+    """Describe a note as a system note or a comment.
+
+    Comments show their length, not their text, to keep the output small. Notes are dated by creation, so an old
+    thread that was resolved or edited does not look like new activity.
+    """
+    at = _utc_second(note["created_at"])
+    author = _username(note["author"])
+    body = note["body"] or ""
+    if note["system"]:
+        return Activity(at=at, by=author, kind="system", summary=_one_line(body))
+    return Activity(at=at, by=author, kind="comment", summary=f"comment ({len(body)} chars)")
+
+
+def _event_summary(kind: EventKind, event: dict[str, Any]) -> str:
+    """Return a short summary such as "added label tech-debt" or "merged".
+
+    A state event names the new state. Label and milestone events name their target, which GitLab sends as null
+    after the target is deleted, so the summary then keeps only the verb and the kind.
+    """
+    if kind == "state":
+        return event["state"]
+    verb = ACTIVITY_VERBS.get(event["action"], "changed")
+    target = event[kind]
+    if target is None:
+        return f"{verb} {kind}"
+    name = target["name"] if kind == "label" else target["title"]
+    return f"{verb} {kind} {name}"
+
+
+def _event_activity(kind: EventKind, event: dict[str, Any]) -> Activity:
+    """Describe the newest label, state, or milestone event as an activity."""
+    return Activity(
+        at=_utc_second(event["created_at"]),
+        by=_username(event["user"]),
+        kind=kind,
+        summary=_event_summary(kind, event),
+    )
+
+
+def _activity_time(activity: Activity) -> datetime:
+    """Parse an activity time so that candidates compare by instant, not by text."""
+    return datetime.fromisoformat(activity.at)
+
+
+async def _newest_event(client: GitLabClient, path: str) -> tuple[dict[str, Any] | None, bool]:
+    """Return the newest event of one resource event list, and whether the scan stopped before the last page.
+
+    GitLab lists these events oldest first, so the newest event is the last item of the last page. The scan is
+    capped at MAX_PAGES pages. A longer list returns the last event read and reports that it was cut short.
+    """
+    newest: dict[str, Any] | None = None
+    page = 1
+    for _ in range(MAX_PAGES):
+        events, next_page = await client.get_page(path, per_page=100, page=page)
+        if events:
+            newest = events[-1]  # Later pages overwrite earlier ones, so the final value is the newest event.
+        if next_page is None:
+            return newest, False
+        page = next_page
+    return newest, True
+
+
+async def _add_activity(
+    client: GitLabClient,
+    project: str,
+    merge_requests: list[CompactMergeRequest],
+) -> None:
+    """Fill last_pushed_at, last_activity, and activity_incomplete with five REST reads per merge request, in sequence.
+
+    Merged and closed merge requests are included, because their history still matters. Each read is independent:
+    a failed read only marks the merge request as incomplete, and the other reads still count. 🔍
+    """
+    for merge_request in merge_requests:
+        mr = mr_rest_path(project, merge_request.iid)
+        candidates: list[Activity] = []
+        incomplete = False
+        try:
+            versions = await client.get(f"{mr}/versions", per_page=1)  # GitLab lists the newest version first.
+        except ToolError:
+            incomplete = True
+        else:
+            merge_request.last_pushed_at = _utc_second(versions[0]["created_at"]) if versions else None
+        try:
+            # GitLab drops notes the token cannot read after paging, so one note per page can come back empty.
+            # Read 20 and keep only the first, which is the newest.
+            notes = await client.get(f"{mr}/notes", sort="desc", order_by="created_at", per_page=20)
+        except ToolError:
+            incomplete = True
+        else:
+            candidates.extend(_note_activity(note) for note in notes[:1])
+        for path, kind in ACTIVITY_EVENT_READS:
+            try:
+                event, cut_short = await _newest_event(client, f"{mr}/{path}")
+            except ToolError:
+                incomplete = True
+                continue
+            incomplete |= cut_short
+            if event is not None:
+                candidates.append(_event_activity(kind, event))
+        merge_request.last_activity = max(candidates, key=_activity_time, default=None)
+        merge_request.activity_incomplete = incomplete
 
 
 @mcp.tool(
@@ -1305,6 +1460,7 @@ async def _fetch_compact_chunk(
     project: str,
     iids: list[int],
     include_description: bool,
+    include_activity: bool,
 ) -> list[dict[str, Any] | None]:
     """Fetch compact merge request nodes for one chunk of IIDs in one GraphQL query.
 
@@ -1312,10 +1468,11 @@ async def _fetch_compact_chunk(
     order, where `None` means the merge request does not exist. Raises `ProjectNotFoundError` when the project
     is missing.
     """
-    declarations = ["$fullPath: ID!", "$includeDescription: Boolean!"]
+    declarations = ["$fullPath: ID!", "$includeDescription: Boolean!", "$includeActivity: Boolean!"]
     variables: dict[str, Any] = {
         "fullPath": project,
         "includeDescription": include_description,
+        "includeActivity": include_activity,
     }
     selections = []
     for index, iid in enumerate(iids):
@@ -1357,6 +1514,15 @@ async def get_merge_requests(  # noqa: PLR0913, PLR0917 - each argument controls
             ),
         ),
     ] = False,
+    include_activity: Annotated[
+        bool,
+        Field(
+            description=(
+                "Add updated_at, last_pushed_at, and last_activity. Costs 5 sequential REST calls per MR. "
+                "Defaults to false."
+            ),
+        ),
+    ] = False,
 ) -> MergeRequestBatch:
     """Return compact status for up to 20 merge requests, similar to `glab mr view`.
 
@@ -1367,6 +1533,15 @@ async def get_merge_requests(  # noqa: PLR0913, PLR0917 - each argument controls
     sequential GraphQL queries. Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are
     not visible to the token. With `include_commits_behind=true`, each open MR also gets `commits_behind`, read with
     one REST call per MR in sequence.
+
+    With `include_activity=true`, each MR also gets `updated_at`, `last_pushed_at` (the newest diff version), and
+    `last_activity` (the newest comment, system note, or label, state, or milestone change, with `at`, `by`, `kind`,
+    and `summary`). Label-only changes may not move `updated_at`, so use `last_activity` for "what happened last".
+    System notes that cross-reference, like "mentioned in !12", count as activity. Times are UTC to the second.
+    These come from `glab api` `projects/:id/merge_requests/:iid/versions`, `/notes`, and
+    `/resource_label_events`, `/resource_state_events`, and `/resource_milestone_events`. That is five sequential
+    REST calls per MR, in any state. `activity_incomplete` is true when a read failed or an event list hit the page
+    cap, so `last_activity` may not be the newest.
     """
     unique_iids = list(dict.fromkeys(iids))
     if not unique_iids:
@@ -1378,7 +1553,7 @@ async def get_merge_requests(  # noqa: PLR0913, PLR0917 - each argument controls
     client = get_client(ctx)
     nodes: list[dict[str, Any] | None] = []
     for chunk in batched(unique_iids, GRAPHQL_MR_CHUNK, strict=False):
-        nodes.extend(await _fetch_compact_chunk(client, project, list(chunk), include_description))
+        nodes.extend(await _fetch_compact_chunk(client, project, list(chunk), include_description, include_activity))
 
     merge_requests = []
     missing_iids = []
@@ -1396,4 +1571,6 @@ async def get_merge_requests(  # noqa: PLR0913, PLR0917 - each argument controls
     await _add_blockers(client, project, merge_requests)
     if include_commits_behind:
         await _add_commits_behind(client, project, merge_requests)
+    if include_activity:
+        await _add_activity(client, project, merge_requests)
     return MergeRequestBatch(merge_requests=merge_requests, missing_iids=missing_iids)
