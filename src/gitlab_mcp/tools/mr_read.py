@@ -24,6 +24,7 @@ from gitlab_mcp.common import (
     Project,
     bare_id,
     lower_or_empty,
+    page_text,
 )
 from gitlab_mcp.errors import ProjectNotFoundError
 from gitlab_mcp.mr_common import (
@@ -708,17 +709,6 @@ def _cap_description(description: str | None, limit: int = DESCRIPTION_CAP) -> t
     return description[:limit], len(description) > limit
 
 
-def _page_description(description: str | None, limit: int, offset: int) -> tuple[str, bool, int | None]:
-    """Return one description page, whether more text follows, and its next character offset."""
-    if not description or offset >= len(description):
-        return "", False, None
-    end = min(offset + limit, len(description))
-    page = description[offset:end]
-    if end == len(description):
-        return page, False, None
-    return page, True, end
-
-
 def _description_hash(description: str | None) -> str:
     """Hash the full raw description as UTF-8, treating null as empty text."""
     return hashlib.sha256((description or "").encode("utf-8")).hexdigest()
@@ -919,8 +909,8 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     )
     created_at = node.get("createdAt")
     merged_at, merged_by = _merged_metadata(node)
-    description, description_truncated, next_description_offset = _page_description(
-        node.get("description") if include_description else None,
+    description, description_truncated, next_description_offset = page_text(
+        (node.get("description") or "") if include_description else "",
         description_limit,
         description_offset,
     )
@@ -1114,7 +1104,14 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     ] = None,
     description_limit: Annotated[
         int,
-        Field(ge=0, le=DESCRIPTION_CAP, description="Maximum description page length in characters, from 0 to 4000."),
+        Field(
+            ge=0,
+            le=DESCRIPTION_CAP,
+            description=(
+                "Maximum description page length in characters, from 0 to 4000. The limit is soft: a final tail "
+                "up to a quarter of it is included to save a call."
+            ),
+        ),
     ] = DESCRIPTION_CAP,
     description_offset: Annotated[
         int,
@@ -1177,11 +1174,12 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
       Custom patterns return full matches, preserve case, and use a bounded scan with a matching timeout.
       `issue_keys_truncated=true` means a result, scan, or match-length limit excluded content.
     - `description_limit` controls description length when the description is included. Zero skips it; the default is
-      4000 characters.
+      4000 characters. The limit is soft: a final tail up to a quarter of it is included to save a call.
     - `description_offset` starts a description page at that character offset. When `next_description_offset` is
       returned, call again with that value to continue. Nonzero offsets return only the IID, description page,
       continuation fields, and full description hash. Other detail flags are ignored on continuation pages.
-      Each page is capped at 4000 characters. Set `include_description_hash=true` on the first page to compare hashes
+      Each page holds the limit plus that soft tail, so 5000 characters by default. Set
+      `include_description_hash=true` on the first page to compare hashes
       across all pages and restart paging if the description changes. The hash is SHA-256 of the full raw description
       encoded as UTF-8, with null treated as empty text.
     - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
@@ -1197,8 +1195,8 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     if description_offset > 0:
         node = await fetch_merge_request(client, MERGE_REQUEST_DESCRIPTION_QUERY, project, iid)
         raw_description = node.get("description")
-        description, description_truncated, next_description_offset = _page_description(
-            raw_description, description_limit, description_offset
+        description, description_truncated, next_description_offset = page_text(
+            raw_description or "", description_limit, description_offset
         )
         return MergeRequestDescriptionPage(
             iid=iid,

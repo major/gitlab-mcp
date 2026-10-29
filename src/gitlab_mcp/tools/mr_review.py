@@ -152,6 +152,7 @@ class PostReviewNotesResult(BaseModel):
         description="Upper bound in seconds until a validated batch expires; use, eviction, or restart may shorten it.",
         exclude_if=lambda value: value is None,
     )
+    hint: str = Field(default="", exclude_if=lambda value: not value)  # Next-step guidance after a validated batch.
     batch_error: Literal["unavailable"] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
@@ -1012,6 +1013,10 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                 update={
                     "batch_id": batch_id,
                     "ttl_seconds": cache.TTL_SECONDS,
+                    "hint": (
+                        "To change note text before posting, pass body_overrides with this batch_id. "
+                        "No new validation is needed."
+                    ),
                     "results": [row.model_copy(update={"position": {}}) for row in result.results],
                 }
             )

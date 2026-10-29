@@ -298,10 +298,17 @@ async def test_description_can_be_skipped_or_truncated(
     assert result.get("next_description_offset") == (4 if expected_description == "A lo" else None)
 
 
-@pytest.mark.parametrize("length", [4000, 4001])
+@pytest.mark.parametrize(
+    ("length", "expected_page_length", "expected_next_offset"),
+    [
+        (4000, 4000, None),
+        (5000, 5000, None),  # A 1000-character tail fits the soft limit.
+        (5001, DESCRIPTION_PAGE_SIZE, DESCRIPTION_PAGE_SIZE),  # A 1001-character tail is paged as usual.
+    ],
+)
 @respx.mock
-async def test_description_page_at_character_limit(gitlab_env, length):
-    """Only text beyond the default 4000-character limit has a continuation."""
+async def test_description_page_at_character_limit(gitlab_env, length, expected_page_length, expected_next_offset):
+    """A tail up to a quarter of the default limit rides along; a longer tail gets a continuation."""
     # Arrange
     description = "x" * length
     route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=description)))
@@ -310,9 +317,9 @@ async def test_description_page_at_character_limit(gitlab_env, length):
     result = await call_tool("get_work_item", {"project": PROJECT, "iid": IID})
 
     # Assert
-    assert result["description"] == description[:4000]
-    assert result.get("description_truncated", False) is (length > DESCRIPTION_PAGE_SIZE)
-    assert result.get("next_description_offset") == (DESCRIPTION_PAGE_SIZE if length > DESCRIPTION_PAGE_SIZE else None)
+    assert result["description"] == description[:expected_page_length]
+    assert result.get("description_truncated", False) is (expected_next_offset is not None)
+    assert result.get("next_description_offset") == expected_next_offset
     assert route.call_count == 1
 
 
@@ -320,7 +327,7 @@ async def test_description_page_at_character_limit(gitlab_env, length):
 async def test_description_pages_reconstruct_full_text_and_keep_full_hash(gitlab_env):
     """Three pages reconstruct the description and repeat the full-description hash."""
     # Arrange
-    description = "a" * 4000 + "b" * 4000 + "end"
+    description = "a" * 4000 + "b" * 4000 + "c" * 1001
     route = respx.post(GRAPHQL).mock(return_value=response(work_item(description=description)))
     arguments = {"project": PROJECT, "iid": IID}
 

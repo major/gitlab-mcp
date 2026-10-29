@@ -12,7 +12,13 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from gitlab_mcp.client import GitLabAPIError, GitLabConnectionError, GitLabGraphQLError
-from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR, REVIEW_NOTE_BODY_CAP, read_server_local_utf8_file
+from gitlab_mcp.common import (
+    HTTP_REQUEST_TIMEOUT,
+    HTTP_SERVER_ERROR,
+    REVIEW_NOTE_BODY_CAP,
+    page_text,
+    read_server_local_utf8_file,
+)
 lazy from gitlab_mcp.client import GitLabClient
 
 WorkItemScope = Literal["project", "group"]
@@ -487,14 +493,9 @@ def _description_result(  # noqa: PLR0913, PLR0917 - options mirror the public d
         return None, False, description_hash, None, selected_sections
     if raw_description is None:
         return None, False, description_hash, None, None
-    end = description_offset + description_limit
-    return (
-        raw_description[description_offset:end],
-        len(raw_description) > end,
-        description_hash,
-        None,
-        None,
-    )
+    # The detail reader derives next_description_offset from this page's length, so the helper's offset is unused.
+    page, truncated, _ = page_text(raw_description, description_limit, description_offset)
+    return page, truncated, description_hash, None, None
 
 
 def _item_from_data(

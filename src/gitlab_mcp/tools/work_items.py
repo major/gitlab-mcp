@@ -23,7 +23,12 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
     include_description: bool = True,
     description_limit: Annotated[
         int,
-        Field(ge=0, le=4000, description="Maximum description length, from 0 to 4000 characters."),
+        Field(
+            ge=0,
+            le=4000,
+            description="Maximum description length, from 0 to 4000 characters. Full-description pages are soft: "
+            "a final tail up to a quarter of the limit is included to save a call.",
+        ),
     ] = 4000,
     cursor: Annotated[
         str | None,
@@ -59,10 +64,11 @@ async def get_work_item(  # noqa: PLR0913, PLR0917 - each argument is a user-fac
     `description_truncated` when cut. A list `section`, even with one heading, returns `sections` entries with
     `heading`, `content`, and `truncated` when cut. Set `headings_only` to list all ATX headings. Focused reads require
     the description and a positive limit, and do not accept a widget cursor. The limit caps total content across
-    selected sections. For full descriptions, use `next_description_offset` as `description_offset` for the next
-    page. Offsets count Unicode code points, not bytes or grapheme clusters. Positive offsets cannot be combined with
-    `section`, `headings_only`, a widget `cursor`, `include_description=false`, or `description_limit=0`. Continue
-    widget cursors with offset 0. Compare `description_hash` across description pages; it hashes the full description.
+    selected sections. For full descriptions, use `next_description_offset` as `description_offset` for the next page.
+    A final tail up to a quarter of `description_limit` joins the last page to save a call. Offsets count Unicode code
+    points, not bytes or grapheme clusters. Positive offsets cannot be combined with `section`, `headings_only`, a
+    widget `cursor`, `include_description=false`, or `description_limit=0`. Continue widget cursors with offset 0.
+    Compare `description_hash` across description pages; it hashes the full description.
     If the hash changes, the description was edited and paging must restart from offset 0.
     """
     return await _work_items.read_work_item(
