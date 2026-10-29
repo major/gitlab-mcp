@@ -111,6 +111,12 @@ async def test_generic_tail_falls_back_to_early_actionable_errors(summary):
             "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n"
             "145 passed, 1 warning in 2.1s\n"
         ),
+        (
+            "================ slowest 10 durations ================\n"
+            "91.53s call     tests/test_gradle.py::test_build[1-error: compilation failed-gradle]\n"
+            "================ 145 passed in 380.1s ================\n"
+        ),
+        "0.52s setup    tests/test_gradle.py::test_build[1-error: compilation failed-gradle]\n",
     ],
     ids=[
         "passed-row",
@@ -121,6 +127,8 @@ async def test_generic_tail_falls_back_to_early_actionable_errors(summary):
         "warning-traceback",
         "warning-final-title",
         "warning-header-outside-window",
+        "durations",
+        "durations-header-outside-window",
     ],
 )
 @respx.mock
@@ -152,6 +160,7 @@ async def test_pytest_success_and_warnings_do_not_hide_earlier_failure(summary):
     assert "make: *** [typecheck] Error 1" in log["text"]
     assert "SocketBlockedError" not in log["text"]
     assert "ValueError: expected" not in log["text"]
+    assert "compilation failed" not in log["text"]
 
 
 @pytest.mark.parametrize(

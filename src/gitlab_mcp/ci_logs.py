@@ -73,6 +73,8 @@ _PYTEST_COUNTS_PATTERN = re.compile(
     r" in \d+(?:\.\d+)?s(?:\s*\([^\n]*\))?\s*(?:=+)?\s*$",
     re.IGNORECASE,
 )
+# A pytest `--durations` row. Parametrized test IDs can hold text like `error:`, which is not a failure. ⏱️
+_PYTEST_DURATIONS_PATTERN = re.compile(r"^\s*\d+(?:\.\d+)?s (?:call|setup|teardown)\s+\S+::")
 _RUNNER_FAILURE_PATTERN = re.compile(r"^\s*ERROR:\s*Job failed\b", re.IGNORECASE)
 _OTHER_CAUSE_PATTERN = re.compile(r"(?i)\b(?:fatal|exception):")
 _GLPAT_PATTERN = re.compile(r"(?i)(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
@@ -193,8 +195,13 @@ def pytest_result_line(line: str) -> bool:
 
 
 def actionable_failure_line(line: str) -> bool:
-    """Recognize diagnostic causes, excluding generic make and runner failure footers."""
-    if make_failure_line(line) or _RUNNER_FAILURE_PATTERN.search(line) or pytest_result_line(line):
+    """Recognize diagnostic causes, excluding generic make and runner footers and passing pytest output."""
+    if (
+        make_failure_line(line)
+        or _RUNNER_FAILURE_PATTERN.search(line)
+        or pytest_result_line(line)
+        or _PYTEST_DURATIONS_PATTERN.match(line)
+    ):
         return False
     return any(pattern.search(line) for pattern in _FAILURE_PATTERNS[1:]) or bool(_OTHER_CAUSE_PATTERN.search(line))
 
