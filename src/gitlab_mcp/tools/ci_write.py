@@ -12,13 +12,19 @@ lazy from fastmcp import Context
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR
-from gitlab_mcp.mr_common import full_sha
-lazy from gitlab_mcp.common import Project
+from gitlab_mcp.mr_common import full_sha, mr_rest_path
+lazy from gitlab_mcp.common import Iid, Project
 
 HTTP_CLIENT_ERROR = 400
 MAX_PIPELINE_VARIABLES = 20
 MAX_VARIABLE_NAME_LENGTH = 255
 MAX_VARIABLE_VALUE_LENGTH = 4096
+# A head pipeline in one of these states is still going, so a new MR pipeline would be a duplicate. ⏳
+ACTIVE_PIPELINE_STATUSES = frozenset({"created", "pending", "running", "preparing", "waiting_for_resource"})
+# GitLab answers 400 or 405 when the CI config makes no MR pipeline, for example with no merge_request_event rules.
+MR_PIPELINE_REJECTED_HINT = (
+    'The CI config may not define merge request pipelines (rules: if: $CI_PIPELINE_SOURCE == "merge_request_event").'
+)
 
 CiId = Annotated[int, Field(strict=True, ge=1, description="Positive numeric GitLab job or pipeline ID.")]
 FullSha = Annotated[
@@ -53,6 +59,8 @@ class CiWriteResult(BaseModel):
     web_url: str | None = Field(default=None, exclude_if=lambda value: value is None)
     sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     ref: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    # GitLab's status of a new pipeline, like "created". Only create_merge_request_pipeline sets it.
+    pipeline_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
     warning: str = Field(default="", exclude_if=lambda value: not value)
 
 
@@ -122,8 +130,14 @@ def _unverified_write() -> ToolError:
     return ToolError("GitLab may have accepted the write, but the outcome is unverified. Check GitLab before retrying.")
 
 
-async def _send_write(client: GitLabClient, path: str, body: dict[str, Any] | None = None) -> Any:
-    """Send one CI write without retrying and hide request data from error messages."""
+async def _send_write(
+    client: GitLabClient, path: str, body: dict[str, Any] | None = None, rejected_hint: str = ""
+) -> Any:
+    """Send one CI write without retrying and hide request data from error messages.
+
+    GitLab's reason for a 4xx is hidden by default, because it may echo pipeline variables. A write with no
+    secret input passes `rejected_hint`, so the agent sees GitLab's reason and the hint instead.
+    """
     try:
         return await client.request("POST", path, json=body)
     except GitLabConnectionError as exc:
@@ -136,7 +150,8 @@ async def _send_write(client: GitLabClient, path: str, body: dict[str, Any] | No
                 f"The CI write outcome is unknown after HTTP {exc.status}. Check GitLab before retrying."
             ) from exc
         if HTTP_CLIENT_ERROR <= exc.status < HTTP_SERVER_ERROR:
-            raise ToolError(f"GitLab rejected the CI write with HTTP {exc.status}.") from exc  # noqa: TRY003
+            reason = f" {exc.detail}. {rejected_hint}" if rejected_hint and exc.detail else ""
+            raise ToolError(f"GitLab rejected the CI write with HTTP {exc.status}.{reason}") from exc  # noqa: TRY003
         raise ToolError(f"GitLab returned an unexpected HTTP {exc.status} for the CI write.") from exc  # noqa: TRY003
     except ValueError as exc:
         # A successful status with invalid JSON can still mean GitLab applied the write.
@@ -243,3 +258,61 @@ async def create_pipeline(  # noqa: PLR0913, PLR0917 - each argument is one user
             "The ref moved after preflight. GitLab started the pipeline at a different SHA; check GitLab before acting."
         )
     return result.model_copy(update={"ref": ref, "warning": warning})
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+async def create_merge_request_pipeline(
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    expected_sha: FullSha,
+    validate_only: bool = False,
+) -> CiWriteResult:
+    """Start a merge request pipeline, like `glab api --method POST projects/:id/merge_requests/:iid/pipelines`.
+
+    Use this, not create_pipeline, when an MR needs a pipeline for "pipeline must succeed" or a merge train. A
+    branch pipeline does not count there. A common case is a retarget with no new push: the old pipeline ran
+    against the old target, so the MR waits in `ci_must_pass` until a new MR pipeline runs.
+
+    `expected_sha` must be the full MR `head_sha` from get_merge_request. GitLab's POST takes no SHA, so the check
+    is not atomic. If the head moves, the result reports the actual SHA and a warning. `ref` is GitLab's pipeline
+    ref, like `refs/merge-requests/12/merge` for merged results. Only open MRs qualify, and an MR whose head
+    pipeline is still active is refused, so no duplicate pipeline starts. `validate_only` checks all of this
+    without a POST.
+    Writes are never retried automatically; check GitLab before retrying when the outcome is unknown or unverified.
+    """
+    _project_component(project)
+    client = get_client(ctx)
+    path = mr_rest_path(project, iid)
+    merge_request = await client.get(path)
+    sha = merge_request.get("sha") if isinstance(merge_request, dict) else None
+    if not isinstance(sha, str) or not full_sha(sha):
+        raise ToolError("GitLab did not return a full head SHA for this MR. Refresh it before starting a pipeline.")  # noqa: TRY003
+    if sha.lower() != expected_sha.lower():
+        raise ToolError("The MR head SHA does not match expected_sha. Refresh the MR before starting a pipeline.")  # noqa: TRY003
+    if merge_request.get("state") != "opened":
+        raise ToolError("Only an open MR can get a new pipeline.")  # noqa: TRY003
+    head_pipeline = merge_request.get("head_pipeline") or {}
+    if head_pipeline.get("status") in ACTIVE_PIPELINE_STATUSES:
+        raise ToolError(  # noqa: TRY003
+            f"The MR head pipeline {head_pipeline.get('id')} is still {head_pipeline['status']}. Wait for it first."
+        )
+    if validate_only:
+        return CiWriteResult(status="validated", kind="pipeline", sha=sha)
+
+    response = await _send_write(client, f"{path}/pipelines", rejected_hint=MR_PIPELINE_REJECTED_HINT)
+    result = _started_result("pipeline", response)
+    ref, status = response.get("ref"), response.get("status")
+    ref = ref if isinstance(ref, str) else None
+    # Merged-results pipelines test a merge commit, so their SHA never matches the head. 🔀
+    tests_merge_commit = ref is not None and ref.endswith("/merge")
+    warning = ""
+    if not tests_merge_commit and isinstance(result.sha, str) and result.sha.lower() != sha.lower():
+        warning = "The MR head moved after preflight. GitLab started the pipeline at a different SHA; check GitLab."
+    return result.model_copy(
+        update={
+            "ref": ref,
+            "pipeline_status": status if isinstance(status, str) else None,
+            "warning": warning,
+        }
+    )

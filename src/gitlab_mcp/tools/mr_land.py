@@ -10,7 +10,13 @@ lazy from fastmcp import Context
 from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import Iid, Project, lower_or_empty
-from gitlab_mcp.mr_common import diff_refs_head_sha, fetch_merge_request, mr_rest_path
+from gitlab_mcp.mr_common import (
+    PIPELINE_STALL_HINT,
+    diff_refs_head_sha,
+    fetch_merge_request,
+    mr_rest_path,
+    needs_mr_pipeline,
+)
 
 # How a land request is sent. "auto" queues the merge, "now" merges right away, "cancel" undoes a queued merge.
 LandMode = Literal["auto", "now", "cancel"]
@@ -62,7 +68,8 @@ class MergeRequestLanding(BaseModel):
     train_position: int | None = Field(default=None, exclude_if=lambda v: v is None)  # 1-based, among active cars.
     train_status: str = Field(default="", exclude_if=lambda v: not v)  # The car's status, lowercased, like "idle".
     train_pipeline_id: int | None = Field(default=None, exclude_if=lambda v: v is None)  # None until a pipeline runs.
-    warning: str = Field(default="", exclude_if=lambda v: not v)  # Set when the write worked but a read did not.
+    # Set when the write worked but a read did not, or when the MR waits for a pipeline that never started.
+    warning: str = Field(default="", exclude_if=lambda v: not v)
 
 
 class LandItem(BaseModel):
@@ -212,6 +219,8 @@ def _to_landing(mode: LandMode, node: dict[str, Any]) -> MergeRequestLanding:
         pipeline = node["headPipeline"] or {}
         fields["head_sha"] = diff_refs_head_sha(node["diffRefs"])
         fields["pipeline_status"] = lower_or_empty(pipeline.get("status"))
+        if needs_mr_pipeline(node["state"], fields["merge_status"], fields["pipeline_status"]):
+            fields["warning"] = PIPELINE_STALL_HINT
     return MergeRequestLanding(**fields)
 
 
@@ -248,9 +257,9 @@ async def _with_train_position(
     try:
         data = await client.graphql(TRAIN_POSITION_QUERY, {"fullPath": project, "targetBranches": [target_branch]})
     except ToolError:
-        return landing.model_copy(
-            update={"warning": "The merge train position could not be read. Check list_merge_train."}
-        )
+        # Keep any stall hint, so neither warning is lost.
+        warning = " ".join(filter(None, (landing.warning, "The merge train position could not be read.")))
+        return landing.model_copy(update={"warning": f"{warning} Check list_merge_train."})
     return landing.model_copy(update=_train_fields(data, iid))
 
 
@@ -321,6 +330,8 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
     - `auto` and `now` also return `head_sha` and `pipeline_status`, so you can confirm which commit was queued.
     - For `merge_train` results, `train_position` (1-based among active cars), `train_status`, and
       `train_pipeline_id` say where the MR sits in its train. They are left out when the MR is not found there.
+    - A `warning` says when GitLab waits for CI (`ci_must_pass`) but the MR has no head pipeline, for example
+      after a retarget with no new push. Start one with create_merge_request_pipeline.
     - A refused merge (405, 406, 409, 422) says to check blockers. Never retry a failed write without checking first.
     """
     _check_land_args(mode, sha, squash, remove_source_branch)

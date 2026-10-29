@@ -414,3 +414,89 @@ async def test_connection_error_during_create_is_unknown_and_not_retried(gitlab_
         await call_tool("create_pipeline", {"ref": "main", "expected_sha": SHA})
     assert "connection reset" not in str(error.value)
     assert write.call_count == 1
+
+
+MR_PATH = f"{API}/projects/{ENCODED_PROJECT}/merge_requests/12"
+MR_PIPELINE_ID = 903
+OPEN_MR = {"sha": SHA, "state": "opened", "head_pipeline": {"id": 902, "status": "success"}}
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "warning"),
+    [
+        # Merged-results pipelines test a merge commit, so a new SHA is normal there.
+        ({"ref": "refs/merge-requests/12/merge", "sha": NEW_SHA}, ""),
+        ({"ref": "refs/merge-requests/12/head", "sha": SHA}, ""),
+        ({"ref": "refs/merge-requests/12/head", "sha": NEW_SHA}, "The MR head moved after preflight"),
+    ],
+    ids=["merged-result", "detached", "detached-head-moved"],
+)
+@respx.mock
+async def test_create_merge_request_pipeline_posts_after_head_check(gitlab_env, pipeline, warning):
+    """A matching MR head starts one MR pipeline and returns its ID, ref, status, and SHA."""
+    # Arrange
+    respx.get(MR_PATH).mock(return_value=httpx.Response(200, json=OPEN_MR))
+    write = respx.post(f"{MR_PATH}/pipelines").mock(
+        return_value=httpx.Response(200, json={"id": MR_PIPELINE_ID, "status": "created", **pipeline})
+    )
+
+    # Act
+    result = await call_tool("create_merge_request_pipeline", {"iid": 12, "expected_sha": SHA})
+
+    # Assert
+    assert write.call_count == 1
+    assert write.calls.last.request.content == b""
+    assert result["id"] == MR_PIPELINE_ID
+    assert result["ref"] == pipeline["ref"]
+    assert result["pipeline_status"] == "created"
+    assert result["sha"] == pipeline["sha"]
+    assert result.get("warning", "").startswith(warning)
+
+
+@pytest.mark.parametrize(
+    ("mr_fields", "validate_only", "error"),
+    [
+        ({}, True, None),
+        ({"head_pipeline": None}, True, None),
+        ({"sha": NEW_SHA}, False, "does not match expected_sha"),
+        ({"sha": None}, False, "full head SHA"),
+        ({"state": "merged"}, False, "Only an open MR"),
+        ({"head_pipeline": {"id": 902, "status": "running"}}, False, "pipeline 902 is still running"),
+    ],
+    ids=["validate-only", "validate-no-pipeline", "stale-head", "no-head", "not-open", "active-pipeline"],
+)
+@respx.mock
+async def test_create_merge_request_pipeline_never_posts_without_a_fresh_idle_head(
+    gitlab_env, mr_fields, validate_only, error
+):
+    """Validate-only, a stale or missing head, a closed MR, and an active pipeline all stop before the POST."""
+    # Arrange
+    respx.get(MR_PATH).mock(return_value=httpx.Response(200, json=OPEN_MR | mr_fields))
+    write = respx.post(f"{MR_PATH}/pipelines").mock(return_value=httpx.Response(201, json={}))
+    arguments = {"iid": 12, "expected_sha": SHA, "validate_only": validate_only}
+
+    # Act / Assert
+    if error:
+        with pytest.raises(ToolError, match=error):
+            await call_tool("create_merge_request_pipeline", arguments)
+    else:
+        assert await call_tool("create_merge_request_pipeline", arguments) == {
+            "status": "validated",
+            "kind": "pipeline",
+            "sha": SHA,
+        }
+    assert write.call_count == 0
+
+
+@respx.mock
+async def test_rejected_merge_request_pipeline_shows_gitlab_reason_and_rules_hint(gitlab_env):
+    """This POST sends no secrets, so GitLab's reason and a CI rules hint are shown."""
+    # Arrange
+    respx.get(MR_PATH).mock(return_value=httpx.Response(200, json=OPEN_MR))
+    respx.post(f"{MR_PATH}/pipelines").mock(
+        return_value=httpx.Response(400, json={"message": {"base": ["No stages / jobs for this pipeline."]}})
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"HTTP 400\. .*No stages / jobs.*merge_request_event"):
+        await call_tool("create_merge_request_pipeline", {"iid": 12, "expected_sha": SHA})
