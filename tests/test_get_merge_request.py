@@ -559,7 +559,10 @@ async def test_include_jobs_returns_failed_jobs_with_numeric_ids(gitlab_env):
 
     # Assert
     assert dict(jobs.calls.last.request.url.params) == {"scope[]": "failed", "per_page": "100", "page": "1"}
-    assert "headPipeline { status id sha }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert (
+        "headPipeline { status id sha mergeRequestEventType }"
+        in json.loads(graphql.calls.last.request.content)["query"]
+    )
     assert data["latest_pipeline_id"] == PIPELINE_ID
     assert data["pipeline_sha"] == HEAD_SHA
     assert data["failed_jobs"] == "id\tname\n456\tunit tests"
@@ -578,7 +581,10 @@ async def test_default_does_not_request_pipeline_jobs(gitlab_env):
     data = await call_tool()
 
     # Assert
-    assert "headPipeline { status id sha }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert (
+        "headPipeline { status id sha mergeRequestEventType }"
+        in json.loads(graphql.calls.last.request.content)["query"]
+    )
     assert jobs.call_count == 0
     assert data["latest_pipeline_id"] == PIPELINE_ID
     assert "failed_jobs" not in data
@@ -615,7 +621,35 @@ async def test_pipeline_sha_comes_from_existing_query_without_extra_requests(
         assert "pipeline_sha" not in data
     else:
         assert data["pipeline_sha"] == expected_sha
-    assert "headPipeline { status id sha }" in json.loads(graphql.calls.last.request.content)["query"]
+    assert (
+        "headPipeline { status id sha mergeRequestEventType }"
+        in json.loads(graphql.calls.last.request.content)["query"]
+    )
+    assert len(respx.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "expected_event_type"),
+    [
+        ({"status": "SUCCESS", "sha": "a" * 40, "mergeRequestEventType": "MERGED_RESULT"}, "merged_result"),
+        ({"status": "SUCCESS", "sha": "a" * 40, "mergeRequestEventType": "MERGE_TRAIN"}, "merge_train"),
+        ({"status": "SUCCESS", "sha": HEAD_SHA, "mergeRequestEventType": "DETACHED"}, "detached"),
+        ({"status": "SUCCESS", "sha": "a" * 40, "mergeRequestEventType": None}, None),
+        (None, None),
+    ],
+    ids=["merged-result", "merge-train", "detached", "stale-branch-pipeline", "no-pipeline"],
+)
+@respx.mock
+async def test_pipeline_event_type_explains_sha_mismatch(gitlab_env, pipeline, expected_event_type):
+    """Say which kind of merge request pipeline ran, so a different SHA is not mistaken for a stale run."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(headPipeline=pipeline)))
+
+    # Act
+    data = await call_tool(include_jobs=False)
+
+    # Assert
+    assert data.get("pipeline_event_type") == expected_event_type
     assert len(respx.calls) == 1
 
 
