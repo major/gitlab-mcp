@@ -35,6 +35,7 @@ from gitlab_mcp.mr_common import (
     fetch_blockers,
     fetch_merge_request,
     mr_rest_path,
+    needs_mr_pipeline,
     position_fields,
 )
 lazy from gitlab_mcp.client import GitLabClient
@@ -304,6 +305,14 @@ class MergeRequestDetail(BaseModel):
         description="Numeric ID of the merge request's head pipeline.",
         exclude_if=lambda value: value is None,
     )
+    needs_mr_pipeline: bool = Field(
+        default=False,
+        description=(
+            "True when an open MR waits for CI (ci_must_pass) but has no head pipeline, often after a retarget. "
+            "Start one with create_merge_request_pipeline. Left out when false."
+        ),
+        exclude_if=lambda value: not value,
+    )
     failed_jobs: str = Field(default="", exclude_if=lambda value: not value)
     jobs_complete: bool = Field(default=True, exclude_if=lambda value: value)
     auto_merge_strategy: str = Field(default="", exclude_if=lambda v: not v)
@@ -367,6 +376,14 @@ class CompactMergeRequest(BaseModel):
     approved: bool
     approved_by: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
     pipeline_status: str = Field(default="", exclude_if=lambda v: not v)
+    needs_mr_pipeline: bool = Field(
+        default=False,
+        description=(
+            "True when an open MR waits for CI (ci_must_pass) but has no head pipeline, often after a retarget. "
+            "Start one with create_merge_request_pipeline. Left out when false."
+        ),
+        exclude_if=lambda value: not value,
+    )
     blocked_by: list[int] = Field(default_factory=list, exclude_if=lambda v: not v)  # Blocked MRs only.
     hidden_blockers: int = Field(default=0, exclude_if=lambda v: not v)  # Blockers the token cannot see.
     commits_behind: int | None = Field(default=None, exclude_if=lambda value: value is None)  # Open MRs, when asked.
@@ -922,6 +939,8 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     pipeline_id = (
         numeric_gid(pipeline.get("id"), {"Ci::Pipeline"}) if pipeline and pipeline.get("id") is not None else None
     )
+    pipeline_status = lower_or_empty(pipeline["status"]) if pipeline else ""
+    merge_status = lower_or_empty(node["detailedMergeStatus"])
     created_at = node.get("createdAt")
     merged_at, merged_by = _merged_metadata(node)
     description, description_truncated, next_description_offset = page_text(
@@ -958,13 +977,14 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         next_description_offset=next_description_offset,
         issue_keys=issue_keys or None,
         issue_keys_truncated=issue_keys_truncated or None,
-        merge_status=lower_or_empty(node["detailedMergeStatus"]),
+        merge_status=merge_status,
         should_be_rebased=node["shouldBeRebased"],
         conflicts=node["conflicts"],
         approved=node["approved"],
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
         reviewers=[_to_reviewer(reviewer) for reviewer in node["reviewers"]["nodes"]],
-        pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
+        pipeline_status=pipeline_status,
+        needs_mr_pipeline=needs_mr_pipeline(node["state"], merge_status, pipeline_status),
         pipeline_sha=(pipeline.get("sha") or "") if pipeline else "",
         # Branch pipelines send a null event type. 🚦
         pipeline_event_type=lower_or_empty(pipeline.get("mergeRequestEventType")) if pipeline else "",
@@ -989,6 +1009,8 @@ def _to_compact_detail(
     author = node["author"]
     # headPipeline can be null, so check before reading it.
     pipeline = node["headPipeline"]
+    pipeline_status = lower_or_empty(pipeline["status"]) if pipeline else ""
+    merge_status = lower_or_empty(node["detailedMergeStatus"])
     merged_at, merged_by = _merged_metadata(node)
     description, description_truncated = _cap_description(
         node.get("description") if include_description else None,
@@ -1005,12 +1027,13 @@ def _to_compact_detail(
         source_branch=node["sourceBranch"],
         target_branch=node["targetBranch"],
         head_sha=diff_refs_head_sha(node["diffRefs"]),
-        merge_status=lower_or_empty(node["detailedMergeStatus"]),
+        merge_status=merge_status,
         should_be_rebased=node["shouldBeRebased"],
         conflicts=node["conflicts"],
         approved=node["approved"],
         approved_by=[user["username"] for user in node["approvedBy"]["nodes"]],
-        pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
+        pipeline_status=pipeline_status,
+        needs_mr_pipeline=needs_mr_pipeline(node["state"], merge_status, pipeline_status),
         description=description,
         description_truncated=description_truncated,
     )

@@ -455,3 +455,22 @@ async def test_non_train_results_do_not_read_the_train(gitlab_env, mode, node_fi
     # Assert
     assert graphql_bodies(graphql, TRAIN_MARKER) == []
     assert graphql.call_count == 1
+
+
+@respx.mock
+async def test_ci_wait_with_no_head_pipeline_warns_and_keeps_the_train_warning(gitlab_env):
+    """A train MR stuck in ci_must_pass with no head pipeline says to start one, even when the train read fails."""
+    # Arrange
+    respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    node = make_landing_node(
+        detailedMergeStatus="CI_MUST_PASS", autoMergeStrategy="ADD_TO_MERGE_TRAIN_WHEN_CHECKS_PASS", headPipeline=None
+    )
+    respx.post(GRAPHQL).mock(side_effect=[graphql_response(node), httpx.Response(500)])
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert data["result"] == "merge_train"
+    assert "create_merge_request_pipeline" in data["warning"]
+    assert data["warning"].endswith("The merge train position could not be read. Check list_merge_train.")

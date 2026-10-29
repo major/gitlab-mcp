@@ -463,3 +463,26 @@ async def test_graphql_errors_propagate(gitlab_env):
     with pytest.raises(ToolError, match="denied"):
         await call_tool([1])
     assert route.call_count == 1
+
+
+@respx.mock
+async def test_needs_mr_pipeline_flags_open_merge_requests_with_no_head_pipeline(gitlab_env):
+    """Only an open MR in ci_must_pass with no head pipeline at all gets the flag."""
+    # Arrange
+    waiting = {"detailedMergeStatus": "CI_MUST_PASS"}
+    respx.post(GRAPHQL).mock(
+        side_effect=serve_batch(
+            {
+                1: waiting | {"headPipeline": None},
+                2: waiting,  # The default head pipeline passed, so GitLab is only catching up.
+                3: waiting | {"headPipeline": {"status": "RUNNING"}},
+                4: waiting | {"headPipeline": None, "state": "closed"},
+            }
+        )
+    )
+
+    # Act
+    data = await call_tool([1, 2, 3, 4])
+
+    # Assert
+    assert [mr.get("needs_mr_pipeline", False) for mr in data["merge_requests"]] == [True, False, False, False]

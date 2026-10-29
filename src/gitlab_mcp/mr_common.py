@@ -224,6 +224,23 @@ def full_sha(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
 
 
+# Shown when GitLab waits for CI that no current pipeline can satisfy. 🚦
+PIPELINE_STALL_HINT = (
+    "GitLab waits for CI (ci_must_pass), but the MR has no head pipeline. This often happens after a retarget "
+    "with no new push. If none starts soon, start one with create_merge_request_pipeline."
+)
+
+
+def needs_mr_pipeline(state: str, merge_status: str, pipeline_status: str) -> bool:
+    """Return True when an open MR waits for CI (`ci_must_pass`) but has no head pipeline at all.
+
+    A common cause is a retarget with no new push: nothing starts a pipeline for the new target. 🔁
+    Other statuses are left out on purpose. Active pipelines show `ci_still_running`, and a failed or
+    manual pipeline needs a fix or a click, not a new pipeline.
+    """
+    return state == "opened" and merge_status == "ci_must_pass" and not pipeline_status
+
+
 def mr_rest_path(project: str, iid: int) -> str:
     """Return the REST path of one merge request.
 

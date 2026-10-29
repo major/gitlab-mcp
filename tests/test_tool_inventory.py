@@ -41,6 +41,7 @@ READ_ONLY_TOOLS = {
 WRITE_TOOLS = {
     "create_issue",
     "create_merge_request",
+    "create_merge_request_pipeline",
     "create_pipeline",
     "create_work_item_note",
     "edit_merge_request_description",
