@@ -646,15 +646,6 @@ async def test_review_note_batch_schema_keeps_notes_optional_and_bounded(tools):
     assert "batch_id" in properties
 
 
-async def test_review_note_compact_schema_defaults_to_false(tools):
-    """Review note results keep their existing full form unless compact output is requested."""
-    # Arrange
-    compact = tools["post_review_notes"].input_schema["properties"]["compact"]
-
-    # Act / Assert
-    assert compact["default"] is False
-
-
 async def test_review_note_result_schema_and_recovery_guidance(tools):
     """Review output exposes bounded lifetime and unavailable-batch recovery guidance."""
     # Arrange

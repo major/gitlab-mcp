@@ -33,10 +33,10 @@ SECOND_WRITE = 2
 SECOND_CACHED_NOTE_NEW_LINE = 2
 PEOPLE_REQUESTS = 3
 WARNING_CAP = 500
-VALIDATED_BATCH_HINT = (
-    "Post all notes with this batch_id, a subset with indices, or edited text with body_overrides. "
-    "No new validation is needed."
-)
+TWO_POSTS = 2
+THREE_NOTES = 3
+FOUR_NOTES = 4
+POSTED_NOTE_ID = 101
 
 
 @pytest.fixture
@@ -86,7 +86,7 @@ def create_response(request: httpx.Request) -> httpx.Response:
     """Return a successful discussion response that echoes the requested position."""
     payload = json.loads(request.content)
     return response(
-        {"id": "discussion-1", "notes": [{"id": 101, "position": payload.get("position", {})}]},
+        {"id": "discussion-1", "notes": [{"id": POSTED_NOTE_ID, "position": payload.get("position", {})}]},
         status=201,
     )
 
@@ -125,7 +125,7 @@ def assert_unavailable(result: Any, *, head: str | None = HEAD) -> dict[str, Any
     """Check the safe, structured response for an unavailable single-use batch."""
     assert not result.is_error
     data = result.structured_content
-    assert data["results"] == []
+    assert "results" not in data
     assert data["batch_error"] == "unavailable"
     assert data.get("current_head_sha") == head
     warning = data["warning"].lower()
@@ -168,10 +168,8 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     token_data = prepared.structured_content
     assert token_data["batch_id"]
     assert token_data["ttl_seconds"] == review_batches.ReviewBatchCache.TTL_SECONDS
-    assert token_data["hint"] == VALIDATED_BATCH_HINT
-    assert "expires_at" not in token_data
     assert "batch_error" not in token_data
-    assert [row["status"] for row in token_data["results"]] == ["validated"] * 3
+    assert token_data["validated_count"] == THREE_NOTES
     batch_id = token_data["batch_id"]
     changed_body_path.write_text("changed after validation", encoding="utf-8")
     deleted_body_path.unlink()
@@ -180,9 +178,8 @@ async def test_validated_batch_posts_frozen_bodies_and_positions(
     # Assert
     assert not posted.is_error
     assert "ttl_seconds" not in posted.structured_content
-    assert "hint" not in posted.structured_content
     assert "batch_error" not in posted.structured_content
-    assert [row["status"] for row in posted.structured_content["results"]] == ["posted"] * 3
+    assert posted.structured_content["posted_count"] == THREE_NOTES
     requests = [json.loads(call.request.content) for call in post_route.calls]
     assert [request["body"] for request in requests] == ["inline body", "original file body", "deleted file body"]
     assert [request.get("position", {}) for request in requests] == [
@@ -282,10 +279,7 @@ async def test_batch_indices_post_in_supplied_order_and_keep_original_result_ind
 
     # Assert
     assert not posted.is_error
-    assert [(row["index"], row["status"]) for row in posted.structured_content["results"]] == [
-        (2, "posted"),
-        (0, "posted"),
-    ]
+    assert posted.structured_content["posted_count"] == TWO_POSTS
     requests = [json.loads(call.request.content) for call in post_route.calls]
     assert [request["body"] for request in requests] == ["note 3", "note 1"]
 
@@ -365,13 +359,8 @@ async def test_subset_override_and_extra_notes_post_then_add_people(review_clien
 
     # Assert
     assert not posted.is_error
-    # Extra notes are numbered after the three-note cached batch.
-    assert [(row["index"], row["status"]) for row in posted.structured_content["results"]] == [
-        (2, "posted"),
-        (0, "posted"),
-        (3, "posted"),
-        (4, "posted"),
-    ]
+    assert posted.structured_content["posted_count"] == FOUR_NOTES
+    assert posted.structured_content["note_ids"] == [POSTED_NOTE_ID] * FOUR_NOTES
     assert posted.structured_content["people"]["applied"] == ["add_reviewers", "add_assignees"]
     assert [json.loads(call.request.content)["body"] for call in post_route.calls] == [
         "replacement third",
@@ -520,7 +509,7 @@ async def test_stale_live_head_consumes_token_without_writes(review_client: Clie
 
     # Assert
     assert not stale.is_error
-    assert stale.structured_content["results"] == [{"index": 0, "status": "unattempted"}]
+    assert stale.structured_content["unattempted"] == [0]
     assert "stale" in stale.structured_content["warning"].lower()
     assert len(mr_route.calls) == prior_mr_calls + 1
     assert len(diff_route.calls) == prior_diff_calls
@@ -647,13 +636,9 @@ async def test_invalid_extra_note_blocks_every_write_and_reports_its_index(revie
     # Assert
     assert not result.is_error
     rows = result.structured_content["results"]
-    assert [(row["index"], row["status"]) for row in rows] == [
-        (0, "validated"),
-        (1, "validated"),
-        (2, "validated"),
-        (3, "failed"),
-    ]
-    assert "line 99" in rows[3]["reason"]
+    assert [(row["index"], row["status"]) for row in rows] == [(3, "failed")]
+    assert result.structured_content["validated_count"] == THREE_NOTES
+    assert "line 99" in rows[0]["reason"]
     assert "No notes were posted" in result.structured_content["warning"]
     assert not post_route.called
 
@@ -704,7 +689,6 @@ async def test_failed_validation_does_not_return_a_batch_token(review_client: Cl
     assert not result.is_error
     assert "batch_id" not in result.structured_content
     assert "ttl_seconds" not in result.structured_content
-    assert "hint" not in result.structured_content
     assert result.structured_content["results"][0]["status"] == "failed"
     assert len(mr_route.calls) == MR_CALLS_PER_PREFLIGHT
     assert len(diff_route.calls) == 1
@@ -787,7 +771,7 @@ async def test_batch_remains_claimable_just_before_expiration(
 
     # Assert
     assert not posted.is_error
-    assert posted.structured_content["results"][0]["status"] == "posted"
+    assert posted.structured_content["posted_count"] == 1
     assert len(post_route.calls) == 1
 
 
@@ -837,7 +821,7 @@ async def test_concurrent_calls_claim_a_token_once(review_client: Client) -> Non
     unavailable = next(result for result in (first, second) if result.structured_content.get("batch_error"))
     assert_unavailable(unavailable)
     posted = next(result for result in (first, second) if not result.structured_content.get("batch_error"))
-    assert posted.structured_content["results"][0]["status"] == "posted"
+    assert posted.structured_content["posted_count"] == 1
     assert len(post_route.calls) == 1
     assert len(mr_route.calls) == MR_CALLS_FOR_VALIDATE_AND_POST + 1
     assert len(diff_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
@@ -868,7 +852,6 @@ async def test_unavailable_token_reports_live_sha_without_diff_refs(
         **note_args(
             batch_id="secret-batch-token",
             head_sha=supplied_sha,
-            compact=True,
             add_reviewers=["alice"],
             add_assignees=["bob"],
         ),
@@ -985,7 +968,9 @@ async def test_unknown_write_outcome_stops_batch_and_consumes_token(review_clien
 
     # Assert
     assert not posted.is_error
-    assert [row["status"] for row in posted.structured_content["results"]] == ["posted", "unknown", "unattempted"]
+    assert posted.structured_content["posted_count"] == 1
+    assert [row["status"] for row in posted.structured_content["results"]] == ["unknown"]
+    assert posted.structured_content["unattempted"] == [2]
     assert "outcome is unknown" in posted.structured_content["warning"]
     assert len(post_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
     assert not people_route.called
@@ -1029,7 +1014,7 @@ async def test_people_changes_follow_every_successful_batch_post(review_client: 
 
     # Assert
     assert not posted.is_error
-    assert [row["status"] for row in posted.structured_content["results"]] == ["posted", "posted"]
+    assert posted.structured_content["posted_count"] == TWO_POSTS
     assert posted.structured_content["people"]["applied"] == ["add_reviewers", "add_assignees"]
     request_order = [
         "discussion" if "query" not in json.loads(call.request.content) else "people"
