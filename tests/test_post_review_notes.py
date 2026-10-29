@@ -316,7 +316,7 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
         {
             "index": 0,
             "status": "failed",
-            "reason": "body_path must be an absolute server-local path",
+            "reason": "body_path must be absolute unless body_dir is set",
             "position": {"path": "src.py", "line": 1},
         },
         {
@@ -537,6 +537,30 @@ async def test_missing_body_file_fails_only_its_note_and_posts_nothing(gitlab_en
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
     assert not post_route.called
+
+
+@respx.mock
+async def test_body_dir_resolves_relative_paths_and_keeps_absolute_paths(gitlab_env, tmp_path):
+    """With body_dir set, relative body paths resolve inside it and absolute paths still work."""
+    # Arrange
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    (notes_dir / "01.md").write_text("relative body", encoding="utf-8")
+    absolute_body = tmp_path / "absolute.md"
+    absolute_body.write_text("absolute body", encoding="utf-8")
+    add_preflight([([diff_file("src.py")], None)])
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [
+        {"file": "src.py", "line": 1, "body_path": "01.md"},
+        {"file": "src.py", "line": 1, "body_path": str(absolute_body)},
+    ]
+
+    # Act
+    data = await call_tool(notes=notes, body_dir=str(notes_dir))
+
+    # Assert
+    assert [row["status"] for row in data["results"]] == ["posted", "posted"]
+    assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["relative body", "absolute body"]
 
 
 @respx.mock
@@ -952,7 +976,8 @@ async def test_invalid_head_sha_returns_unattempted_without_requests(gitlab_env,
 @pytest.mark.parametrize(
     ("body_kind", "expected_reason"),
     [
-        ("relative", "body_path must be an absolute server-local path"),
+        ("relative", "body_path must be absolute unless body_dir is set"),
+        ("escape", "body_path must stay inside body_dir"),
         ("directory", "body_path must point to a regular file"),
         ("oversize", "body exceeds 100000 UTF-8 bytes"),
         ("invalid-utf8", "body_path is not valid UTF-8"),
@@ -960,7 +985,16 @@ async def test_invalid_head_sha_returns_unattempted_without_requests(gitlab_env,
         ("blank-inline", "body must not be blank"),
         ("oversize-inline", "body exceeds 100000 UTF-8 bytes"),
     ],
-    ids=["relative", "directory", "oversize", "invalid-utf8", "blank-file", "blank-inline", "oversize-inline"],
+    ids=[
+        "relative",
+        "escape",
+        "directory",
+        "oversize",
+        "invalid-utf8",
+        "blank-file",
+        "blank-inline",
+        "oversize-inline",
+    ],
 )
 @respx.mock
 async def test_unusable_note_body_fails_its_note_without_any_gitlab_request(
@@ -973,8 +1007,15 @@ async def test_unusable_note_body_fails_its_note_without_any_gitlab_request(
     # Arrange
     body_path = tmp_path / "body.txt"
     note: dict[str, Any] = {"file": "src.py", "line": 1}
+    extra: dict[str, Any] = {}
     if body_kind == "relative":
         note["body_path"] = "relative-body.txt"
+    elif body_kind == "escape":
+        # The file exists, but it sits one level above body_dir. 🛡️
+        body_path.write_text("secret", encoding="utf-8")
+        (tmp_path / "notes").mkdir()
+        note["body_path"] = "../body.txt"
+        extra["body_dir"] = str(tmp_path / "notes")
     elif body_kind == "directory":
         note["body_path"] = str(tmp_path)
     elif body_kind == "oversize":
@@ -994,7 +1035,7 @@ async def test_unusable_note_body_fails_its_note_without_any_gitlab_request(
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
 
     # Act
-    data = await call_tool(notes=[note])
+    data = await call_tool(notes=[note], **extra)
 
     # Assert
     assert data["results"] == [{"index": 0, "status": "failed", "reason": expected_reason}]

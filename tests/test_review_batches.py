@@ -381,14 +381,19 @@ async def test_subset_applies_original_index_override_then_adds_people(review_cl
     assert len(people_route.calls) == PEOPLE_REQUESTS
 
 
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative-to-body-dir"])
 @respx.mock
-async def test_batch_body_path_override_reads_replacement_body(review_client: Client, tmp_path: Path) -> None:
-    """A cached note body can be replaced by a server-local body path."""
+async def test_batch_body_path_override_reads_replacement_body(
+    review_client: Client, tmp_path: Path, relative: bool
+) -> None:
+    """A cached note body can be replaced by a server-local body path, absolute or relative to body_dir."""
     # Arrange
     add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     body_path = tmp_path / "replacement.txt"
     body_path.write_text("replacement from path", encoding="utf-8")
+    override = {"index": 0, "body_path": body_path.name if relative else str(body_path)}
+    extra: dict[str, Any] = {"body_dir": str(tmp_path)} if relative else {}
     prepared = await call_review(
         review_client,
         **note_args(notes=[{"file": "src.py", "line": 1, "body": "cached body"}], validate_only=True),
@@ -397,10 +402,7 @@ async def test_batch_body_path_override_reads_replacement_body(review_client: Cl
     # Act
     posted = await call_review(
         review_client,
-        **note_args(
-            batch_id=prepared.structured_content["batch_id"],
-            body_overrides=[{"index": 0, "body_path": str(body_path)}],
-        ),
+        **note_args(batch_id=prepared.structured_content["batch_id"], body_overrides=[override], **extra),
     )
 
     # Assert
@@ -578,6 +580,10 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
         pytest.param(
             {"batch_id": "token", "validate_only": True, "body_overrides": [{"index": 0, "body": "replacement"}]},
             id="overrides-with-validation",
+        ),
+        pytest.param(
+            {"notes": [{"file": "src.py", "line": 1, "body_path": "01.md"}], "body_dir": "relative/notes"},
+            id="relative-body-dir",
         ),
     ],
 )

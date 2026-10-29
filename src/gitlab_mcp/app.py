@@ -93,7 +93,8 @@ mcp = FastMCP(
         "view=full|headings|finding, include_mr_status, count_only, cursor); "
         "edit_merge_request_note(project, iid, thread_id, note_id, expected_hash, body, old_text, new_text); "
         "post_review_notes(project, iid, head_sha, notes=[{file, line or old_line (neither for a file-level note), "
-        "body or body_path}] or batch_id, indices, body_overrides, add_reviewers, add_assignees, validate_only); "
+        "body or body_path}] or batch_id, indices, body_overrides, body_dir, add_reviewers, add_assignees, "
+        "validate_only); "
         "update_merge_request(project, iid, add_reviewers, remove_reviewers, add_assignees, remove_assignees, "
         "add_labels, remove_labels, add_blocked_by, remove_blocked_by, approve with sha, rebase)."
     ),

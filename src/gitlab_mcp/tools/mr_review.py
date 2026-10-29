@@ -1,6 +1,7 @@
 """Merge request inline review note tools: validate and post diff comments 📝."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
@@ -39,7 +40,7 @@ class ReviewNote(BaseModel):
     Omit ``file``, ``line``, and ``old_line`` for a general merge-request discussion. Set ``file`` without either
     line coordinate for a file-level note, or set a file and at most one line coordinate for an inline note. Set
     exactly one of ``body`` or ``body_path``. The body may contain up to 100000 UTF-8 bytes. ``body_path`` must be an
-    absolute server-local path to a regular UTF-8 file.
+    absolute server-local path to a regular UTF-8 file, or a path relative to the tool's ``body_dir``.
     """
 
     file: str | None = Field(default=None, min_length=1, description="Diff path. Omit for a general MR note.")
@@ -57,7 +58,7 @@ class ReviewNote(BaseModel):
     )
     body_path: str | None = Field(
         default=None,
-        description="Absolute server-local note file.",
+        description="Absolute server-local note file, or a path relative to body_dir.",
     )
 
     @model_validator(mode="after")
@@ -79,7 +80,9 @@ class ReviewNoteBodyOverride(BaseModel):
 
     index: Annotated[int, Field(strict=True, ge=0)] = Field(description="Zero-based index in the cached review batch.")
     body: str | None = Field(default=None, description="Replacement inline note text.")
-    body_path: str | None = Field(default=None, description="Absolute server-local replacement note file.")
+    body_path: str | None = Field(
+        default=None, description="Absolute server-local replacement file, or relative to body_dir."
+    )
 
     @model_validator(mode="after")
     def validate_body_source(self) -> ReviewNoteBodyOverride:
@@ -224,13 +227,29 @@ def _note_reason(message: str) -> str:
     return message[:REVIEW_NOTE_REASON_CAP]
 
 
-def _read_review_note_body(note: ReviewNote) -> str:
+def _resolve_body_path(body_path: str, body_dir: str | None) -> str:
+    """Return the path to read: absolute paths as given, relative paths joined to `body_dir`.
+
+    The joined path is resolved first, so `..` parts and symlinks that leave `body_dir` are rejected. 🛡️
+    """
+    if Path(body_path).is_absolute():
+        return body_path
+    if body_dir is None:
+        raise_review_preflight_error("body_path must be absolute unless body_dir is set")
+    base = Path(body_dir).resolve()
+    resolved = (base / body_path).resolve()
+    if not resolved.is_relative_to(base):
+        raise_review_preflight_error("body_path must stay inside body_dir")
+    return str(resolved)
+
+
+def _read_review_note_body(note: ReviewNote, body_dir: str | None) -> str:
     """Return one usable note body, or raise a ValueError or OSError that says why it is not usable."""
     if note.body is not None:
         body = note.body
     else:
         body = read_server_local_utf8_file(
-            note.body_path or "",
+            _resolve_body_path(note.body_path or "", body_dir),
             path_field="body_path",
             size_field="body",
             byte_limit=REVIEW_NOTE_BODY_CAP,
@@ -242,12 +261,12 @@ def _read_review_note_body(note: ReviewNote) -> str:
     return body
 
 
-def _read_review_note_bodies(notes: list[ReviewNote]) -> list[_CheckedNote]:
+def _read_review_note_bodies(notes: list[ReviewNote], body_dir: str | None) -> list[_CheckedNote]:
     """Read every note body before any GitLab request, recording a reason for each unusable one."""
     checks: list[_CheckedNote] = []
     for note in notes:
         try:
-            checks.append(_CheckedNote(body=_read_review_note_body(note)))
+            checks.append(_CheckedNote(body=_read_review_note_body(note, body_dir)))
         except OSError as exc:
             checks.append(_CheckedNote(reason=_note_reason(f"body_path could not be read: {exc}")))
         except ValueError as exc:
@@ -976,13 +995,14 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     head_sha: str,
     notes: list[ReviewNote],
     validate_only: bool,
+    body_dir: str | None,
 ) -> PostReviewNotesResult:
     """Run preflight, then validate or post the notes. The public tool adds people changes after this returns."""
     if not full_sha(head_sha):
         return _unattempted_review_notes(
             len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
         )
-    checks = _read_review_note_bodies(notes)
+    checks = _read_review_note_bodies(notes, body_dir)
     if all(check.reason for check in checks):
         return _review_preflight_result(checks)
 
@@ -1117,6 +1137,16 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
             ),
         ),
     ] = None,
+    body_dir: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            description=(
+                "Absolute server-local directory. Relative body_path values in notes and body_overrides resolve "
+                "inside it, so each note can send only a short file name."
+            ),
+        ),
+    ] = None,
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
@@ -1151,10 +1181,11 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     A file-level note needs only the file's path in the diff, so it works for findings outside diff hunks and for
     collapsed or too-large diffs. General notes do not read diff pages, but still check the merge request head twice.
     A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
-    computer. All bodies, diff lines, and paths are checked before the first post. A second head check is preflight
-    only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are sequential
-    and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check every result
-    before deciding what to do next.
+    computer. Set `body_dir` to send relative `body_path` values, such as `01.md`, that must stay inside it; absolute
+    paths still work. All bodies, diff lines, and paths are checked before the first post. A second head check is
+    preflight only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are
+    sequential and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check
+    every result before deciding what to do next.
     Normal posted rows contain only `index`, `status`, `note_id`, and `discussion_id`. Failed, unknown, and unverified
     rows include a `reason` and any available `position`. `add_reviewers` and `add_assignees` add people only after
     every note posts, in the same call. They are ignored when `validate_only` is true.
@@ -1171,6 +1202,8 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
         raise ToolError("body_overrides can only be used with batch_id.")  # noqa: TRY003
     if indices is not None and batch_id is None:
         raise ToolError("indices can only be used with batch_id.")  # noqa: TRY003
+    if body_dir is not None and not Path(body_dir).is_absolute():
+        raise ToolError("body_dir must be an absolute server-local directory.")  # noqa: TRY003
 
     selected_indices = list(range(len(notes or [])))
     if batch_id is not None:
@@ -1184,7 +1217,7 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     if notes is None:
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
-    result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only)
+    result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only, body_dir)
     result = result.model_copy(
         update={
             "results": [row.model_copy(update={"index": selected_indices[row.index]}) for row in result.results],
