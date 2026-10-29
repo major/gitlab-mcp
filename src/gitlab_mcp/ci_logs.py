@@ -194,6 +194,11 @@ def pytest_result_line(line: str) -> bool:
     return bool(_PYTEST_COUNTS_PATTERN.fullmatch(line))
 
 
+def pytest_summary_header(line: str) -> bool:
+    """Return whether a line starts pytest's short test summary block."""
+    return bool(_PYTEST_SUMMARY_HEADER_PATTERN.fullmatch(line.removesuffix("\n")))
+
+
 def actionable_failure_line(line: str) -> bool:
     """Recognize diagnostic causes, excluding generic make and runner footers and passing pytest output."""
     if (

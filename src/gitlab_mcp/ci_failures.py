@@ -19,6 +19,9 @@ DEFAULT_LOG_CHARS = 1000
 MIN_LOG_CHARS = 1
 MAX_LOG_CHARS = 1000
 LOG_BATCH_SIZE = 10
+SUMMARY_MESSAGE_CHARS = 80
+# A parametrized node ID can hold spaces inside its brackets, so a bracket group is matched as one unit. 🧪
+_PYTEST_SUMMARY_ROW = re.compile(r"(?P<node>\s*(?:FAILED|ERROR) (?:[^\s\[]*\[[^\]]*\]\S*|\S+))(?: - (?P<message>.*))?")
 _PYTEST_PASSED_ROW = re.compile(
     r"(?:^\s*\S*::.*\s+PASSED(?:\s+\[\s*\d+%\])?\s*$"
     r"|^\s*(?:\[gw\d+\]\s*)?(?:\[\s*\d+%\]\s*)?PASSED\s+\S*::.*\s*$)",
@@ -67,6 +70,11 @@ class FailureLog(BaseModel):
     next_offset: int | None = Field(
         default=None,
         description="Raw byte offset after the last complete line of a cut prefix, for get_job_log byte_offset.",
+        exclude_if=lambda value: value is None,
+    )
+    failed_tests_omitted: int | None = Field(
+        default=None,
+        description="Count of the last pytest summary rows left out because their node IDs did not fit in log_chars.",
         exclude_if=lambda value: value is None,
     )
     hint: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -174,14 +182,116 @@ def _excluded_evidence_lines(lines: list[str]) -> set[int]:
     return excluded
 
 
-def _excerpt(text: str, log_chars: int) -> tuple[str, bool, bool]:
-    """Budget cause and make lines before traceback context, keeping selected lines in source order."""
+def _summary_row_parts(line: str) -> tuple[str, str] | None:
+    """Split one pytest summary row into its `FAILED <node ID>` part and its message, or return None."""
+    line = line.rstrip("\n")
+    if match := _PYTEST_SUMMARY_ROW.fullmatch(line):
+        return match["node"], match["message"] or ""
+    if line.lstrip().startswith(("FAILED ", "ERROR ")):
+        # An unusual node ID did not split cleanly, so keep the whole row rather than lose part of the ID. 🛟
+        return line, ""
+    return None
+
+
+def _summary_block(lines: list[str]) -> tuple[int, int, list[tuple[str, str]], str | None] | None:
+    """Find the last pytest summary block as (first line, end line, rows, result line), or None without rows.
+
+    The block starts at the last `short test summary info` header. GitLab's summary holds only the last 100 lines,
+    so a long block can lose its header; then the block is found by walking back from the last result line. The
+    block stops at the first line that is not a row, so a cut log cannot pull later lines into it.
+    """
+    header = max((index for index, line in enumerate(lines) if ci_logs.pytest_summary_header(line)), default=None)
+    if header is not None:
+        first, end = header, header + 1
+    else:
+        end = max((index for index, line in enumerate(lines) if ci_logs.pytest_result_line(line)), default=None)
+        if end is None:
+            return None
+        while end > 0 and _summary_row_parts(lines[end - 1]):
+            end -= 1
+        first = end
+    rows: list[tuple[str, str]] = []
+    while end < len(lines) and (parts := _summary_row_parts(lines[end])):
+        rows.append(parts)
+        end += 1
+    result = None
+    if end < len(lines) and ci_logs.pytest_result_line(lines[end]):
+        result = lines[end].strip().strip("=").strip() + "\n"
+        end += 1
+    if not rows:
+        return None
+    return first, end, rows, result
+
+
+def _fit_summary_rows(rows: list[tuple[str, str]], budget: int) -> tuple[str, bool, int]:
+    """Fit every row into the budget, cutting messages first, then leaving out the last node IDs.
+
+    Messages are kept whole, then cut to `SUMMARY_MESSAGE_CHARS`, then dropped. Return the text, whether any text
+    was cut, and how many rows were left out.
+    """
+    for limit in (None, SUMMARY_MESSAGE_CHARS, 0):
+        body = "".join(_summary_row(node, message, limit) for node, message in rows)
+        if len(body) <= budget:
+            return body, limit is not None and any(len(message) > limit for _, message in rows), 0
+    kept: list[str] = []
+    for node, _ in rows:
+        row = _summary_row(node, "", 0)
+        if len(row) > budget:
+            break
+        kept.append(row)
+        budget -= len(row)
+    return "".join(kept), True, len(rows) - len(kept)
+
+
+def _summary_row(node: str, message: str, limit: int | None) -> str:
+    """Render one summary row, cutting the message to `limit` characters (None keeps it, 0 drops it)."""
+    if not message or limit == 0:
+        return f"{node}\n"
+    if limit is not None and len(message) > limit:
+        message = message[: limit - 3] + "..."
+    return f"{node} - {message}\n"
+
+
+def _pytest_excerpt(lines: list[str], excluded: set[int], log_chars: int) -> tuple[str, bool, int] | None:
+    """Keep every pytest summary node ID, the result line, and later make targets, then earlier causes if room.
+
+    Earlier causes (like `E` lines, lint errors, or an earlier pytest run) use only the space left after the summary,
+    and stay before it in source order. Return None when the log has no summary rows or the footer fills the budget.
+    """
+    if (block := _summary_block(lines)) is None:
+        return None
+    first, end, rows, result = block
+    targets = [
+        line for index, line in enumerate(lines[end:], end) if index not in excluded and ci_logs.make_failure_line(line)
+    ]
+    footer = (result or "") + "".join(targets)
+    budget = log_chars - len(footer)
+    if budget <= 0:
+        return None
+    body, truncated, omitted = _fit_summary_rows(rows, budget)
+    spare = budget - len(body)
+    # A tiny leftover would only hold a cut fragment, so skip it and report the cut instead.
+    before, before_cut, _, before_omitted = _excerpt(
+        "".join(lines[:first]), spare if spare >= SUMMARY_MESSAGE_CHARS else 0
+    )
+    return before + body + footer, truncated or before_cut, omitted + before_omitted
+
+
+def _excerpt(text: str, log_chars: int) -> tuple[str, bool, bool, int]:
+    """Budget cause and make lines before traceback context, keeping selected lines in source order.
+
+    A pytest short test summary takes over the selection, so every failed node ID is kept. The last value counts
+    summary rows left out because even bare node IDs did not fit.
+    """
     lines = text.splitlines(keepends=True)
     excluded = _excluded_evidence_lines(lines)
+    if pytest_excerpt := _pytest_excerpt(lines, excluded, log_chars):
+        excerpt, truncated, omitted = pytest_excerpt
+        return excerpt, truncated, True, omitted
+    targets = [index for index, line in enumerate(lines) if index not in excluded and ci_logs.make_failure_line(line)]
     causes = [
         index for index, line in enumerate(lines) if index not in excluded and ci_logs.actionable_failure_line(line)
     ]
-    targets = [index for index, line in enumerate(lines) if index not in excluded and ci_logs.make_failure_line(line)]
     context = {
         after
         for index in causes
@@ -191,10 +301,10 @@ def _excerpt(text: str, log_chars: int) -> tuple[str, bool, bool]:
     }
     selected = set(causes) | set(targets) | context
     if not selected:
-        return "", False, False
+        return "", False, False, 0
     selected_chars = sum(len(lines[index]) for index in selected)
     if selected_chars <= log_chars:
-        return "".join(lines[index] for index in sorted(selected)), False, bool(causes)
+        return "".join(lines[index] for index in sorted(selected)), False, bool(causes), 0
 
     # Reserve space for both a target and a cause before filling the rest of the budget.
     priority = targets[:1] + causes[:1]
@@ -215,7 +325,7 @@ def _excerpt(text: str, log_chars: int) -> tuple[str, bool, bool]:
         if remaining == 0:
             break
     excerpt = "".join(pieces[index] for index in sorted(pieces))
-    return excerpt, selected_chars > len(excerpt), bool(causes)
+    return excerpt, selected_chars > len(excerpt), bool(causes), 0
 
 
 def _log(
@@ -225,10 +335,11 @@ def _log(
     source: Literal["summary", "trace_prefix", "trace_prefix_and_summary"],
 ) -> FailureLog:
     """Select evidence or retain the bounded available text when no marker is present."""
-    excerpt, truncated, actionable = _excerpt(text, log_chars)
+    excerpt, truncated, actionable, omitted = _excerpt(text, log_chars)
     if not excerpt or (source == "summary" and not actionable):
         truncated = len(text) > log_chars
         excerpt = text[-log_chars:]
+        omitted = 0
     return FailureLog(
         job_id=job_id,
         text=excerpt,
@@ -236,6 +347,7 @@ def _log(
         truncated=truncated,
         available=True,
         source=source,
+        failed_tests_omitted=omitted or None,
     )
 
 
@@ -248,7 +360,7 @@ async def _job_log(
 ) -> FailureLog:
     """Use a summary cause when present, otherwise try one bounded trace prefix."""
     tail = None if summary is None else ci_logs.clean_log_text(ci_logs.html_summary_text(summary))
-    _, _, actionable = _excerpt(tail or "", log_chars)
+    _, _, actionable, _ = _excerpt(tail or "", log_chars)
     if tail is None:
         log = FailureLog(job_id=job_id, text="", chars=0, truncated=False, available=False)
     else:
@@ -264,7 +376,7 @@ async def _job_log(
         return log
 
     raw = ci_logs.clean_log_text(raw)
-    _, _, raw_actionable = _excerpt(raw, log_chars)
+    _, _, raw_actionable, _ = _excerpt(raw, log_chars)
     if raw_actionable or tail is None:
         # A cut prefix can contain the cause while a later make target appears only in the summary.
         raw_lines = set(raw.splitlines())

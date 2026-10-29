@@ -258,6 +258,77 @@ async def test_pytest_failure_after_warning_section_stays_on_fast_path(next_head
     assert "SocketBlockedError" not in log["text"]
 
 
+def pytest_summary(node_ids: list[str], message: str) -> str:
+    """Build a pytest short test summary block, its result line, and a make footer."""
+    rows = "".join(f"FAILED {node_id} - {message}\n" for node_id in node_ids)
+    return (
+        "E   AssertionError: earlier detail\n"
+        "=========================== short test summary info ============================\n"
+        + rows
+        + f"============ {len(node_ids)} failed, 30638 passed, 65 skipped in 342.23s ============\n"
+        "make: *** [Makefile:104: test] Error 1\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("node_count", "id_length", "message", "shown", "omitted"),
+    [
+        (1, 30, "AssertionError: assert 1 == 2", " - AssertionError: assert 1 == 2\n", None),
+        (4, 70, "AssertionError: assert " + "x" * 300, " - AssertionError: assert " + "x" * 54 + "...\n", None),
+        (8, 70, "AssertionError: assert " + "x" * 300, "\n", None),
+        (8, 300, "AssertionError", "\n", 6),
+    ],
+    ids=["fits-as-is", "messages-cut", "messages-dropped", "node-ids-omitted"],
+)
+@respx.mock
+async def test_pytest_summary_keeps_every_node_id_and_result_line(node_count, id_length, message, shown, omitted):
+    """A pytest summary cuts messages before it drops node IDs, and always keeps the result counts."""
+    # Arrange
+    node_ids = [f"tests/test_{index}.py::test_" + "n" * (id_length - 20) for index in range(node_count)]
+    respx.get(JOBS_URL).mock(return_value=httpx.Response(200, json=[job(11)]))
+    respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=summaries(pytest_summary(node_ids, message))))
+    route = trace(11, httpx.Response(200, text="not requested"))
+
+    # Act
+    data = await call_tool("get_pipeline_failures", {"project": PROJECT, "pipeline_id": 901})
+
+    # Assert
+    log = data["logs"][0]
+    kept = node_count - (omitted or 0)
+    rows = "".join(f"FAILED {node_id}{shown}" for node_id in node_ids[:kept])
+    counts = f"{node_count} failed, 30638 passed, 65 skipped in 342.23s\n"
+    assert route.call_count == 0
+    assert log["chars"] == len(log["text"]) <= MAX_EXCERPT_CHARS
+    assert (
+        log["text"]
+        == "E   AssertionError: earlier detail\n" + rows + counts + "make: *** [Makefile:104: test] Error 1\n"
+    )
+    assert log["truncated"] is (shown != f" - {message}\n")
+    assert log.get("failed_tests_omitted") == omitted
+
+
+@respx.mock
+async def test_pytest_summary_without_its_header_keeps_unusual_rows_whole():
+    """Rows found by walking back from the result line keep ERROR rows and odd bracket IDs whole."""
+    # Arrange
+    respx.get(JOBS_URL).mock(return_value=httpx.Response(200, json=[job(11)]))
+    rows = (
+        "FAILED tests/test_a.py::test_x[[1, 2] y] - boom\n"
+        "ERROR tests/test_b.py::test_y[two words] - fixture 'db' not found\n"
+    )
+    summary = "collected output\n" + rows + "==== 1 failed, 1 error in 1.0s ====\nartifact upload\n"
+    respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=summaries(summary)))
+    route = trace(11, httpx.Response(200, text="not requested"))
+
+    # Act
+    data = await call_tool("get_pipeline_failures", {"project": PROJECT, "pipeline_id": 901})
+
+    # Assert
+    assert route.call_count == 0
+    assert data["logs"][0]["text"] == rows + "1 failed, 1 error in 1.0s\n"
+    assert data["logs"][0]["truncated"] is False
+
+
 @respx.mock
 async def test_standalone_failures_view_keeps_its_existing_broad_marker_selection():
     """The raw failures view still matches broad error markers in their original order."""
