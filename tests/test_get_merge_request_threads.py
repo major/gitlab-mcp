@@ -400,14 +400,12 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
                 "notes": [
                     {
                         "note_id": 1,
-                        "body_hash": hashlib.sha256(b"Rename this.").hexdigest(),
                         "by": "mhayden",
                         "body": "Rename this.",
                         "at": "2026-10-21",
                     },
                     {
                         "note_id": 2,
-                        "body_hash": hashlib.sha256(b"Done.").hexdigest(),
                         "by": "bkearney",
                         "body": "Done.",
                         "at": "2026-10-22",
@@ -424,7 +422,7 @@ async def test_sends_variables_and_maps_fields(gitlab_env):
 )
 @respx.mock
 async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env, root_type, reply_type):
-    """Supported note GIDs become REST IDs with hashes of the untouched UTF-8 bodies in every view."""
+    """Supported note GIDs become REST IDs, with opt-in hashes of the untouched UTF-8 bodies in every view."""
     # Arrange
     root_body = "Résumé 🧪\n\n<!-- review-bot:finding hidden -->\n"
     reply_body = "Reply with trailing space  "
@@ -434,10 +432,10 @@ async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env, root_typ
 
     # Act
     results = [
-        await call_tool(view="full"),
-        await call_tool(view="finding"),
-        await call_tool(view="full", max_body_chars=3),
-        await call_tool(view="finding", max_body_chars=0),
+        await call_tool(view="full", include_hashes=True),
+        await call_tool(view="finding", include_hashes=True),
+        await call_tool(view="full", max_body_chars=3, include_hashes=True),
+        await call_tool(view="finding", max_body_chars=0, include_hashes=True),
     ]
     headings = await call_tool(view="headings")
 
@@ -538,8 +536,8 @@ async def test_zero_body_output_budget_accounts_for_note_metadata(gitlab_env, vi
     route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
 
     # Act
-    first = await call_tool(view=view, max_body_chars=0)
-    second = await call_tool(view=view, max_body_chars=0, cursor=first["next_cursor"])
+    first = await call_tool(view=view, max_body_chars=0, include_hashes=True)
+    second = await call_tool(view=view, max_body_chars=0, include_hashes=True, cursor=first["next_cursor"])
 
     # Assert
     assert len(json.dumps(first["threads"], ensure_ascii=False, separators=(",", ":"))) <= THREAD_BODY_BUDGET
@@ -1020,7 +1018,6 @@ async def test_null_author_and_general_note_leave_out_fields(gitlab_env):
     assert thread["notes"] == [
         {
             "note_id": 1,
-            "body_hash": hashlib.sha256(b"Please rename this.").hexdigest(),
             "body": "Please rename this.",
             "at": "2026-10-20",
         }
@@ -1419,8 +1416,8 @@ async def test_finding_view_compacts_bot_greeting_and_signoff_preserving_finding
     respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("finding", note))))
 
     # Act
-    full = await call_tool()
-    finding = await call_tool(view="finding")
+    full = await call_tool(include_hashes=True)
+    finding = await call_tool(view="finding", include_hashes=True)
 
     # Assert
     assert full["threads"][0]["notes"][0]["body"] == body
@@ -1879,8 +1876,8 @@ async def test_custom_body_cap_is_used_when_resuming_budget_cursor(gitlab_env):
     route = respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
 
     # Act
-    first = await call_tool(max_body_chars=3)
-    second = await call_tool(max_body_chars=3, cursor=first["next_cursor"])
+    first = await call_tool(max_body_chars=3, include_hashes=True)
+    second = await call_tool(max_body_chars=3, include_hashes=True, cursor=first["next_cursor"])
 
     # Assert
     assert thread_ids(first) + thread_ids(second) == [f"t{index}" for index in range(len(discussions))]

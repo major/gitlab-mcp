@@ -57,6 +57,7 @@ def make_mr(**overrides: Any) -> dict[str, Any]:
         "diffStatsSummary": {"additions": 483, "deletions": 15, "fileCount": 7},
         "resolvableDiscussionsCount": 0,
         "resolvedDiscussionsCount": 0,
+        "userDiscussionsCount": 0,
         "discussions": make_discussions(),
     }
     return node | overrides
@@ -239,28 +240,21 @@ async def test_include_threads_controls_graphql_fetch_and_output(
 
 
 @pytest.mark.parametrize(
-    ("resolvable_count", "resolved_count", "expected_open", "expected_resolved"),
+    ("counts", "expected"),
     [
-        (0, 0, 0, 0),
-        (6, 2, 4, 2),
-        (None, None, 0, 0),
+        ((0, 0, 0), (0, 0, None)),
+        ((6, 2, 9), (4, 2, 3)),
+        ((0, 0, 1), (0, 0, 1)),
+        ((None, None, None), (0, 0, None)),
     ],
-    ids=["zero-counts", "nonzero-counts", "null-counts"],
+    ids=["zero-counts", "nonzero-counts", "comment-only", "null-counts"],
 )
 @respx.mock
-async def test_thread_counts_are_returned_when_thread_index_is_skipped(
-    gitlab_env,
-    resolvable_count,
-    resolved_count,
-    expected_open,
-    expected_resolved,
-):
-    """Thread counts remain available without fetching or returning discussion details."""
+async def test_thread_counts_are_returned_when_thread_index_is_skipped(gitlab_env, counts, expected):
+    """Thread counts, including comment-only threads, remain available without fetching discussion details."""
     # Arrange
-    node = make_mr(
-        resolvableDiscussionsCount=resolvable_count,
-        resolvedDiscussionsCount=resolved_count,
-    )
+    resolvable, resolved, user = counts
+    node = make_mr(resolvableDiscussionsCount=resolvable, resolvedDiscussionsCount=resolved, userDiscussionsCount=user)
     del node["discussions"]
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
 
@@ -272,8 +266,7 @@ async def test_thread_counts_are_returned_when_thread_index_is_skipped(
     assert route.call_count == 1
     assert request["variables"]["includeThreads"] is False
     assert "discussions(first: 100) @include(if: $includeThreads)" in request["query"]
-    assert data["open_thread_count"] == expected_open
-    assert data["resolved_thread_count"] == expected_resolved
+    assert (data["open_thread_count"], data["resolved_thread_count"], data.get("comment_thread_count")) == expected
     assert "threads" not in data
 
 

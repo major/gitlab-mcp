@@ -154,7 +154,8 @@ class Note(BaseModel):
     """One human note."""
 
     note_id: int  # REST-compatible note ID.
-    body_hash: str  # SHA-256 of the untouched UTF-8 body.
+    # SHA-256 of the untouched UTF-8 body, only with include_hashes=true. It is often longer than the body. #️⃣
+    body_hash: str | None = Field(default=None, exclude_if=lambda v: v is None)
     by: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the author was deleted or banned.
     body: str  # Cut at the requested max_body_chars, then marked with THREAD_CUT_MARKER.
     at: str  # Date only, YYYY-MM-DD.
@@ -380,11 +381,16 @@ def _note_id(value: Any) -> int:
     return note_id
 
 
-def _to_note(node: dict[str, Any], max_body_chars: int = NOTE_CAP, compact_findings: bool = False) -> Note:
-    """Convert one GraphQL note into a note with a capped body and a date-only timestamp."""
+def _to_note(
+    node: dict[str, Any],
+    max_body_chars: int = NOTE_CAP,
+    compact_findings: bool = False,
+    include_hashes: bool = False,
+) -> Note:
+    """Convert one GraphQL note into a note with a capped body, a date-only timestamp, and an optional body hash."""
     author = node["author"]  # A deleted or banned author comes back as null.
     body = node["body"]
-    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest() if include_hashes else None
     if compact_findings and author is not None and author.get("bot") is True:
         body = _findings.compact_finding_body(body)
     return Note(
@@ -400,6 +406,7 @@ def _to_thread(
     discussion: dict[str, Any],
     max_body_chars: int = NOTE_CAP,
     compact_findings: bool = False,
+    include_hashes: bool = False,
 ) -> Thread | None:
     """Convert one discussion into a thread, or return None when it has no human notes.
 
@@ -413,7 +420,12 @@ def _to_thread(
     return Thread(
         id=bare_id(discussion["id"]),
         status=_thread_status(discussion),
-        notes=[_to_note(node, max_body_chars=max_body_chars, compact_findings=compact_findings) for node in human],
+        notes=[
+            _to_note(
+                node, max_body_chars=max_body_chars, compact_findings=compact_findings, include_hashes=include_hashes
+            )
+            for node in human
+        ],
         # GitLab only returns the first 50 notes, so more may exist.
         notes_truncated=notes["pageInfo"]["hasNextPage"],
         **position_fields(human[0]["position"]),
@@ -484,6 +496,7 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     max_body_chars: int = NOTE_CAP,
     view: ThreadView = "full",
     include_mr_status: bool = True,
+    include_hashes: bool = False,
 ) -> tuple[list[Thread | ThreadHeading], str, set[str], dict[str, str]]:
     """Read discussion pages from `start` and collect the matching threads.
 
@@ -515,6 +528,7 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
                 nodes[index],
                 max_body_chars=max_body_chars,
                 compact_findings=view == "finding",
+                include_hashes=include_hashes,
             )
             if thread is None or not thread_filter.matches(thread, nodes[index]):
                 continue
@@ -631,6 +645,10 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
             description="Return exact open/resolved counts only. Counts both states and fetches no discussion notes."
         ),
     ] = False,
+    include_hashes: Annotated[
+        bool,
+        Field(description="Add each note's body_hash in full and finding views, for edit_merge_request_note."),
+    ] = False,
 ) -> Any:
     """Read compact MR triage status and review thread notes for one MR or a batch, like `glab mr note list`.
 
@@ -652,8 +670,9 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - `notes_truncated` means the notes page has another page. Heading `note_count`, `last_by`, and `last_at` only
       cover fetched human notes when this is true, and the `author` filter can miss a late reply.
-    - Full and finding notes include a REST-compatible `note_id` and `body_hash`, the SHA-256 hex digest of the full,
-      untouched UTF-8 body before removing markers, compacting findings, or truncating text.
+    - Full and finding notes include a REST-compatible `note_id`. Set `include_hashes=true` to also get `body_hash`,
+      the SHA-256 hex digest of the full, untouched UTF-8 body before removing markers, compacting findings, or
+      truncating text. Pass it as `expected_hash` to `edit_merge_request_note`.
     - Trailing `review-bot:finding` comments are removed.
     - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
       the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
@@ -696,6 +715,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
             max_body_chars,
             view,
             include_mr_status,
+            include_hashes,
         )
         # A resumed call did not read the first page, so it cannot prove an ID is missing.
         not_found_ids: list[str] = []
@@ -732,6 +752,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
                 max_body_chars,
                 view,
                 include_mr_status,
+                include_hashes,
             )
         except MergeRequestNotFoundError:
             missing_iids.append(requested_iid)

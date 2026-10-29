@@ -94,7 +94,7 @@ query(
       headPipeline { status id sha mergeRequestEventType }
       autoMergeStrategy
       diffStatsSummary { additions deletions fileCount }
-      resolvableDiscussionsCount resolvedDiscussionsCount
+      resolvableDiscussionsCount resolvedDiscussionsCount userDiscussionsCount
       discussions(first: 100) @include(if: $includeThreads) {
         pageInfo { hasNextPage }
         nodes {
@@ -320,6 +320,11 @@ class MergeRequestDetail(BaseModel):
         default=None,
         description="GitLab's resolved discussion count.",
         exclude_if=lambda value: value is None,
+    )
+    comment_thread_count: int = Field(
+        default=0,
+        description="Comment-only threads that cannot be resolved. Left out when 0.",
+        exclude_if=lambda value: not value,
     )
     threads: ThreadIndex | None = Field(default=None, exclude_if=lambda value: value is None)
 
@@ -859,6 +864,15 @@ def _to_thread_counts(node: dict[str, Any]) -> tuple[int, int]:
     return resolvable - resolved, resolved
 
 
+def _comment_thread_count(node: dict[str, Any]) -> int:
+    """Return the count of human discussions that cannot be resolved, like a plain `LGTM` comment.
+
+    GitLab counts every discussion with a human note in `userDiscussionsCount`, and only resolvable ones in
+    `resolvableDiscussionsCount`, so the difference is the comment-only threads. Null counts mean zero.
+    """
+    return max((node.get("userDiscussionsCount") or 0) - (node["resolvableDiscussionsCount"] or 0), 0)
+
+
 def _to_thread_index(node: dict[str, Any]) -> ThreadIndex:
     """Build the thread index from the exact counts and the first page of discussions.
 
@@ -923,6 +937,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         custom_issue_key_pattern,
     )
     open_thread_count, resolved_thread_count = _to_thread_counts(node) if not include_threads else (None, None)
+    comment_thread_count = _comment_thread_count(node) if not include_threads else 0
     return MergeRequestDetail(
         iid=int(node["iid"]),  # GraphQL sends IIDs as strings.
         title=node["title"],
@@ -958,6 +973,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
         changes=_to_diff_summary(node["diffStatsSummary"]),
         open_thread_count=open_thread_count,
         resolved_thread_count=resolved_thread_count,
+        comment_thread_count=comment_thread_count,
         threads=_to_thread_index(node) if include_threads else None,
     )
 
@@ -1076,7 +1092,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         Field(
             description=(
                 "Include the first page of open thread refs. Defaults to true; false skips discussion data but returns "
-                "open_thread_count and resolved_thread_count. Ignored on continuation pages."
+                "open_thread_count, resolved_thread_count, and comment_thread_count. Ignored on continuation pages."
             ),
         ),
     ] = True,
@@ -1150,10 +1166,11 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     - `approved`: Free means one approval. Premium and Ultimate mean all approval rules pass.
     - `auto_merge_strategy`: `merge_when_checks_pass`, `merge_train`, `add_to_merge_train_when_checks_pass` (waiting).
     - `threads.open` IDs go to get_merge_request_threads. `index_complete` false means some are missing.
-      Set `include_threads=false` to omit the index while keeping `open_thread_count` and `resolved_thread_count`.
-      `open_thread_count` is resolvable discussions minus resolved discussions; `resolved_thread_count` is GitLab's
-      resolved discussion count. For discussion details across several MRs, use the batch mode of
-      `get_merge_request_threads` instead.
+      Set `include_threads=false` to omit the index while keeping `open_thread_count`, `resolved_thread_count`, and
+      `comment_thread_count`. `open_thread_count` is resolvable discussions minus resolved discussions;
+      `resolved_thread_count` is GitLab's resolved discussion count; `comment_thread_count` counts comment-only
+      threads that cannot be resolved and is left out when 0. When all three are 0, skip `get_merge_request_threads`.
+      For discussion details across several MRs, use the batch mode of `get_merge_request_threads` instead.
     - `line` is the new-file line. `old_line` replaces it on a deleted line.
     - Empty fields are left out: a missing `draft` means false, a missing list is empty.
     - `created_at` is the creation date in YYYY-MM-DD format when available.
