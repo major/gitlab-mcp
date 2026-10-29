@@ -1,4 +1,4 @@
-"""Guarded editing of existing merge request discussion notes 📝."""
+"""Paged reads and guarded edits of existing merge request notes 📝."""
 
 import hashlib
 import json
@@ -21,12 +21,27 @@ from gitlab_mcp.common import (
     Project,
     has_quick_action,
     is_int_at_least,
+    page_text,
 )
 from gitlab_mcp.mr_common import mr_rest_path
 
 DISCUSSION_BYTE_LIMIT = 1_048_576
 NOTE_BODY_LIMIT = 1_000_000
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
+# Matches the 4000-character note cap in get_merge_request_threads, so one page picks up where a cut note ends.
+NOTE_PAGE_CAP = 4000
+_NOT_FOUND_STATUS = 404
+
+
+class MergeRequestNotePage(BaseModel):
+    """One bounded page of a merge request note body, with a hash of the full body."""
+
+    note_id: int
+    by: str = Field(default="", exclude_if=lambda value: not value)  # Empty when the author was deleted.
+    at: str  # Date only, YYYY-MM-DD.
+    body: str
+    body_hash: str
+    next_body_offset: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class NoteEditResult(BaseModel):
@@ -347,3 +362,49 @@ async def edit_merge_request_note(  # noqa: C901, PLR0912, PLR0913, PLR0917 - in
     except ToolError as exc:
         result.warning = f"Could not verify the saved note: {exc} Do not retry automatically."
     return result
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def get_merge_request_note(  # noqa: PLR0913, PLR0917 - each argument is a user-facing read option.
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    note_id: Annotated[int, Field(strict=True, gt=0, description="Positive note_id from get_merge_request_threads.")],
+    body_offset: Annotated[
+        int, Field(ge=0, description="Unicode code-point offset for the body page, such as next_body_offset.")
+    ] = 0,
+    body_limit: Annotated[
+        int, Field(ge=1, le=NOTE_PAGE_CAP, description="Maximum body characters per page, from 1 to 4000.")
+    ] = NOTE_PAGE_CAP,
+) -> MergeRequestNotePage:
+    """Read one page of a merge request note body, like `glab api projects/:id/merge_requests/:iid/notes/:note_id`.
+
+    Use it to finish a note that `get_merge_request_threads` cut with ` [truncated]`: pass that note's `note_id` and
+    its `next_body_offset`. Offsets count Unicode code points, not bytes. A page can hold up to 25% more than
+    `body_limit`, so a short tail needs no extra call. `next_body_offset` is set while more text follows, and an
+    offset past the end returns an empty body. The body is raw, so a trailing `review-bot:finding` comment is kept.
+    `body_hash` is the SHA-256 of the full UTF-8 body; if it changes between pages, the note was edited, so restart
+    from offset 0. An empty body at a nonzero offset can also mean the note got shorter, so reread from 0. A note
+    that is not on this merge request returns an error.
+    """
+    try:
+        note = await get_client(ctx).get(f"{mr_rest_path(project, iid)}/notes/{note_id}")
+    except GitLabAPIError as exc:
+        if exc.status == _NOT_FOUND_STATUS:
+            # 🔎 GitLab gives the same 404 for a wrong project, MR, or note, so name all three.
+            message = f"Note {note_id}, merge request !{iid}, or the project was not found, or the token cannot see it."
+            raise ToolError(message) from exc
+        raise
+    body = note.get("body") if isinstance(note, dict) else None
+    if not isinstance(body, str):
+        raise ToolError("GitLab returned an invalid note body.")  # noqa: TRY003
+    author = note.get("author") or {}  # A deleted author comes back as null.
+    page, _, next_body_offset = page_text(body, body_limit, body_offset)
+    return MergeRequestNotePage(
+        note_id=note_id,
+        by=str(author.get("username") or ""),
+        at=str(note.get("created_at") or "")[:10],
+        body=page,
+        body_hash=_body_hash(body),
+        next_body_offset=next_body_offset,
+    )

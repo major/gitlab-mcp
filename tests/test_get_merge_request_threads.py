@@ -1754,7 +1754,7 @@ async def test_finding_view_keeps_signoff_only_unstructured_and_human_notes(gitl
 
 @respx.mock
 async def test_finding_view_compacts_before_applying_body_cap(gitlab_env):
-    """The body cap applies after the removable bot greeting and signoff are compacted."""
+    """The body cap applies after compaction, so the raw-body read for the rest restarts at offset 0."""
     # Arrange
     finding = "1. [P1] " + "x" * 100
     body = f"👋 Hi!\n\n{finding}\n\nThanks!"
@@ -1768,6 +1768,7 @@ async def test_finding_view_compacts_before_applying_body_cap(gitlab_env):
 
     # Assert
     assert data["threads"][0]["notes"][0]["body"] == finding[:30] + THREAD_CUT_MARKER
+    assert data["threads"][0]["notes"][0]["next_body_offset"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1817,18 +1818,18 @@ async def test_only_trailing_finding_comments_are_removed(gitlab_env, body, expe
 
 
 @pytest.mark.parametrize(
-    ("max_body_chars", "body", "expected"),
+    ("max_body_chars", "body", "expected", "next_offset"),
     [
-        (0, "abcdef", ""),
-        (3, "abcdef", "abc [truncated]"),
-        (3, "abc", "abc"),
-        (NOTE_CAP, "x" * (NOTE_CAP + 1), "x" * NOTE_CAP + " [truncated]"),
+        (0, "abcdef", "", None),
+        (3, "abcdef", "abc [truncated]", 3),
+        (3, "abc", "abc", None),
+        (NOTE_CAP, "x" * (NOTE_CAP + 1), "x" * NOTE_CAP + " [truncated]", NOTE_CAP),
     ],
     ids=["omit", "short-cap", "at-cap", "maximum-cap"],
 )
 @respx.mock
-async def test_max_body_chars_controls_truncation(gitlab_env, max_body_chars, body, expected):
-    """The requested body cap truncates after marker removal, while zero omits all body text."""
+async def test_max_body_chars_controls_truncation(gitlab_env, max_body_chars, body, expected, next_offset):
+    """The body cap truncates after marker removal and points cut notes at get_merge_request_note."""
     # Arrange
     respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", make_note(body)))))
 
@@ -1837,6 +1838,7 @@ async def test_max_body_chars_controls_truncation(gitlab_env, max_body_chars, bo
 
     # Assert
     assert data["threads"][0]["notes"][0]["body"] == expected
+    assert data["threads"][0]["notes"][0].get("next_body_offset") == next_offset
 
 
 @pytest.mark.parametrize("max_body_chars", [-1, NOTE_CAP + 1])

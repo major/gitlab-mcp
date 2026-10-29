@@ -159,6 +159,8 @@ class Note(BaseModel):
     by: str = Field(default="", exclude_if=lambda v: not v)  # Empty when the author was deleted or banned.
     body: str  # Cut at the requested max_body_chars, then marked with THREAD_CUT_MARKER.
     at: str  # Date only, YYYY-MM-DD.
+    # Set only on a cut body: where get_merge_request_note continues the raw body. 📖
+    next_body_offset: int | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class Thread(ThreadLocation):
@@ -341,16 +343,6 @@ def _thread_statuses(state: ThreadState | list[ThreadState]) -> frozenset[Thread
     return frozenset(status for item in states for status in STATE_STATUSES[item])
 
 
-def _cap_note_body(body: str, max_body_chars: int = NOTE_CAP) -> str:
-    """Remove a trailing review finding, then cap the remaining note body."""
-    body = _strip_trailing_finding(body)
-    if max_body_chars == 0:
-        return ""
-    if len(body) <= max_body_chars:
-        return body
-    return body[:max_body_chars] + THREAD_CUT_MARKER
-
-
 def _strip_trailing_finding(body: str) -> str:
     """Remove a well-formed trailing review-bot finding marker from a note body."""
     finding = REVIEW_BOT_FINDING_PATTERN.search(body)
@@ -387,18 +379,31 @@ def _to_note(
     compact_findings: bool = False,
     include_hashes: bool = False,
 ) -> Note:
-    """Convert one GraphQL note into a note with a capped body, a date-only timestamp, and an optional body hash."""
+    """Convert one GraphQL note into a note with a capped body, a date-only timestamp, and an optional body hash.
+
+    A trailing review finding is removed before the cap. A cut body gets `next_body_offset` for
+    `get_merge_request_note`. Removing the trailing finding keeps the raw prefix, so the offset is the cap. A
+    compacted bot finding no longer matches the raw body, so its offset is 0 and the reader starts over.
+    """
     author = node["author"]  # A deleted or banned author comes back as null.
-    body = node["body"]
-    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest() if include_hashes else None
+    raw_body = node["body"]
+    body_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest() if include_hashes else None
+    body = raw_body
     if compact_findings and author is not None and author.get("bot") is True:
-        body = _findings.compact_finding_body(body)
+        body = _findings.compact_finding_body(raw_body)
+    stripped = _strip_trailing_finding(body)
+    shown = stripped[:max_body_chars]
+    next_body_offset = None
+    if 0 < max_body_chars < len(stripped):
+        shown += THREAD_CUT_MARKER
+        next_body_offset = max_body_chars if body == raw_body else 0
     return Note(
         note_id=_note_id(node.get("id")),
         body_hash=body_hash,
         by=author_display(author),
-        body=_cap_note_body(body, max_body_chars=max_body_chars),
+        body=shown,
         at=node["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
+        next_body_offset=next_body_offset,
     )
 
 
@@ -682,7 +687,9 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
       scenario", and "How to fix" sections, including their code and diagrams. A bold-heading action-bullet format
       loses its introductory paragraph. Human notes and unrecognized formats remain unchanged.
     - In full and finding views, note bodies are cut at `max_body_chars` (default 4000, maximum 4000). Zero omits
-      body text. Each view returns about 30000 serialized thread characters, unless the first thread exceeds the budget.
+      body text. A cut note gets `next_body_offset`; pass it with the note's `note_id` to `get_merge_request_note`
+      to read the rest. Each view returns about 30000 serialized thread characters, unless the first thread exceeds
+      the budget.
       Continue with `next_cursor` using the same filters, `view`, and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
     - Each batch result includes its own `iid`, `threads`, `next_cursor`, and `not_found_ids`. Batch cursors are not
