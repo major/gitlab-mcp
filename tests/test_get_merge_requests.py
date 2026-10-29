@@ -9,6 +9,7 @@ import pytest
 import respx
 from fastmcp.exceptions import ToolError
 
+from gitlab_mcp.common import MAX_PAGES
 from gitlab_mcp.tools.mr_read import DESCRIPTION_CAP
 from mcp_helpers import call_tool as call_mcp_tool
 
@@ -82,18 +83,21 @@ async def call_tool(iids: list[Any], **extra: Any) -> dict[str, Any]:
 
 @respx.mock
 async def test_deduplicates_in_order_and_reports_missing_iids(gitlab_env):
-    """One aliased request preserves the first requested IID order and tracks missing MRs."""
+    """One aliased request preserves the first requested IID order, tracks missing MRs, and sends no activity reads."""
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=batch_response(make_mr(9), None, make_mr(4), make_mr(3)))
+    activity_reads = mock_activity(9)
 
     # Act
     data = await call_tool([9, 2, 9, 4, 3])
 
     # Assert
     assert route.call_count == 1
+    assert all(read.call_count == 0 for read in activity_reads.values())
     assert sent_request(route)["variables"] == {
         "fullPath": PROJECT,
         "includeDescription": False,
+        "includeActivity": False,
         "iid0": "9",
         "iid1": "2",
         "iid2": "4",
@@ -279,7 +283,12 @@ async def test_more_than_twenty_raw_iids_are_allowed_when_unique_count_is_bounde
 
     # Assert
     assert route.call_count == 1
-    assert sent_request(route)["variables"] == {"fullPath": PROJECT, "includeDescription": False, "iid0": "7"}
+    assert sent_request(route)["variables"] == {
+        "fullPath": PROJECT,
+        "includeDescription": False,
+        "includeActivity": False,
+        "iid0": "7",
+    }
     assert [mr["iid"] for mr in data["merge_requests"]] == [7]
 
 
@@ -486,3 +495,239 @@ async def test_needs_mr_pipeline_flags_open_merge_requests_with_no_head_pipeline
 
     # Assert
     assert [mr.get("needs_mr_pipeline", False) for mr in data["merge_requests"]] == [True, False, False, False]
+
+
+ACTIVITY_AT = "2026-10-21T09:00:00.000Z"  # Raw GitLab form, with milliseconds.
+ACTIVITY_AT_UTC = "2026-10-21T09:00:00Z"
+PUSHED_AT = "2026-10-20T08:00:00.000Z"
+PUSHED_AT_UTC = "2026-10-20T08:00:00Z"
+ACTIVITY_FIELDS = {"updated_at", "last_pushed_at", "last_activity", "activity_incomplete"}
+ACTIVITY_READS = ("versions", "notes", "resource_label_events", "resource_state_events", "resource_milestone_events")
+
+
+def note(body: str, *, at: str = ACTIVITY_AT, system: bool = False) -> dict[str, Any]:
+    """Build one REST note by jdoe, with the same created and updated time."""
+    return {"body": body, "system": system, "author": {"username": "jdoe"}, "created_at": at, "updated_at": at}
+
+
+def event(*, at: str = ACTIVITY_AT, **change: Any) -> dict[str, Any]:
+    """Build one REST resource event by jdoe. `change` holds the event's own fields, like `action` and `label`."""
+    return {"created_at": at, "user": {"username": "jdoe"}, **change}
+
+
+def pages(*bodies: list[dict[str, Any]]) -> Callable[[httpx.Request], httpx.Response]:
+    """Serve one REST list page per `page` query value, with X-Next-Page on every page but the last."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Answer with the page named by the request's `page` query value."""
+        page = int(request.url.params.get("page", "1"))
+        next_page = str(page + 1) if page < len(bodies) else ""
+        return httpx.Response(200, json=bodies[page - 1], headers={"X-Next-Page": next_page})
+
+    return respond
+
+
+def server_error(_request: httpx.Request) -> httpx.Response:
+    """Answer any REST request with a 500, like a flaky GitLab read."""
+    return httpx.Response(500, json={"message": "Boom"})
+
+
+def mock_activity(iid: int, **reads: Callable[[httpx.Request], httpx.Response]) -> dict[str, respx.Route]:
+    """Mock each activity read of one MR. Reads not named in `reads` return one empty page."""
+    return {
+        read: respx.get(f"{MR_REST.format(iid=iid)}/{read}").mock(side_effect=reads.get(read, pages([])))
+        for read in ACTIVITY_READS
+    }
+
+
+@respx.mock
+async def test_include_activity_reports_push_update_and_newest_activity_per_mr(gitlab_env):
+    """Each MR gets its own newest activity, even when one is a label change and the other a comment."""
+    # Arrange
+    graphql = respx.post(GRAPHQL).mock(
+        side_effect=serve_batch(
+            {9: {"updatedAt": "2026-10-25T12:00:00.000Z"}, 4: {"updatedAt": "2026-10-27T10:00:00.000Z"}}
+        ),
+    )
+    first_reads = mock_activity(
+        9,
+        versions=pages([{"created_at": PUSHED_AT}]),
+        notes=pages([note("Looks good.")]),
+        resource_label_events=pages([event(at="2026-10-25T12:00:00.000Z", action="add", label={"name": "tech-debt"})]),
+    )
+    mock_activity(
+        4,
+        versions=pages([{"created_at": "2026-10-26T07:00:00.000Z"}]),
+        notes=pages([note("Please rebase.", at="2026-10-27T10:00:00.000Z")]),
+        resource_label_events=pages([event(at="2026-10-22T10:00:00.000Z", action="remove", label={"name": "wip"})]),
+    )
+
+    # Act
+    data = await call_tool([9, 4], include_activity=True)
+
+    # Assert
+    first, second = data["merge_requests"]
+    assert first["updated_at"] == "2026-10-25T12:00:00Z"
+    assert first["last_pushed_at"] == PUSHED_AT_UTC
+    assert first["last_activity"] == {
+        "at": "2026-10-25T12:00:00Z",
+        "by": "jdoe",
+        "kind": "label",
+        "summary": "added label tech-debt",
+    }
+    assert second["last_activity"] == {
+        "at": "2026-10-27T10:00:00Z",
+        "by": "jdoe",
+        "kind": "comment",
+        "summary": "comment (14 chars)",
+    }
+    assert "activity_incomplete" not in first
+    assert "activity_incomplete" not in second
+    assert sent_request(graphql)["variables"]["includeActivity"] is True
+    assert dict(first_reads["notes"].calls.last.request.url.params) == {
+        "sort": "desc",
+        "order_by": "created_at",
+        "per_page": "20",
+    }
+
+
+@respx.mock
+async def test_newest_activity_is_compared_by_instant_and_written_in_utc(gitlab_env):
+    """A Z event newer than a +02:00 note wins, even though its text sorts lower. Output is UTC to the second."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({9: {"updatedAt": "2026-10-25T12:00:00.123+00:00"}}))
+    mock_activity(
+        9,
+        versions=pages([{"created_at": "2026-10-20T10:00:00.500+02:00"}]),  # 08:00:00 UTC
+        notes=pages([note("Ship it.", at="2026-10-21T11:00:00+02:00")]),  # 09:00 UTC
+        resource_label_events=pages([event(at="2026-10-21T10:00:00.000Z", action="add", label={"name": "tech-debt"})]),
+    )
+
+    # Act
+    data = await call_tool([9], include_activity=True)
+
+    # Assert
+    mr = data["merge_requests"][0]
+    assert mr["updated_at"] == "2026-10-25T12:00:00Z"
+    assert mr["last_pushed_at"] == "2026-10-20T08:00:00Z"
+    assert mr["last_activity"] == {
+        "at": "2026-10-21T10:00:00Z",
+        "by": "jdoe",
+        "kind": "label",
+        "summary": "added label tech-debt",
+    }
+
+
+@respx.mock
+async def test_empty_activity_lists_leave_out_last_activity_and_the_flag(gitlab_env):
+    """With no pushes, notes, or events, only updated_at from GraphQL comes back."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({9: {"updatedAt": "2026-10-25T12:00:00.000Z"}}))
+    mock_activity(9)
+
+    # Act
+    data = await call_tool([9], include_activity=True)
+
+    # Assert
+    mr = data["merge_requests"][0]
+    assert mr["updated_at"] == "2026-10-25T12:00:00Z"
+    assert {"last_pushed_at", "last_activity", "activity_incomplete"}.isdisjoint(mr)
+
+
+@pytest.mark.parametrize(
+    ("read", "payload", "kind", "summary"),
+    [
+        (
+            "notes",
+            note("line one\nline two " + "y" * 100, system=True),
+            "system",
+            "line one line two " + "y" * 61 + "…",
+        ),
+        ("resource_label_events", event(action="add", label=None), "label", "added label"),
+        (
+            "resource_milestone_events",
+            event(action="add", milestone={"title": "v1.0"}),
+            "milestone",
+            "added milestone v1.0",
+        ),
+        ("resource_state_events", event(state="merged"), "state", "merged"),
+    ],
+    ids=["system-note-cut-to-one-line", "label-deleted", "milestone-added", "state-merged"],
+)
+@respx.mock
+async def test_last_activity_summary_names_the_change(gitlab_env, read, payload, kind, summary):
+    """Each kind of activity gets a short summary, and a deleted label leaves out its name."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({}))
+    mock_activity(9, **{read: pages([payload])})
+
+    # Act
+    data = await call_tool([9], include_activity=True)
+
+    # Assert
+    assert data["merge_requests"][0]["last_activity"] == {
+        "at": ACTIVITY_AT_UTC,
+        "by": "jdoe",
+        "kind": kind,
+        "summary": summary,
+    }
+
+
+@pytest.mark.parametrize(
+    ("page_count", "expected_calls", "expected_incomplete"),
+    [(2, 2, False), (MAX_PAGES + 1, MAX_PAGES, True)],
+    ids=["follows-x-next-page-to-the-last-page", "stops-at-the-page-cap"],
+)
+@respx.mock
+async def test_event_scan_takes_the_last_event_of_the_last_page_read(
+    gitlab_env,
+    page_count,
+    expected_calls,
+    expected_incomplete,
+):
+    """The scan follows X-Next-Page, keeps the last event of the last page read, and flags a cut-off scan."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({}))
+    state_pages = [[event(state=f"first-{page}"), event(state=f"last-{page}")] for page in range(1, page_count + 1)]
+    routes = mock_activity(9, resource_state_events=pages(*state_pages))
+
+    # Act
+    data = await call_tool([9], include_activity=True)
+
+    # Assert
+    mr = data["merge_requests"][0]
+    assert routes["resource_state_events"].call_count == expected_calls
+    assert mr["last_activity"]["summary"] == f"last-{expected_calls}"
+    assert ("activity_incomplete" in mr) is expected_incomplete
+
+
+@pytest.mark.parametrize(
+    ("failing_read", "expected_last_pushed_at"),
+    [("versions", None), ("resource_state_events", PUSHED_AT_UTC)],
+    ids=["versions-fail", "state-events-fail"],
+)
+@respx.mock
+async def test_failed_activity_read_flags_the_merge_request_and_keeps_other_reads(
+    gitlab_env,
+    failing_read,
+    expected_last_pushed_at,
+):
+    """A failed read flags activity_incomplete, but the other reads and the MR fields still return."""
+    # Arrange
+    respx.post(GRAPHQL).mock(side_effect=serve_batch({}))
+    reads = {
+        "versions": pages([{"created_at": PUSHED_AT}]),
+        "resource_label_events": pages([event(action="add", label={"name": "tech-debt"})]),
+    }
+    reads[failing_read] = server_error
+    mock_activity(9, **reads)
+
+    # Act
+    data = await call_tool([9], include_activity=True)
+
+    # Assert
+    mr = data["merge_requests"][0]
+    assert mr["activity_incomplete"] is True
+    assert mr.get("last_pushed_at") == expected_last_pushed_at
+    assert mr["last_activity"]["summary"] == "added label tech-debt"
+    assert mr["title"] == "Merge request 9"
