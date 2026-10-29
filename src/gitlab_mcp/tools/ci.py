@@ -464,8 +464,9 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     pytest's short test summary block, standalone `FAILED` lines and final counts, and recognized terminal error lines.
     It keeps recent selected text within
     `max_chars`. Earlier failures can be outside the 100-line window even when `truncated` is false, and `found=false`
-    means no marker was found in that window, not that the job succeeded. A hint suggests a raw scan when only a make
-    or runner failure is visible. `head`, `search`, `section`, and `failures`
+    means no marker was found in that window, not that the job succeeded. Then `text` is the last 20 lines and a
+    hint says so, which is handy for checking how a passing job ended. Otherwise a hint suggests a raw scan when
+    only a make or runner failure is visible. `head`, `search`, `section`, and `failures`
     each make two REST requests: one job check and one bounded trace read. A skipped job in those views stops after
     the job check. `head` reads the first 32 KiB of the raw trace. `search` uses one case-insensitive literal pattern
     or a list of 1 to 10. Each matching line in list mode includes all matching 1-based pattern indices. `failures`
