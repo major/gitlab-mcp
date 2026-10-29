@@ -1055,8 +1055,8 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                     "batch_id": batch_id,
                     "ttl_seconds": cache.TTL_SECONDS,
                     "hint": (
-                        "To change note text before posting, pass body_overrides with this batch_id. "
-                        "No new validation is needed."
+                        "Post all notes with this batch_id, a subset with indices, or edited text with "
+                        "body_overrides. No new validation is needed."
                     ),
                     "results": [row.model_copy(update={"position": {}}) for row in result.results],
                 }
@@ -1112,7 +1112,10 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
         list[int] | None,
         Field(
             min_length=1,
-            description="Unique zero-based indices to post from a cached batch, in posting order. Requires batch_id.",
+            description=(
+                "Unique zero-based indices to post from a cached batch, in posting order. Requires batch_id. "
+                "Omit to post every note in the batch."
+            ),
         ),
     ] = None,
     notes: Annotated[
@@ -1156,8 +1159,9 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
             min_length=1,
             max_length=200,
             description=(
-                "Single-use handle from a successful validate_only call. Provide this instead of notes. It is claimed "
-                "before body_overrides indices are checked, so an invalid index consumes the handle."
+                "Single-use handle from a successful validate_only call. Provide this instead of notes. Without "
+                "indices, it posts every cached note. It is claimed before body_overrides indices are checked, so "
+                "an invalid index consumes the handle."
             ),
         ),
     ] = None,
