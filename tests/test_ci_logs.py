@@ -225,7 +225,7 @@ async def test_unfinished_job_still_reads_its_log(view, status):
     # Assert
     assert log_route.call_count == 1
     assert data["status"] == status
-    assert data["text"] == ("" if view == "summary" else "partial output")
+    assert data["text"] == "partial output"
     if view == "summary":
         assert data["found"] is False
 
@@ -1242,13 +1242,25 @@ async def test_summary_selects_make_pytest_block_and_terminal_failure_in_one_tai
 
 
 @pytest.mark.parametrize(
-    "body",
-    ["", "starting build\nerror occurred\nError without a code\n"],
-    ids=["empty", "no-recognized-markers"],
+    ("body", "expected_text", "expected_hint"),
+    [
+        ("", "", None),
+        (
+            "starting build\nerror occurred\nError without a code\n",
+            "starting build\nerror occurred\nError without a code\n",
+            "No failure markers; showing the last 20 lines",
+        ),
+        (
+            "".join(f"line {number}\n" for number in range(1, 26)),
+            "".join(f"line {number}\n" for number in range(6, 26)),
+            "No failure markers; showing the last 20 lines",
+        ),
+    ],
+    ids=["empty", "short-log", "long-log-keeps-last-20"],
 )
 @respx.mock
-async def test_summary_returns_no_marker_for_empty_or_unrecognized_text(body):
-    """No recognized marker means no selected text, not a successful job or a complete trace."""
+async def test_summary_without_markers_falls_back_to_short_tail(body, expected_text, expected_hint):
+    """No marker returns the last 20 lines with a hint, so a passing job needs no second call 🪙."""
     # Arrange
     mock_tail(body)
 
@@ -1256,8 +1268,9 @@ async def test_summary_returns_no_marker_for_empty_or_unrecognized_text(body):
     data = await call_log(view="summary")
 
     # Assert
-    assert data["text"] == ""
+    assert data["text"] == expected_text
     assert data["found"] is False
+    assert data.get("hint") == expected_hint
     assert data["truncated"] is False
     assert data["complete"] is None
     assert len(respx.calls) == ONE_CALL
