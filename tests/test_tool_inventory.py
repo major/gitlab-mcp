@@ -97,6 +97,7 @@ async def test_server_instructions_describe_the_review_workflow(gitlab_env):
     assert "post_review_notes(validate_only=true)" in instructions
     assert instructions.index("validate_only=true") < instructions.index("APPROVE")
     assert "explicit APPROVE before posting" in instructions
+    assert "with paths=[...] for patches" in instructions
 
 
 async def test_server_instructions_describe_the_ci_triage_workflow(gitlab_env):

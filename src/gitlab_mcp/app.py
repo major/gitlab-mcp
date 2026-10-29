@@ -77,7 +77,7 @@ mcp = FastMCP(
         "For long descriptions, pass the returned next offset as description_offset with include_description=true; "
         "restart if the merge request is edited. To read part of a long description, list its headings with "
         "headings_only=true, then read only the parts you need with section. "
-        "Use get_merge_request_diff for patches. "
+        "Use get_merge_request_diff without paths for the file list, then with paths=[...] for patches. "
         "For CI triage, use list_pipelines to find a pipeline, get_pipeline to inspect its jobs, then get_job_log "
         "to read a job's log; use get_job for runner-job metadata. "
         "Prepare inline notes with post_review_notes(validate_only=true) before requesting approval, then keep the "
