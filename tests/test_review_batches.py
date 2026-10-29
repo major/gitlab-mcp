@@ -34,7 +34,8 @@ SECOND_CACHED_NOTE_NEW_LINE = 2
 PEOPLE_REQUESTS = 3
 WARNING_CAP = 500
 VALIDATED_BATCH_HINT = (
-    "To change note text before posting, pass body_overrides with this batch_id. No new validation is needed."
+    "Post all notes with this batch_id, a subset with indices, or edited text with body_overrides. "
+    "No new validation is needed."
 )
 
 
