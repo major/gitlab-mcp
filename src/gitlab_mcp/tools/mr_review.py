@@ -186,7 +186,7 @@ def _lean_review_result(result: PostReviewNotesResult, *, validate_only: bool) -
     )
 
 
-def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int, head_sha: str) -> CachedReviewBatch:
+def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int, head_sha: str | None) -> CachedReviewBatch:
     """Claim synchronously, treating an unconfigured cache as unavailable."""
     try:
         cache = get_review_batch_cache(ctx)
@@ -195,22 +195,31 @@ def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int, hea
     return cache.claim(batch_id, project, iid, head_sha)
 
 
-async def _unavailable_review_batch(ctx: Context, project: str, iid: int, head_sha: str) -> PostReviewNotesResult:
+async def _live_head_sha(ctx: Context, project: str, iid: int) -> str | None:
+    """Read the MR source SHA for diagnostics, or return `None` when it cannot be read safely."""
+    try:
+        # Only the MR source SHA is needed; diff refs can be pending after a push.
+        merge_request = await get_client(ctx).get(mr_rest_path(project, iid))
+    except ToolError, OSError, ValueError, KeyError, TypeError, RecursionError:
+        return None  # Diagnostic failures must not leak API errors or prevent recovery guidance.
+    raw_sha = merge_request.get("sha") if isinstance(merge_request, dict) else None
+    return str(raw_sha).lower() if full_sha(raw_sha) else None
+
+
+async def _unavailable_review_batch(
+    ctx: Context, project: str, iid: int, head_sha: str | None
+) -> PostReviewNotesResult:
     """Diagnose the live head without exposing read errors or assuming earlier writes failed."""
     current_head_sha = None
-    if not full_sha(head_sha):
+    if head_sha is not None and not full_sha(head_sha):
         head_warning = "Head status is unknown: head_sha must be a full 40-character hexadecimal SHA."
     else:
-        try:
-            # Only the MR source SHA is needed; diff refs can be pending after a push.
-            merge_request = await get_client(ctx).get(mr_rest_path(project, iid))
-            raw_sha = merge_request.get("sha") if isinstance(merge_request, dict) else None
-            if full_sha(raw_sha):
-                current_head_sha = str(raw_sha).lower()
-        except ToolError, OSError, ValueError, KeyError, TypeError, RecursionError:
-            pass  # Diagnostic failures must not leak API errors or prevent recovery guidance.
+        current_head_sha = await _live_head_sha(ctx, project, iid)
         if current_head_sha is None:
             head_warning = "Head status is unknown."
+        elif head_sha is None:
+            # 🧭 The expired batch took its stored SHA with it, so hand back the live head for revalidation.
+            head_warning = "No head_sha was supplied; validate the notes again against current_head_sha."
         elif current_head_sha == head_sha.lower():
             head_warning = "The supplied head is current, but cached notes and positions remain unavailable."
         else:
@@ -1113,9 +1122,14 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     project: Project,
     iid: Iid,
     head_sha: Annotated[
-        str,
-        Field(description="Full 40-character head SHA from get_merge_request or get_merge_request_diff."),
-    ],
+        str | None,
+        Field(
+            description=(
+                "Full 40-character head SHA from get_merge_request or get_merge_request_diff. Required with notes. "
+                "Optional with batch_id, which reuses the validated SHA; if set, it must match."
+            ),
+        ),
+    ] = None,
     indices: Annotated[
         list[int] | None,
         Field(
@@ -1223,7 +1237,10 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     and note positions before resubmitting; show
     changed final text to the user and obtain explicit `APPROVE` before posting. The warning states whether the
     supplied head is current, stale, or unknown; even a current head cannot recover the cached notes or positions.
-    `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`.
+    `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`. It is required with `notes`
+    and optional with `batch_id`, which reuses the SHA stored at validation. The live head check still runs before
+    the first write. When an unavailable handle was sent without `head_sha`, `current_head_sha` shows the live head
+    to validate against again.
     Each note is checked on its own. If any note fails, nothing is posted. `results` lists each failed note with a
     `reason`, and `validated_count` counts the notes that passed. A batch-wide problem, such as a stale `head_sha`,
     lists every note index in `unattempted` and adds a `warning`.
@@ -1245,6 +1262,8 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     """
     if (notes is None) == (batch_id is None):
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
+    if notes is not None and head_sha is None:
+        raise ToolError("head_sha is required with notes.")  # noqa: TRY003
     if batch_id is not None and not batch_id.strip():
         raise ToolError("batch_id must not be blank.")  # noqa: TRY003
     if validate_only and batch_id is not None:
@@ -1265,10 +1284,12 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
         except ReviewBatchUnavailableError:
             result = await _unavailable_review_batch(ctx, project, iid, head_sha)
             return _lean_review_result(result, validate_only=validate_only)
+        head_sha = cached_batch.head_sha
         cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
         notes, selected_indices = _select_review_notes(cached_notes, indices)
         notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
-    if notes is None:
+    # Unreachable after the checks above; this narrows both types for the checker.
+    if notes is None or head_sha is None:
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
     result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only, body_dir)
