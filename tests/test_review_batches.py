@@ -331,8 +331,8 @@ async def test_invalid_batch_indices_are_rejected_without_gitlab_writes(
 
 
 @respx.mock
-async def test_subset_applies_original_index_override_then_adds_people(review_client: Client) -> None:
-    """Overrides use original indices and people changes follow every selected note post."""
+async def test_subset_override_and_extra_notes_post_then_add_people(review_client: Client) -> None:
+    """Overrides use original indices, extras post after the subset, and people follow every post."""
     # Arrange
     add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -356,6 +356,7 @@ async def test_subset_applies_original_index_override_then_adds_people(review_cl
             batch_id=prepared.structured_content["batch_id"],
             indices=[2, 0],
             body_overrides=[{"index": 2, "body": "replacement third"}],
+            extra_notes=[{"file": "src.py", "line": 2, "body": "extra inline"}, {"body": "extra general"}],
             add_reviewers=["alice"],
             add_assignees=["bob"],
         ),
@@ -363,21 +364,27 @@ async def test_subset_applies_original_index_override_then_adds_people(review_cl
 
     # Assert
     assert not posted.is_error
+    # Extra notes are numbered after the three-note cached batch.
     assert [(row["index"], row["status"]) for row in posted.structured_content["results"]] == [
         (2, "posted"),
         (0, "posted"),
+        (3, "posted"),
+        (4, "posted"),
     ]
     assert posted.structured_content["people"]["applied"] == ["add_reviewers", "add_assignees"]
     assert [json.loads(call.request.content)["body"] for call in post_route.calls] == [
         "replacement third",
         "original 1",
+        "extra inline",
+        "extra general",
     ]
+    assert json.loads(post_route.calls[2].request.content)["position"]["new_line"] == SECOND_CACHED_NOTE_NEW_LINE
     request_order = [
         "discussion" if "query" not in json.loads(call.request.content) else "people"
         for call in respx.calls
         if call.request.method == "POST"
     ]
-    assert request_order == ["discussion", "discussion", "people", "people", "people"]
+    assert request_order == ["discussion"] * 4 + ["people"] * 3
     assert len(people_route.calls) == PEOPLE_REQUESTS
 
 
@@ -582,6 +589,17 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
             id="overrides-with-validation",
         ),
         pytest.param(
+            {
+                "notes": [{"file": "src.py", "line": 1, "body": "review"}],
+                "extra_notes": [{"file": "src.py", "line": 2, "body": "extra"}],
+            },
+            id="extra-notes-without-batch",
+        ),
+        pytest.param(
+            {"batch_id": "token", "validate_only": True, "extra_notes": [{"body": "extra"}]},
+            id="extra-notes-with-validation",
+        ),
+        pytest.param(
             {"notes": [{"file": "src.py", "line": 1, "body_path": "01.md"}], "body_dir": "relative/notes"},
             id="relative-body-dir",
         ),
@@ -604,6 +622,64 @@ async def test_invalid_input_combinations_fail_without_gitlab_requests(
     assert_rejected(result)
     assert not mr_route.called
     assert not post_route.called
+
+
+@respx.mock
+async def test_invalid_extra_note_blocks_every_write_and_reports_its_index(review_client: Client) -> None:
+    """One extra note with a bad line stops the cached notes and the good extra from posting."""
+    # Arrange
+    add_preflight()
+    add_missing_blobs()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"file": "src.py", "line": line, "body": f"cached {line}"} for line in (1, 2)]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(
+            batch_id=prepared.structured_content["batch_id"],
+            extra_notes=[{"body": "good extra"}, {"file": "src.py", "line": 99, "body": "bad extra"}],
+        ),
+    )
+
+    # Assert
+    assert not result.is_error
+    rows = result.structured_content["results"]
+    assert [(row["index"], row["status"]) for row in rows] == [
+        (0, "validated"),
+        (1, "validated"),
+        (2, "validated"),
+        (3, "failed"),
+    ]
+    assert "line 99" in rows[3]["reason"]
+    assert "No notes were posted" in result.structured_content["warning"]
+    assert not post_route.called
+
+
+@respx.mock
+async def test_extra_notes_over_the_call_cap_consume_the_handle_without_writes(review_client: Client) -> None:
+    """A cached note plus 20 extras exceeds the 20-note call cap, so nothing posts and the handle is used."""
+    # Arrange
+    mr_route, diff_route = add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(review_client, **note_args(notes=[{"body": "cached"}], validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    before = (len(mr_route.calls), len(diff_route.calls))
+
+    # Act
+    rejected = await call_review(
+        review_client,
+        **note_args(batch_id=batch_id, extra_notes=[{"body": f"extra {index}"} for index in range(20)]),
+    )
+    after_reject = (len(mr_route.calls), len(diff_route.calls))
+    replayed = await call_review(review_client, **note_args(batch_id=batch_id))
+
+    # Assert
+    assert "at most 20" in assert_rejected(rejected)
+    assert after_reject == before
+    assert not post_route.called
+    assert replayed.structured_content["batch_error"] == "unavailable"
 
 
 @respx.mock

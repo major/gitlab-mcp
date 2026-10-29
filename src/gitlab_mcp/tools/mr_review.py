@@ -31,6 +31,8 @@ from gitlab_mcp.review_batches import CachedReviewBatch, CachedReviewNote, Revie
 REVIEW_NOTE_REASON_CAP = 200
 REVIEW_NOTE_HINT_CAP = 120
 REVIEW_NOTE_BLOB_CAP = 131_072
+# One call writes at most this many notes, even when extra_notes are added to a cached batch. 🧱
+REVIEW_NOTE_CALL_CAP = 20
 PEOPLE_SKIPPED_WARNING = "Reviewers and assignees were not changed because not every note posted."
 
 
@@ -988,6 +990,25 @@ def _select_review_notes(notes: list[ReviewNote], indices: list[int] | None) -> 
     return [notes[index] for index in indices], indices
 
 
+def _append_extra_notes(
+    notes: list[ReviewNote],
+    indices: list[int],
+    batch_size: int,
+    extra_notes: list[ReviewNote] | None,
+) -> tuple[list[ReviewNote], list[int]]:
+    """Add extra notes after the selected batch notes, numbering them after the full cached batch.
+
+    Extras go through the same all-or-nothing preflight as cached notes. 📎 The combined list keeps the per-call cap.
+    """
+    extras = extra_notes or []
+    combined = [*notes, *extras]
+    if len(combined) > REVIEW_NOTE_CALL_CAP:
+        raise ToolError(  # noqa: TRY003 - name both inputs so the caller can trim the right one.
+            f"Selected batch notes plus extra_notes must total at most {REVIEW_NOTE_CALL_CAP}."
+        )
+    return combined, [*indices, *range(batch_size, batch_size + len(extras))]
+
+
 async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part of the batch request.
     ctx: Context,
     project: str,
@@ -1096,7 +1117,22 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     ] = None,
     notes: Annotated[
         list[ReviewNote] | None,
-        Field(min_length=1, max_length=20, description="Notes to validate or post. Required unless batch_id is set."),
+        Field(
+            min_length=1,
+            max_length=REVIEW_NOTE_CALL_CAP,
+            description="Notes to validate or post. Required unless batch_id is set.",
+        ),
+    ] = None,
+    extra_notes: Annotated[
+        list[ReviewNote] | None,
+        Field(
+            min_length=1,
+            max_length=REVIEW_NOTE_CALL_CAP,
+            description=(
+                "Approved notes to post after the cached batch notes, without resending the batch. Requires batch_id. "
+                "Result rows number them after the full cached batch."
+            ),
+        ),
     ] = None,
     add_reviewers: Annotated[
         list[str] | None,
@@ -1162,7 +1198,12 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     unique and in range, each entry must set exactly one body source, and omitted indices keep their cached snapshots.
     Overrides require `batch_id` and always use indices from the original full batch. Optional `indices` selects a
     nonempty, unique, in-range subset to post, in the supplied order. It also requires `batch_id`; omitted `indices`
-    posts the full batch in its original order. Returned row indices always refer to the original batch. The tool
+    posts the full batch in its original order. Returned row indices always refer to the original batch. When the
+    user approves the batch plus short new notes, send those as `extra_notes` with the `batch_id` instead of resending
+    every note. Show the final text of each extra to the user and get approval before posting. Extras post after the
+    cached or selected notes, accept `body_dir`, and return row indices that start at the full cached batch length;
+    `indices` and `body_overrides` cannot target them. Selected notes plus extras must total at most 20, and an
+    over-limit call consumes the handle. If any extra fails preflight, nothing is posted. The tool
     checks every selected final body and reruns fresh SHA, path, and position checks
     before the first write. The handle is opaque, is not approval, expires after 30 minutes,
     may be evicted earlier when the bounded cache is full, and is invalidated by a server restart. It is consumed on
@@ -1202,6 +1243,8 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
         raise ToolError("body_overrides can only be used with batch_id.")  # noqa: TRY003
     if indices is not None and batch_id is None:
         raise ToolError("indices can only be used with batch_id.")  # noqa: TRY003
+    if extra_notes is not None and batch_id is None:
+        raise ToolError("extra_notes can only be used with batch_id.")  # noqa: TRY003
     if body_dir is not None and not Path(body_dir).is_absolute():
         raise ToolError("body_dir must be an absolute server-local directory.")  # noqa: TRY003
 
@@ -1214,6 +1257,7 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
             return _compact_review_result(result) if compact else result
         cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
         notes, selected_indices = _select_review_notes(cached_notes, indices)
+        notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
     if notes is None:
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
