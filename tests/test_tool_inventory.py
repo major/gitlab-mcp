@@ -23,6 +23,7 @@ READ_ONLY_TOOLS = {
     "get_job_log",
     "get_merge_request",
     "get_merge_request_diff",
+    "get_merge_request_note",
     "get_merge_request_threads",
     "get_merge_requests",
     "get_pipeline",
@@ -135,6 +136,7 @@ async def test_server_instructions_list_real_main_arguments(gitlab_env):
             "count_only",
             "cursor",
         },
+        "get_merge_request_note": {"project", "iid", "note_id", "body_offset", "body_limit"},
         "edit_merge_request_note": {
             "project",
             "iid",
