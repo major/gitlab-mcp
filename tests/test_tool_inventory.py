@@ -262,6 +262,31 @@ async def test_review_tools_have_searchable_first_line_descriptions(tools, name,
         assert "glab mr update" in tools[name].description
 
 
+@pytest.mark.parametrize(
+    ("name", "budget", "guidance"),
+    [
+        (
+            "get_merge_request",
+            3200,
+            ("merge_status", "pipeline_sha", "merged_result", "description_hash", "restart", "hidden_blockers"),
+        ),
+        (
+            "post_review_notes",
+            3600,
+            ("APPROVE", "ttl_seconds", "prior", "never retried", "not an atomic", "truncation markers"),
+        ),
+    ],
+)
+async def test_large_review_descriptions_are_bounded_and_keep_safety_guidance(tools, name, budget, guidance):
+    """Keep frequently advertised review guidance compact without dropping safety rules."""
+    # Arrange
+    description = tools[name].description
+
+    # Act / Assert
+    assert len(description.encode("utf-8")) <= budget
+    assert all(term in description for term in guidance)
+
+
 @pytest.mark.parametrize("name", sorted(READ_ONLY_TOOLS))
 async def test_read_only_tools_are_marked_read_only(tools, name):
     """Read tools advertise readOnlyHint and openWorldHint, since they call GitLab."""
