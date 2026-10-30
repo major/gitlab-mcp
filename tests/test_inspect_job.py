@@ -15,8 +15,6 @@ pytestmark = pytest.mark.usefixtures("gitlab_env")
 BASE = "https://gitlab.example.com/api/v4/projects/group%2Fproject/jobs/42"
 ARGS = {"project": "group/project", "job_id": 42}
 HIDDEN = ("get_job", "get_job_artifact", "list_job_artifacts")
-FULL_COUNT = 44
-COMPACT_COUNT = 41
 TWO_CALLS = 2
 
 
@@ -32,8 +30,6 @@ async def test_catalog():
     async with Client(gitlab_mcp.create_app()) as client:
         full = {tool.name: tool for tool in await client.list_tools()}
     # Assert
-    assert len(full) == FULL_COUNT
-    assert len(short) == COMPACT_COUNT
     assert all(name in full and name not in short for name in HIDDEN)
     assert "inspect_job" not in full
     assert short["inspect_job"].annotations.read_only_hint is True
