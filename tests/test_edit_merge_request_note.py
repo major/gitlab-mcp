@@ -75,6 +75,45 @@ def responses(before: dict[str, Any], after: dict[str, Any]) -> respx.Route:
     )
 
 
+@respx.mock
+async def test_full_body_with_truncation_marker_is_rejected_before_http(gitlab_env):
+    """A full replacement containing a preview marker fails before reading GitLab."""
+    # Act / Assert
+    with pytest.raises(ToolError, match="truncation marker"):
+        await edit(body="preview [truncated]", old_text=None, new_text=None)
+    assert not respx.calls
+
+
+@respx.mock
+async def test_exact_edit_rejects_truncated_final_body_after_read(gitlab_env):
+    """Exact replacement validates the computed body before writing it."""
+    # Arrange
+    reads = respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json=discussion()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="truncation marker"):
+        await edit(old_text=ORIGINAL, new_text="preview [truncated]")
+    assert reads.call_count == 1
+    assert all(call.request.method != "PUT" for call in respx.calls)
+
+
+@respx.mock
+async def test_exact_edit_can_remove_existing_truncation_marker(gitlab_env):
+    """Replacing an existing marker is allowed when the final body is complete."""
+    # Arrange
+    original = "preview [truncated]"
+    saved = "complete body"
+    responses(discussion([note(body=original)]), discussion([note(body=saved)]))
+    write = respx.put(NOTE_URL).mock(return_value=httpx.Response(200, json={"id": 7, "body": saved}))
+
+    # Act
+    result = await edit(expected_hash=digest(original), old_text=original, new_text=saved)
+
+    # Assert
+    assert result["status"] == "applied"
+    assert json.loads(write.calls.last.request.content)["body"] == saved
+
+
 @pytest.mark.parametrize(
     "case", ["individual", "root-open", "root-resolved", "reply-open", "reply-resolved", "late-reply"]
 )
