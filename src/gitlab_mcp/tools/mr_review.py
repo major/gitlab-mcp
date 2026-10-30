@@ -1212,58 +1212,40 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
+    Like `glab mr note create`. Omit file/coordinates for general notes; set only file for file-level notes
+    (including outside hunks or collapsed diffs), or file and one line coordinate for inline notes.
     Bodies containing truncation markers are rejected.
-    Like `glab mr note create`. Omit `file`, `line`, and `old_line` for a general merge-request discussion. Set only
-    `file` for a file-level diff discussion, or set `file` and one line coordinate for an inline diff discussion.
-    Provide exactly one of `notes` or `batch_id`. `validate_only` cannot be combined with `batch_id`. Set
-    `validate_only` to true to run all body, path, line, and SHA checks without writing; validation does not need the
-    user's `APPROVE`. A successful validation returns a single-use `batch_id` with the resolved note bodies and
-    locations, and `ttl_seconds`, an upper bound until expiration. Show the final note text to the user and wait for
-    explicit `APPROVE`; approval of placeholder drafts
-    alone is not enough. Then call this tool with that `batch_id` instead of `notes`. Optional `body_overrides` entries
-    use `{index, body}` or `{index, body_path}` to replace cached bodies at zero-based indices. Each index must be
-    unique and in range, each entry must set exactly one body source, and omitted indices keep their cached snapshots.
-    Overrides require `batch_id` and always use indices from the original full batch. Optional `indices` selects a
-    nonempty, unique, in-range subset to post, in the supplied order. It also requires `batch_id`; omitted `indices`
-    posts the full batch in its original order. Returned row indices always refer to the original batch. When the
-    user approves the batch plus short new notes, send those as `extra_notes` with the `batch_id` instead of resending
-    every note. Show the final text of each extra to the user and get approval before posting. Extras post after the
-    cached or selected notes, accept `body_dir`, and return row indices that start at the full cached batch length;
-    `indices` and `body_overrides` cannot target them. Selected notes plus extras must total at most 20, and an
-    over-limit call consumes the handle. If any extra fails preflight, nothing is posted. The tool
-    checks every selected final body and reruns fresh SHA, path, and position checks
-    before the first write. The handle is opaque, is not approval, expires after 30 minutes,
-    may be evicted earlier when the bounded cache is full, and is invalidated by a server restart. It is consumed on
-    any posting attempt, including failed preflight or writes. Invalid override and selection indices are checked
-    after the handle is claimed and therefore consume it. A mismatched project, MR, or head consumes the handle and
-    returns an error without GitLab requests. An unavailable handle returns `batch_error="unavailable"` and no rows;
-    this call attempted no writes, but prior attempts may have posted. Check prior results and GitLab before
-    resubmitting if a previous attempt may have written, and wait for any in-flight attempt to finish. Check the head
-    and note positions before resubmitting; show
-    changed final text to the user and obtain explicit `APPROVE` before posting. The warning states whether the
-    supplied head is current, stale, or unknown; even a current head cannot recover the cached notes or positions.
-    `head_sha` must be the full SHA from `get_merge_request` or `get_merge_request_diff`. It is required with `notes`
-    and optional with `batch_id`, which reuses the SHA stored at validation. The live head check still runs before
-    the first write. When an unavailable handle was sent without `head_sha`, `current_head_sha` shows the live head
-    to validate against again.
-    Each note is checked on its own. If any note fails, nothing is posted. `results` lists each failed note with a
-    `reason`, and `validated_count` counts the notes that passed. A batch-wide problem, such as a stale `head_sha`,
-    lists every note index in `unattempted` and adds a `warning`.
-    A file-level note needs only the file's path in the diff, so it works for findings outside diff hunks and for
-    collapsed or too-large diffs. General notes do not read diff pages, but still check the merge request head twice.
-    A `body_path` is an absolute path on this server, which is useful with stdio but is not a path on the agent's
-    computer. Set `body_dir` to send relative `body_path` values, such as `01.md`, that must stay inside it; absolute
-    paths still work. All bodies, diff lines, and paths are checked before the first post. A second head check is
-    preflight only, not an atomic lock, because GitLab has no expected-head guard for discussion creation. Writes are
-    sequential and never retried. If a write result is unknown or unverified, check GitLab before trying again. Check
-    every result before deciding what to do next.
-    Posted notes are not listed in `results`. `posted_count` counts them, and `note_ids[k]` is the ID of the k-th posted
-    note in posting order: the selected `indices` order, then `extra_notes`. Failed, unknown, and unverified rows in
-    `results` include a `reason` and any available `position`. Unverified rows may also include `note_id` and
-    `discussion_id`. `unattempted` lists the indices of notes that were not tried, after a stop or a batch-wide
-    problem. Thread and discussion IDs for `reply_to_thread` come from `get_merge_request_threads`.
-    `add_reviewers` and `add_assignees` add people only after every note posts, in the same call. They are ignored
-    when `validate_only` is true.
+
+    Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
+    check bodies, paths, lines, and SHA without writing or needing approval. Success returns a single-use `batch_id`
+    with body/location snapshots and `ttl_seconds` (upper lifetime bound). Show final text and get explicit APPROVE
+    before posting; placeholder approval is insufficient. Then send `batch_id`, not notes or validate_only.
+    A handle is not approval. It expires after 30 minutes, cache eviction, or restart, and any posting attempt
+    consumes it, including failed preflight, invalid indices, excess notes, or project/MR/head mismatch.
+
+    With batch_id, `indices` selects original zero-based indices in posting order; omit it for the whole batch.
+    `body_overrides` replaces selected body sources; omitted entries retain snapshots. Indices must be unique/in range.
+    Show changed final text and get explicit APPROVE again. `extra_notes` appends approved new notes without resending
+    cached ones. Selected notes plus extras must total at most 20. Extras cannot be selected/overridden; their result
+    indices start at the original full batch length. All other indices also refer to the original batch.
+
+    All selected final bodies and fresh SHA/path/position checks must pass before any write. `head_sha` is required
+    with notes, optional with batch_id (stored SHA reused); live checks still run. General notes skip diff reads but
+    still check the head twice. This is preflight, not an atomic lock: GitLab has no expected-head discussion guard.
+    Writes are sequential and never retried. Check GitLab before retrying unknown or unverified outcomes.
+
+    `batch_error="unavailable"` means this call wrote nothing, not that prior attempts did. Check prior results and
+    GitLab, and wait for in-flight attempts before resubmitting. Recheck head/positions and get APPROVE for changed
+    text. Warnings report current/stale/unknown head, not recovered cached content; `current_head_sha` supplies the
+    live head when unavailable batch_id was sent without head_sha.
+
+    `body_path` names a server-local file, not a file on the client's computer. With absolute `body_dir`, relative
+    paths must stay inside that directory; absolute paths still work. Each body needs exactly one source.
+    Any preflight failure prevents all posting: `results` gives failed-note reasons, `validated_count` counts passes,
+    and batch-wide problems add warning/unattempted indices. After writes, inspect every result: posted notes appear
+    only in `posted_count` and `note_ids` (selection order, then extras); failed/unknown/unverified rows retain reasons
+    and available positions/IDs. `unattempted` identifies notes skipped after a stop or batch-wide problem.
+    `add_reviewers`/`add_assignees` run only after every note posts, never during validation.
     """
     if (notes is None) == (batch_id is None):
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
