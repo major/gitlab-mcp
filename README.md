@@ -27,6 +27,8 @@ Set `GITLAB_MCP_PROFILE` in the server environment before launch. Restart the se
 
 Empty or unknown profile values are rejected.
 
+The compact `read_snippet` tool advertises a generic object output schema, but its runtime payload preserves the full metadata or file response shape.
+
 ## Authentication 🔐
 
 For personal interactive use, a personal access token is recommended. Choose the smallest suitable token role, resource scope, and API scope.

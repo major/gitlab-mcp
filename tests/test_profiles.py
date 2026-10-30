@@ -33,7 +33,16 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
 @pytest.mark.parametrize(
     ("arguments", "endpoint", "response", "expected"),
     [
-        ({}, "/snippets/42", {"id": 42, "title": "Example"}, {"id": 42, "title": "Example"}),
+        (
+            {},
+            "/snippets/42",
+            {
+                "id": 42,
+                "title": "Example",
+                "files": [{"path": "a.txt"}, {"path": "b.txt", "raw_url": "https://example.com/raw"}],
+            },
+            {"id": 42, "title": "Example"},
+        ),
         ({"view": "file"}, "/snippets/42/raw", "hello", {"content": "hello"}),
         (
             {"view": "file", "project": "group/project", "file_path": "a/b", "ref": "main"},
@@ -54,9 +63,13 @@ async def test_read_routing(gitlab_env, arguments, endpoint, response, expected)
         )
         # Act
         result = await call_tool("read_snippet", {"snippet_id": 42, **arguments}, app=gitlab_mcp.create_app("compact"))
+        full_arguments = {key: value for key, value in arguments.items() if key != "view"}
+        full_name = "get_snippet_file" if arguments.get("view") == "file" else "get_snippet"
+        full_result = await call_tool(full_name, {"snippet_id": 42, **full_arguments})
     # Assert
     assert all(result[key] == value for key, value in expected.items())
-    assert route.called
+    assert result == full_result
+    assert route.call_count == 2  # noqa: PLR2004
 
 
 @pytest.mark.parametrize(
@@ -99,14 +112,15 @@ def test_profile_selection_and_main(monkeypatch):
     """Startup defaults to full and rejects unknown or empty profiles."""
     # Arrange
     calls = []
-    monkeypatch.setattr(type(gitlab_mcp.mcp), "run", lambda self: calls.append("full"))
+    monkeypatch.setattr(type(gitlab_mcp.mcp), "run", lambda self: calls.append(self))  # noqa: PLW0108
     monkeypatch.delenv("GITLAB_MCP_PROFILE", raising=False)
     # Act / Assert
     gitlab_mcp.main()
-    assert calls == ["full"]
+    assert calls == [gitlab_mcp.mcp]
     monkeypatch.setenv("GITLAB_MCP_PROFILE", "compact")
     gitlab_mcp.main()
-    assert calls == ["full", "full"]
+    assert len(calls) == 2  # noqa: PLR2004
+    assert calls[1] is not gitlab_mcp.mcp
     for profile in ("", "other"):
         with pytest.raises(ValueError, match="Unknown GitLab MCP profile"):
             gitlab_mcp.create_app(profile)
