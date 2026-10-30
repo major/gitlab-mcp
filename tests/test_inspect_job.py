@@ -15,6 +15,9 @@ pytestmark = pytest.mark.usefixtures("gitlab_env")
 BASE = "https://gitlab.example.com/api/v4/projects/group%2Fproject/jobs/42"
 ARGS = {"project": "group/project", "job_id": 42}
 HIDDEN = ("get_job", "get_job_artifact", "list_job_artifacts")
+FULL_COUNT = 44
+COMPACT_COUNT = 41
+TWO_CALLS = 2
 
 
 async def test_catalog():
@@ -29,17 +32,17 @@ async def test_catalog():
     async with Client(gitlab_mcp.create_app()) as client:
         full = {tool.name: tool for tool in await client.list_tools()}
     # Assert
-    assert len(full) == 44
-    assert len(short) == 41
+    assert len(full) == FULL_COUNT
+    assert len(short) == COMPACT_COUNT
     assert all(name in full and name not in short for name in HIDDEN)
     assert "inspect_job" not in full
     assert short["inspect_job"].annotations.read_only_hint is True
     assert short["inspect_job"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731
     assert size(short["inspect_job"]) < sum(size(full[name]) for name in HIDDEN)
-    assert "use get_job for runner-job metadata" in gitlab_mcp.mcp.instructions
-    assert "inspect_job(view='metadata')" in compact.instructions
-    assert "use get_job for runner-job metadata" not in compact.instructions
+    assert "use get_job for runner-job metadata" in (gitlab_mcp.mcp.instructions or "")
+    assert "inspect_job(view='metadata')" in (compact.instructions or "")
+    assert "use get_job for runner-job metadata" not in (compact.instructions or "")
 
 
 @pytest.mark.parametrize(
@@ -84,7 +87,7 @@ async def test_parity(arguments, full_name, full_arguments, suffix, response):
         full = await call_tool(full_name, ARGS | full_arguments)
     # Assert
     assert compact == full
-    assert route.call_count == 2
+    assert route.call_count == TWO_CALLS
     assert route.calls[0].request.url == route.calls[1].request.url
 
 
@@ -150,4 +153,4 @@ async def test_tree_pagination():
         assert route.calls[1].request.url.params["page"] == "2"
         with pytest.raises(ToolError):
             await call_tool("inspect_job", args | {"limit": 2, "cursor": first["next_cursor"]}, app=app)
-        assert route.call_count == 2
+        assert route.call_count == TWO_CALLS
