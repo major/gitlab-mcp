@@ -187,7 +187,7 @@ async def test_compact_singleton_landing(gitlab_env, case):
     # Assert
     assert not response.is_error
     item = response.structured_content["results"][0]
-    assert item["iid"] == 2187
+    assert item["iid"] == 2187  # noqa: PLR2004
     assert item["status"] == {"refused": "failed", "unknown": "unknown"}.get(case, "applied")
     if case in {"merged", "pending", "cancelled"}:
         assert item["landing"]["result"] == case
