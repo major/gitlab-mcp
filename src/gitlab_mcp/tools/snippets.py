@@ -29,7 +29,9 @@ class CreateFile(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     file_path: str = Field(description="Relative snippet file path, including any directories.")
-    content: str | None = Field(default=None, description="Nonblank UTF-8 text; do not set with content_file.")
+    content: str | None = Field(
+        default=None, description="Nonblank UTF-8 text without NUL; exclusive with content_file."
+    )
     content_file: str | None = Field(
         default=None,
         description="Absolute server-local regular UTF-8 file, at most 100000 bytes; exclusive with content.",
@@ -175,8 +177,8 @@ def _files(files: list[CreateFile] | list[UpdateFile], *, update: bool) -> list[
             entry["previous_path"] = previous
         if content is not None:
             total += len(_unicode(content, "content"))
-            if not content.strip():
-                raise ToolError("content must not be blank.")  # noqa: TRY003
+            if not content.strip() or "\x00" in content:
+                raise ToolError("content must not be blank or contain NUL bytes.")  # noqa: TRY003
             entry["content"] = content
         result.append(entry)
     if total > BYTE_LIMIT:
@@ -301,7 +303,7 @@ async def get_snippet_file(
     """Read a snippet file, like `glab api snippets/:id/raw`, with a 100000-byte cap.
 
     Omit file_path and ref for the first file, or supply both. Obtain ref from get_snippet.files[].raw_url;
-    this tool constructs its own API path and never follows returned URLs.
+    this tool constructs its own API path and never follows returned URLs. Content must be UTF-8 without NUL bytes.
     """
     path = f"{_base(project)}/{snippet_id}"
     if (file_path is None) != (ref is None):

@@ -248,6 +248,23 @@ async def test_create_defaults_private_and_accepts_exact_byte_limit(router):
     assert json.loads(route.calls[0].request.content) == {"title": "Private", "visibility": "private", "files": files}
 
 
+@pytest.mark.parametrize("source", ["inline", "local"])
+async def test_nul_content_is_rejected_before_writing(router, tmp_path, source):
+    """Both content sources reject NUL bytes so every submitted file can be read back."""
+    # Arrange
+    route = router.post(PERSONAL).mock(return_value=httpx.Response(201, json={"id": 42, "web_url": URL}))
+    file = {"file_path": "a.txt", "content": "hello\x00world"}
+    if source == "local":
+        path = tmp_path / "source.txt"
+        path.write_text(file.pop("content"), encoding="utf-8")
+        file["content_file"] = str(path)
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="content must not be blank or contain NUL"):
+        await call_tool("create_snippet", {"title": "Text only", "files": [file]})
+    assert not route.called
+
+
 async def test_update_metadata_preserves_omitted_fields(router):
     """Metadata-only edits do not send file actions or replace an omitted description."""
     # Arrange
