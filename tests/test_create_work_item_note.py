@@ -61,6 +61,21 @@ def requests(route: respx.Route) -> list[dict[str, Any]]:
     return [json.loads(call.request.content) for call in route.calls]
 
 
+@pytest.mark.parametrize("source", ["body", "body_file"])
+@respx.mock
+async def test_truncated_note_is_rejected_before_http(gitlab_env, tmp_path, source):
+    """Inline and file-backed previews are rejected before target lookup."""
+    # Arrange
+    body = "preview (45 more lines → /var/tmp/file)"
+    file = tmp_path / "note.md"
+    file.write_text(body, encoding="utf-8")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="truncation marker"):
+        await create_note(**{source: body if source == "body" else str(file)})
+    assert not respx.calls
+
+
 @pytest.mark.parametrize(("scope", "path"), [("project", PROJECT), ("group", "group")])
 @respx.mock
 async def test_create_uses_scoped_lookup_and_global_id(gitlab_env, scope, path):

@@ -17,9 +17,11 @@ from gitlab_mcp.common import (
     DISCUSSION_PREFIX,
     HTTP_REQUEST_TIMEOUT,
     HTTP_SERVER_ERROR,
+    TRUNCATION_MARKER_ERROR,
     Iid,
     Project,
     has_quick_action,
+    has_truncation_marker,
     is_int_at_least,
     page_text,
 )
@@ -213,6 +215,8 @@ def _validate_body(body: str) -> None:
         raise ToolError("The final body must be nonblank and at most 1000000 characters. No write was made.")  # noqa: TRY003
     if has_quick_action(body):
         raise ToolError("The final body may contain a GitLab quick action. No write was made.")  # noqa: TRY003
+    if has_truncation_marker(body):
+        raise ToolError(TRUNCATION_MARKER_ERROR)
     try:
         _body_hash(body)
     except ToolError as exc:
@@ -276,6 +280,7 @@ async def edit_merge_request_note(  # noqa: C901, PLR0912, PLR0913, PLR0917 - in
 ) -> NoteEditResult:
     r"""Edit an existing MR discussion note with `glab api --method PUT` behavior.
 
+    Final bodies containing truncation markers are rejected.
     Equivalent CLI endpoint (without this tool's checks):
 
     ```sh

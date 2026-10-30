@@ -174,6 +174,60 @@ async def validate_and_post_batch(notes: list[dict[str, Any]]) -> tuple[dict[str
     return validation.structured_content, posting.structured_content
 
 
+@pytest.mark.parametrize("validate_only", [True, False])
+@pytest.mark.parametrize("source", ["body", "body_path"])
+@respx.mock
+async def test_truncated_review_body_fails_before_requests(gitlab_env, tmp_path, validate_only, source):
+    """Inline and file-backed review previews fail in validation and post modes."""
+    # Arrange
+    body = "preview [truncated]"
+    file = tmp_path / "review.md"
+    file.write_text(body, encoding="utf-8")
+    note = {"file": "src.py", "line": 1, source: body if source == "body" else str(file)}
+
+    # Act
+    data = await call_tool(notes=[note], validate_only=validate_only)
+
+    # Assert
+    assert data["results"][0]["status"] == "failed"
+    assert "truncation marker" in data["results"][0]["reason"]
+    assert "full" in data["results"][0]["reason"].lower()
+    assert not respx.calls
+
+
+@pytest.mark.parametrize("kind", ["override", "extra"])
+@respx.mock
+async def test_cached_review_rejects_truncated_override_or_extra(gitlab_env, kind):
+    """Cached batches validate replacement and extra bodies before any posting."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    post = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    async with Client(mcp) as client:
+        prepared = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": [{"body": "valid"}], "validate_only": True},
+        )
+        arguments = (
+            {"body_overrides": [{"index": 0, "body": "preview [truncated]"}]}
+            if kind == "override"
+            else {"extra_notes": [{"body": "preview [truncated]"}]}
+        )
+        if kind == "extra":
+            # Mixed batches retain the existing read-only preflight for valid notes.
+            add_preflight([([diff_file("src.py")], None)])
+
+        # Act
+        result = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "batch_id": prepared.structured_content["batch_id"], **arguments},
+            raise_on_error=False,
+        )
+
+    # Assert
+    assert any("truncation marker" in row.get("reason", "") for row in result.structured_content["results"])
+    assert not post.called
+
+
 def serve_people(request: httpx.Request) -> httpx.Response:
     """Answer the username lookup with the known users, and each people mutation with no errors."""
     query = json.loads(request.content)["query"]

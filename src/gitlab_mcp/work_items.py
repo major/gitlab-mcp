@@ -16,6 +16,8 @@ from gitlab_mcp.common import (
     HTTP_REQUEST_TIMEOUT,
     HTTP_SERVER_ERROR,
     REVIEW_NOTE_BODY_CAP,
+    TRUNCATION_MARKER_ERROR,
+    has_truncation_marker,
     page_text,
     read_server_local_utf8_file,
 )
@@ -808,6 +810,8 @@ def _note_body(body: str | None, body_file: str | None) -> str:
         _raise_tool_error("body must be valid UTF-8.")
     if size > REVIEW_NOTE_BODY_CAP:
         _raise_tool_error(f"body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes.")
+    if has_truncation_marker(body):
+        _raise_tool_error(f"{TRUNCATION_MARKER_ERROR} Use body_file for a full server-local file.")
     return body
 
 

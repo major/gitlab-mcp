@@ -19,12 +19,14 @@ from gitlab_mcp.common import (
     HTTP_SERVER_ERROR,
     MAX_BATCH_MERGE_REQUESTS,
     MAX_PAGES,
+    TRUNCATION_MARKER_ERROR,
     Iid,
     PositiveIid,
     Project,
     bare_id,
     decode_cursor,
     encode_cursor,
+    has_truncation_marker,
     is_int_at_least,
     lower_or_empty,
 )
@@ -261,6 +263,8 @@ class ThreadReplyRequest(BaseModel):
             raise ValueError("thread_id must not be empty")  # noqa: TRY003
         if self.body is not None and not self.body.strip():
             raise ValueError("body must not be empty or whitespace")  # noqa: TRY003
+        if self.body is not None and has_truncation_marker(self.body):
+            raise ValueError(TRUNCATION_MARKER_ERROR)
         if self.body is None and not self.resolve:
             raise ValueError("Provide a reply body or set resolve=True")  # noqa: TRY003
         return self
@@ -886,6 +890,8 @@ async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write 
         raise ToolError("thread_id must not be empty.")  # noqa: TRY003
     if body is not None and not body.strip():
         raise ToolError("body must not be empty or whitespace.")  # noqa: TRY003
+    if body is not None and has_truncation_marker(body):
+        raise ToolError(TRUNCATION_MARKER_ERROR)
     if body is None and not resolve:
         raise ToolError("Provide a reply body or set resolve=True.")  # noqa: TRY003
 
@@ -977,6 +983,7 @@ async def reply_to_thread(  # noqa: PLR0913, PLR0917 - user-facing inputs.
 ) -> ThreadReplyResult:
     """Reply to or resolve a review thread. Like `glab mr note create --reply` and `glab mr note resolve`.
 
+    Bodies containing truncation markers are rejected.
     Get user approval before posting a reply or resolving a thread. A missing body is allowed only with `resolve=True`.
     `resolve=False` leaves the current resolution state unchanged and never reopens a thread. Replying and resolving
     are separate GitLab writes. If resolution fails after a reply, the result says not to repost the reply.
@@ -1008,6 +1015,8 @@ async def reply_to_threads(
 ) -> ThreadReplyBatchResult:
     """Reply to or resolve up to 20 review threads in order.
 
+    Bodies containing truncation markers are rejected. Malformed input rejects the whole batch before writes;
+    runtime failures are reported per item.
     Like `glab mr note create --reply` and `glab mr note resolve`. Get user approval before posting. Each item uses
     the same reply and resolution behavior as `reply_to_thread`; items run sequentially, and a failed item does not
     stop later items or roll back successful writes. Writes are never retried. Check each status and warning before

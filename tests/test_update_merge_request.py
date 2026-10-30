@@ -47,6 +47,14 @@ async def call_tool(**arguments: Any) -> dict[str, Any]:
     return await call_mcp_tool("update_merge_request", {"project": PROJECT, "iid": IID, **arguments})
 
 
+async def test_truncated_comment_is_rejected_before_http(gitlab_env, router):
+    """A preview cannot be posted as an update comment or combined with another change."""
+    # Act / Assert
+    with pytest.raises(ToolError, match="truncation marker"):
+        await call_tool(comment="preview [output truncated]", state="close")
+    assert not router.calls
+
+
 def operation(request: httpx.Request) -> str:
     """Return the GraphQL query text that a request carries."""
     return json.loads(request.content)["query"]

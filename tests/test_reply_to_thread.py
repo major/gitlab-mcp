@@ -69,6 +69,65 @@ async def call_reply_batch(replies: list[dict[str, Any]]) -> dict[str, Any]:
     return result.structured_content
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "preview (45 more lines → /var/tmp/file) followed by text",
+        "... (1 more lines -> /var/tmp/file)",
+        "[output truncated]",
+        "preview [truncated]",
+        "preview\r\n[truncated]\r\n \t",
+    ],
+)
+@respx.mock
+async def test_reply_rejects_truncation_markers_before_http(gitlab_env, body):
+    """Truncated previews cannot be posted or resolved as complete replies."""
+    # Act / Assert
+    with pytest.raises(ToolError, match="truncation marker") as error:
+        await call_reply(body=body, resolve=True)
+    assert "full" in str(error.value).lower()
+    assert not respx.calls
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The result was truncated in the original report.",
+        "```\n/var/tmp/file\n```",
+        "See /var/tmp/file for details.",
+        "preview [truncated] followed by text",
+        "(٤٥ more lines → /var/tmp/file)",
+    ],
+)
+@respx.mock
+async def test_reply_accepts_normal_prose_and_fenced_paths(gitlab_env, body):
+    """Ordinary prose and fenced paths are not truncation markers."""
+    # Arrange
+    route = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": 321}))
+
+    # Act
+    result = await call_reply(body=body)
+
+    # Assert
+    assert result["note_id"] == 321  # noqa: PLR2004
+    assert json.loads(route.calls.last.request.content)["body"] == body
+
+
+@respx.mock
+async def test_batch_rejects_later_truncated_reply_before_any_write(gitlab_env):
+    """A bad later reply prevents earlier replies and resolutions from being written."""
+    # Arrange
+    replies = [
+        {"iid": IID, "thread_id": "thread-1", "body": "Valid reply", "resolve": True},
+        {"iid": IID, "thread_id": "thread-2", "body": "preview [truncated]", "resolve": True},
+    ]
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="truncation marker"):
+        await call_reply_batch(replies)
+    assert not respx.calls
+
+
 @respx.mock
 async def test_posts_reply_and_returns_only_the_note_id(gitlab_env):
     """A reply uses the notes endpoint and does not include the note body in its result."""
