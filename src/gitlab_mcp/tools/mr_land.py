@@ -373,12 +373,18 @@ async def land_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
         Field(description="Delete the source branch after merging. Omit for the project default."),
     ] = None,
 ) -> LandBatchResult:
-    """Merge or cancel up to 20 merge requests, in order. Like `glab mr merge` for several MRs.
+    """Merge or cancel up to 20 merge requests. Like `glab mr merge`. Use a one-item list for one MR.
 
-    - Get each `sha` from get_merge_requests. `mode`, `squash`, and `remove_source_branch` apply to every item.
-    - Items run in order. A failed item does not stop later items, and writes are never retried.
-    - Check each `status` before you retry. Never retry an `unknown` outcome without checking get_merge_request first.
-    - Bad arguments and repeated IIDs are refused before the first write, so nothing is sent.
+    - `auto` uses the merge train if enabled, otherwise waits until checks pass. Use `now` to bypass the train ONLY
+      on an explicit user request; a request to merge is not enough.
+    - Get each full head `sha` from get_merge_requests; GitLab refuses with 409 if the head has moved.
+      `mode`, `squash`, and `remove_source_branch` apply to every item. `cancel` disallows `sha`, `squash`,
+      and `remove_source_branch`, including false flags.
+    - Check each `status` and `landing.result`: `applied` may still be `pending`, not merged or cancelled.
+      Check nested warnings too.
+    - Ordered writes are non-atomic: errors do not roll back or stop later items. Never retry a failed write
+      without checking GitLab first; an `unknown` outcome may have succeeded. No writes are automatically retried.
+    - Bad arguments and repeated IIDs are refused before the first write.
     """
     _check_batch_args(mode, items, squash, remove_source_branch)
     client = get_client(ctx)

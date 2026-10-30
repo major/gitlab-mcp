@@ -19,7 +19,14 @@ def create_app(profile: str = "full") -> FastMCP:
     app = FastMCP(name="gitlab-mcp", instructions=instructions, lifespan=gitlab_lifespan)
     app.add_provider(mcp.local_provider)
     app.disable(
-        names={"get_snippet", "get_snippet_file", "get_job", "get_job_artifact", "list_job_artifacts"},
+        names={
+            "get_snippet",
+            "get_snippet_file",
+            "get_job",
+            "get_job_artifact",
+            "list_job_artifacts",
+            "land_merge_request",
+        },
         components={"tool"},
     )
     app.tool(annotations={"readOnlyHint": True, "openWorldHint": True})(read_snippet)
