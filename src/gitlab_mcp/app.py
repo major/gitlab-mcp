@@ -42,14 +42,14 @@ async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
 
 class CreatePipelineValidationMiddleware(Middleware):
-    """Hide argument validation details for create_pipeline calls."""
+    """Hide argument validation details for pipeline creation tools."""
 
     async def on_call_tool(
         self,
         context: MiddlewareContext[CallToolRequestParams],
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
-        """Replace only create_pipeline argument validation errors with a safe hint."""
+        """Replace pipeline argument validation errors with a tool-specific safe hint."""
         hints = {"create_pipeline": CREATE_PIPELINE_VALIDATION_ERROR, "start_pipeline": START_PIPELINE_VALIDATION_ERROR}
         if context.message.name not in hints:
             return await call_next(context)

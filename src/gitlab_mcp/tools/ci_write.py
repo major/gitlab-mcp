@@ -335,6 +335,7 @@ async def start_pipeline(  # noqa: PLR0913, PLR0917
 
     Set target to ref with ref and optional variables, or merge_request with iid only. A branch pipeline does not
     satisfy the MR pipeline gate. expected_sha is checked before the POST, but this preflight is not atomic.
+    For an MR, use get_merge_request.head_sha, not a merged-result pipeline SHA.
     validate_only skips the POST. An observed active MR pipeline is refused, not a concurrency guarantee.
     For unknown or unverified writes, check GitLab before retrying; writes are never retried automatically.
     """

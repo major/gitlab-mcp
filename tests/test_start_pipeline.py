@@ -118,6 +118,27 @@ async def test_validation_redacts(gitlab_env, changes):
     assert not router.calls
 
 
+@pytest.mark.parametrize("missing", ["project", "target", "expected_sha"])
+async def test_missing_required_fields_do_not_expose_variables(gitlab_env, missing):
+    """Missing-field errors never include the remaining payload's secret variables."""
+    # Arrange
+    args = {
+        "project": "group/project",
+        "target": "ref",
+        "ref": "main",
+        "expected_sha": SHA,
+        "variables": {"TOKEN": "secret-value"},
+    }
+    del args[missing]
+
+    # Act / Assert
+    with respx.mock(assert_all_called=False) as router, pytest.raises(ToolError) as error:
+        await call_tool("start_pipeline", args, app=gitlab_mcp.create_app("compact"))
+    assert "Invalid start_pipeline arguments" in str(error.value)
+    assert "secret-value" not in str(error.value)
+    assert not router.calls
+
+
 @pytest.mark.parametrize("active", [False, True])
 async def test_mr_validate_and_active(gitlab_env, active):
     """Validation skips POST and an observed active pipeline is refused."""
