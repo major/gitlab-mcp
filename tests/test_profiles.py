@@ -30,13 +30,26 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
         "list_job_artifacts",
         "land_merge_request",
         "reply_to_thread",
-    } | {"read_snippet", "inspect_job"}
+        "create_pipeline",
+        "create_merge_request_pipeline",
+    } | {"read_snippet", "inspect_job", "start_pipeline"}
     assert short["read_snippet"].annotations.read_only_hint is True
     assert short["read_snippet"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731
     assert size(short["read_snippet"]) < sum(size(full[name]) for name in ("get_snippet", "get_snippet_file"))
     assert len(full) == 44  # noqa: PLR2004
-    assert len(short) == 39  # noqa: PLR2004
+    assert len(short) == 38  # noqa: PLR2004
+    start = short["start_pipeline"]
+    assert start.annotations.read_only_hint is False
+    assert start.annotations.destructive_hint is False
+    assert start.annotations.idempotent_hint is False
+    assert start.annotations.open_world_hint is True
+    assert start.output_schema == full["create_pipeline"].output_schema
+    assert size(start) < sum(size(full[name]) for name in ("create_pipeline", "create_merge_request_pipeline"))
+    for tool in short.values():
+        text = json.dumps([tool.description, tool.input_schema, tool.output_schema])
+        assert not re.search(r"\b(?:create_pipeline|create_merge_request_pipeline)\b", text)
+    assert not re.search(r"\b(?:create_pipeline|create_merge_request_pipeline)\b", compact.instructions or "")
     batch = short["reply_to_threads"]
     assert batch.annotations.read_only_hint is False
     assert batch.annotations.destructive_hint is False
@@ -154,9 +167,10 @@ async def test_hidden_tools_and_pipeline_validation(gitlab_env):
             await call_tool("reply_to_thread", {"project": "group/project", "iid": 42, "thread_id": "x"}, app=app)
         with pytest.raises(ToolError) as error:
             await call_tool(
-                "create_pipeline", {"variables": [{"key": "x", "value": {"secret": "private-value"}}]}, app=app
+                "start_pipeline", {"variables": [{"key": "x", "value": {"secret": "private-value"}}]}, app=app
             )
         assert "private-value" not in str(error.value)
+        assert "target" in str(error.value)
         assert not router.calls
 
 
