@@ -21,7 +21,13 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
     async with Client(gitlab_mcp.create_app()) as client:
         full = {tool.name: tool for tool in await client.list_tools()}
     # Assert
-    assert set(short) == set(full) - {"get_snippet", "get_snippet_file"} | {"read_snippet"}
+    assert set(short) == set(full) - {
+        "get_snippet",
+        "get_snippet_file",
+        "get_job",
+        "get_job_artifact",
+        "list_job_artifacts",
+    } | {"read_snippet", "inspect_job"}
     assert short["read_snippet"].annotations.read_only_hint is True
     assert short["read_snippet"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731

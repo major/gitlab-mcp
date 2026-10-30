@@ -23,11 +23,11 @@ Set `GITLAB_MCP_PROFILE` in the server environment before launch. Restart the se
 | Profile | Tool catalog |
 | --- | --- |
 | `full` (default) | All tools, including `get_snippet` and `get_snippet_file`. |
-| `compact` | Replaces those two reads with `read_snippet` for metadata or file content. |
+| `compact` | Replaces snippet reads with `read_snippet` and job metadata and artifact reads with `inspect_job`. |
 
 Empty or unknown profile values are rejected.
 
-The compact `read_snippet` tool advertises a generic object output schema, but its runtime payload preserves the full metadata or file response shape.
+The compact `read_snippet` and `inspect_job` tools advertise generic object output schemas, but their runtime payloads preserve the corresponding full response shapes.
 
 ## Authentication 🔐
 
@@ -153,6 +153,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_current_user` | Return the username and ID of the user who owns the GitLab token. |
 | `get_job` | Read a runner job's status, timing, failure reason, and runner metadata. |
 | `get_job_artifact` | Read a bounded UTF-8 text prefix from a known job artifact path. |
+| `inspect_job` (compact only) | Read job metadata, artifact text, or an artifact tree. |
 | `get_job_log` | Read a bounded job log view, such as its tail, search results, or failure markers. |
 | `get_merge_request` | Read merge request status, reviewers, approvals, CI status and tested commit, and optional details. |
 | `get_merge_request_diff` | List changed files or read selected merge request patches, optionally compared with an earlier version. |
