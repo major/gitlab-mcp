@@ -14,6 +14,7 @@ from gitlab_mcp.tools import (
     mr_review,
     mr_threads,
     mr_update,
+    snippets,
     users,
     work_items,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "mr_review",
     "mr_threads",
     "mr_update",
+    "snippets",
     "users",
     "work_items",
 ]

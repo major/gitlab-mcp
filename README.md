@@ -131,7 +131,9 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `create_merge_request` | Create a merge request from existing branches with optional labels, assignees, and blockers. |
 | `create_merge_request_pipeline` | Start a merge request pipeline after checking the MR head SHA, for example after a retarget. |
 | `create_pipeline` | Create a pipeline for a ref after checking its expected commit SHA. |
+| `create_snippet` | Create a personal or project snippet with bounded files. |
 | `create_work_item_note` | Add a project or group work item comment from inline text or a server-local file. |
+| `delete_snippet` | Delete a personal or project snippet. |
 | `edit_merge_request_description` | Replace one unique exact-text match in a merge request description. |
 | `edit_merge_request_note` | Edit an existing discussion note with a body hash guard and post-write verification. |
 | `edit_work_item_description` | Apply guarded text replacements or edit a selected table cell in a work item description. |
@@ -147,6 +149,8 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_pipeline` | Read pipeline metadata and one page of its jobs. |
 | `get_pipeline_failures` | List failed runner and build jobs with optional diagnostic log excerpts. |
 | `get_pipeline_test_report` | Read pipeline test suite summaries or failed and errored test cases. |
+| `get_snippet` | Read compact snippet metadata and file paths. |
+| `get_snippet_file` | Read bounded UTF-8 snippet file content. |
 | `get_work_item` | Read a project or group work item and selected description content. |
 | `get_work_item_note` | Read a scoped human note body in bounded pages with a full-body hash. |
 | `land_merge_request` | Merge one merge request or cancel its queued merge. |
@@ -157,6 +161,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `list_merge_train` | List active merge train entries. |
 | `list_pipeline_schedules` | List one page of a project's pipeline schedules. |
 | `list_pipelines` | List one page of project, merge request, or schedule pipelines. |
+| `list_snippets` | List one page of personal, visible, public, or project snippets. |
 | `list_work_item_notes` | Read a bounded page of human notes and their IDs for a work item. |
 | `post_review_notes` | Validate or post general, file-level, or inline review notes with single-use batches and recovery. |
 | `reply_to_thread` | Reply to or resolve one merge request review thread. |
@@ -164,3 +169,4 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `resolve_open_threads` | Resolve open review threads on one merge request. |
 | `retry_ci` | Retry a failed or canceled CI job or pipeline after checking its expected SHA. |
 | `update_merge_request` | Comment on, close, or reopen a merge request, or update its details, people, labels, blockers, approval, or rebase status. |
+| `update_snippet` | Update snippet metadata or file contents. |

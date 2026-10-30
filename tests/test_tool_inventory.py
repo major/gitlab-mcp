@@ -29,6 +29,8 @@ READ_ONLY_TOOLS = {
     "get_pipeline",
     "get_pipeline_failures",
     "get_pipeline_test_report",
+    "get_snippet",
+    "get_snippet_file",
     "get_work_item",
     "get_work_item_note",
     "list_job_artifacts",
@@ -37,6 +39,7 @@ READ_ONLY_TOOLS = {
     "list_merge_train",
     "list_pipeline_schedules",
     "list_pipelines",
+    "list_snippets",
     "list_work_item_notes",
 }
 WRITE_TOOLS = {
@@ -44,7 +47,9 @@ WRITE_TOOLS = {
     "create_merge_request",
     "create_merge_request_pipeline",
     "create_pipeline",
+    "create_snippet",
     "create_work_item_note",
+    "delete_snippet",
     "edit_merge_request_description",
     "edit_merge_request_note",
     "edit_work_item_description",
@@ -56,6 +61,7 @@ WRITE_TOOLS = {
     "resolve_open_threads",
     "retry_ci",
     "update_merge_request",
+    "update_snippet",
 }
 
 
