@@ -469,18 +469,23 @@ class GitLabClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        expected_status: int | None = None,
         **params: Any,
     ) -> Any:
         """Send a POST, PUT, or DELETE and return the parsed JSON body, or None when there is no body.
 
         `json` is the request body. Keyword arguments become query parameters.
         GitLab often answers 204 No Content to a DELETE, so an empty body is None.
+        Set `expected_status` when a caller must distinguish an exact success status
+        from an unexpected empty response, including a redirect. Redirects are not followed.
 
         Raises:
             GitLabConnectionError: When the instance cannot be reached.
-            GitLabAPIError: When GitLab returns an error status.
+            GitLabAPIError: When GitLab returns an error status or does not match `expected_status`.
         """
         response = await self._send(method, path, params=params, json=json)
+        if expected_status is not None and response.status_code != expected_status:
+            raise GitLabAPIError(response.status_code, path, f"Expected HTTP {expected_status}.")
         return response.json() if response.content else None
 
     async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
