@@ -13,7 +13,7 @@ from gitlab_mcp.app import get_client, mcp
 from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionError
 from gitlab_mcp.common import HTTP_REQUEST_TIMEOUT, HTTP_SERVER_ERROR
 from gitlab_mcp.mr_common import full_sha, mr_rest_path
-lazy from gitlab_mcp.common import Iid, Project
+lazy from gitlab_mcp.common import Iid, PositiveIid, Project
 
 HTTP_CLIENT_ERROR = 400
 MAX_PIPELINE_VARIABLES = 20
@@ -316,3 +316,33 @@ async def create_merge_request_pipeline(
             "warning": warning,
         }
     )
+
+
+async def start_pipeline(  # noqa: PLR0913, PLR0917
+    ctx: Context,
+    project: Project,
+    target: Literal["ref", "merge_request"],
+    expected_sha: FullSha,
+    ref: Ref | None = None,
+    iid: PositiveIid | None = None,
+    variables: PipelineVariables | None = None,
+    validate_only: bool = False,
+) -> CiWriteResult:
+    """Start a ref or merge request pipeline.
+
+    Use `glab ci run` for a ref, or for an MR use
+    `glab api --method POST projects/:id/merge_requests/:iid/pipelines`.
+
+    Set target to ref with ref and optional variables, or merge_request with iid only. A branch pipeline does not
+    satisfy the MR pipeline gate. expected_sha is checked before the POST, but this preflight is not atomic.
+    For an MR, use get_merge_request.head_sha, not a merged-result pipeline SHA.
+    validate_only skips the POST. An observed active MR pipeline is refused, not a concurrency guarantee.
+    For unknown or unverified writes, check GitLab before retrying; writes are never retried automatically.
+    """
+    if target == "ref":
+        if ref is None or iid is not None:
+            raise ToolError("The ref target requires ref and does not accept iid.")  # noqa: TRY003
+        return await create_pipeline(ctx, project, ref, expected_sha, variables, validate_only)
+    if iid is None or ref is not None or variables is not None:
+        raise ToolError("The merge_request target requires iid and does not accept ref or variables.")  # noqa: TRY003
+    return await create_merge_request_pipeline(ctx, project, iid, expected_sha, validate_only)

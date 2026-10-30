@@ -325,7 +325,7 @@ class MergeRequestDetail(BaseModel):
         default=False,
         description=(
             "True when an open MR waits for CI (ci_must_pass) but has no head pipeline, often after a retarget. "
-            "Start one with create_merge_request_pipeline. Left out when false."
+            "Start a merge request pipeline, not a branch pipeline. Left out when false."
         ),
         exclude_if=lambda value: not value,
     )
@@ -405,7 +405,7 @@ class CompactMergeRequest(BaseModel):
         default=False,
         description=(
             "True when an open MR waits for CI (ci_must_pass) but has no head pipeline, often after a retarget. "
-            "Start one with create_merge_request_pipeline. Left out when false."
+            "Start a merge request pipeline, not a branch pipeline. Left out when false."
         ),
         exclude_if=lambda value: not value,
     )
