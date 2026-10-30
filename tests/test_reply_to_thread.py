@@ -6,10 +6,10 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp import mcp
+from gitlab_mcp import create_app, mcp
 
 API = "https://gitlab.example.com/api/v4"
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -62,11 +62,44 @@ async def call_reply(**arguments: Any) -> dict[str, Any]:
     return result.structured_content
 
 
-async def call_reply_batch(replies: list[dict[str, Any]]) -> dict[str, Any]:
+async def call_reply_batch(replies: list[dict[str, Any]], *, app: FastMCP = mcp) -> dict[str, Any]:
     """Call reply_to_threads through the in-memory MCP client."""
-    async with Client(mcp) as client:
+    async with Client(app) as client:
         result = await client.call_tool("reply_to_threads", {"project": PROJECT, "replies": replies})
     return result.structured_content
+
+
+@pytest.mark.parametrize("mode", ["reply", "resolve", "unknown"])
+@respx.mock
+async def test_compact_singleton_reply_batch(gitlab_env, mode):
+    """Compact singleton writes retain batch results and post-write summaries."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    resolve = respx.put(DISCUSSION_URL).mock(
+        side_effect=httpx.ConnectError("connection reset") if mode == "unknown" else None,
+        return_value=httpx.Response(200, json={"resolved": True}) if mode != "unknown" else None,
+    )
+    status = respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 1))
+    item = {"iid": IID, "thread_id": "thread-1"}
+    if mode != "resolve":
+        item["body"] = "Reply"
+    if mode != "reply":
+        item["resolve"] = True
+    # Act
+    result = await call_reply_batch([item], app=create_app("compact"))
+    # Assert
+    expected = (["POST"] if mode != "resolve" else []) + (["PUT"] if mode != "reply" else []) + ["POST"]
+    assert [call.request.method for call in respx.calls] == expected
+    assert note.call_count == (mode != "resolve")
+    assert resolve.call_count == (mode != "reply")
+    assert status.call_count == 1
+    assert result["merge_requests"][0]["iid"] == IID
+    row = result["results"][0]
+    assert row["status"] == ("unknown" if mode == "unknown" else "applied")
+    if mode != "resolve":
+        assert row["note_id"] == NOTE_ID
+    if mode == "unknown":
+        assert "do not repost" in row["warning"].lower()
 
 
 @pytest.mark.parametrize(
