@@ -9,7 +9,7 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp import mcp
+from gitlab_mcp import create_app, mcp
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
 PROJECT = "group/project"
@@ -129,10 +129,20 @@ async def test_connection_error_marks_item_unknown_and_is_not_retried(gitlab_env
         ({"items": [{"iid": 2187, "sha": HEAD_SHA}, {"iid": 2187, "sha": HEAD_SHA}]}, "Repeated IIDs: 2187"),
         ({"items": [{"iid": 2187, "sha": HEAD_SHA}, {"iid": 2188}]}, "needs sha"),
         ({"items": [{"iid": 2187, "sha": HEAD_SHA}], "mode": "cancel"}, "takes only project and iid"),
+        ({"items": [{"iid": 2187}], "mode": "cancel", "squash": False}, "takes only project and iid"),
+        ({"items": [{"iid": 2187}], "mode": "cancel", "remove_source_branch": False}, "takes only project and iid"),
         ({"items": []}, "items"),
         ({"items": [{"iid": n, "sha": HEAD_SHA} for n in range(1, 22)]}, "items"),
     ],
-    ids=["duplicate-iid", "missing-sha-later-item", "cancel-with-sha", "empty-batch", "too-many-items"],
+    ids=[
+        "duplicate-iid",
+        "missing-sha-later-item",
+        "cancel-with-sha",
+        "cancel-squash-false",
+        "cancel-remove-false",
+        "empty-batch",
+        "too-many-items",
+    ],
 )
 @respx.mock
 async def test_invalid_batch_fails_before_any_request(gitlab_env, arguments, message):
@@ -144,3 +154,48 @@ async def test_invalid_batch_fails_before_any_request(gitlab_env, arguments, mes
     with pytest.raises(ToolError, match=message):
         await call_batch(**arguments)
     assert catch_all.call_count == 0
+
+
+@pytest.mark.parametrize("case", ["merged", "pending", "refused", "unknown", "cancelled"])
+@respx.mock
+async def test_compact_singleton_landing(gitlab_env, case):
+    """The compact batch tool preserves singleton write and per-item outcomes."""
+    # Arrange
+    cancel = case == "cancelled"
+    url = f"{MERGE_REQUESTS_URL}/2187/cancel_merge_when_pipeline_succeeds" if cancel else merge_url(2187)
+    route = respx.post(url) if cancel else respx.put(url)
+    if case == "unknown":
+        route.mock(side_effect=httpx.ConnectError("connection reset"))
+    elif case == "refused":
+        route.mock(return_value=httpx.Response(409, json={"message": "Head moved"}))
+    else:
+        route.mock(return_value=httpx.Response(200, json={}))
+        if case == "pending":
+            respx.post(GRAPHQL).mock(return_value=httpx.Response(500))
+        else:
+            mock_graphql(
+                make_landing_node(state="merged" if case == "merged" else "opened", autoMergeStrategy=None), []
+            )
+    arguments = {"project": PROJECT, "items": [{"iid": 2187} if cancel else {"iid": 2187, "sha": HEAD_SHA}]}
+    if cancel:
+        arguments["mode"] = "cancel"
+
+    # Act
+    async with Client(create_app("compact")) as client:
+        response = await client.call_tool("land_merge_requests", arguments)
+
+    # Assert
+    assert not response.is_error
+    item = response.structured_content["results"][0]
+    assert item["iid"] == 2187
+    assert item["status"] == {"refused": "failed", "unknown": "unknown"}.get(case, "applied")
+    if case in {"merged", "pending", "cancelled"}:
+        assert item["landing"]["result"] == case
+    if case == "pending":
+        assert "could not be read" in item["landing"]["warning"]
+    if case in {"refused", "unknown"}:
+        assert "landing" not in item
+        assert ("Head moved" if case == "refused" else "outcome is unknown") in item["warning"]
+    assert route.call_count == 1
+    if not cancel:
+        assert json.loads(route.calls.last.request.content) == {"sha": HEAD_SHA, "auto_merge": True}

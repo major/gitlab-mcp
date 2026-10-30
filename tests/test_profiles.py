@@ -13,7 +13,7 @@ from mcp_helpers import call_tool
 
 
 async def test_compact_inventory_and_schema_budget(gitlab_env):
-    """Compact replaces only the two snippet reads without mutating full."""
+    """Compact isolates its catalog and keeps landing guidance within the full schema budget."""
     # Arrange / Act
     compact = gitlab_mcp.create_app("compact")
     async with Client(compact) as client:
@@ -27,11 +27,39 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
         "get_job",
         "get_job_artifact",
         "list_job_artifacts",
+        "land_merge_request",
     } | {"read_snippet", "inspect_job"}
     assert short["read_snippet"].annotations.read_only_hint is True
     assert short["read_snippet"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731
     assert size(short["read_snippet"]) < sum(size(full[name]) for name in ("get_snippet", "get_snippet_file"))
+    assert len(full) == 44  # noqa: PLR2004
+    assert len(short) == 40  # noqa: PLR2004
+    landing = short["land_merge_requests"]
+    assert landing.annotations.read_only_hint is False
+    assert landing.annotations.destructive_hint is True
+    assert landing.annotations.idempotent_hint is False
+    assert landing.annotations.open_world_hint is True
+    assert size(landing) < sum(size(full[name]) for name in ("land_merge_request", "land_merge_requests"))
+    description = landing.description
+    for text in (
+        "one-item list",
+        "merge train",
+        "checks pass",
+        "explicit",
+        "bypass",
+        "false",
+        "head has moved",
+        "landing.result",
+        "pending",
+        "non-atomic",
+        "later items",
+        "without checking GitLab",
+        "unknown",
+    ):
+        assert text in description
+    assert "land_merge_request`" not in description
+    assert "land_merge_request" not in (compact.instructions or "")
     assert gitlab_mcp.create_app() is gitlab_mcp.mcp
     assert gitlab_mcp.create_app("compact") is not compact
 
@@ -106,6 +134,8 @@ async def test_hidden_tools_and_pipeline_validation(gitlab_env):
         for name in ("get_snippet", "get_snippet_file"):
             with pytest.raises(ToolError):
                 await call_tool(name, {"snippet_id": 42}, app=app)
+        with pytest.raises(ToolError, match="Unknown tool"):
+            await call_tool("land_merge_request", {"project": "group/project", "iid": 42}, app=app)
         with pytest.raises(ToolError) as error:
             await call_tool(
                 "create_pipeline", {"variables": [{"key": "x", "value": {"secret": "private-value"}}]}, app=app
