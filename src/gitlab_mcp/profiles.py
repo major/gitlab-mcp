@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 
 from gitlab_mcp.app import CreatePipelineValidationMiddleware, gitlab_lifespan, mcp
 from gitlab_mcp.tools.ci import inspect_job
+from gitlab_mcp.tools.ci_write import start_pipeline
 from gitlab_mcp.tools.snippets import read_snippet
 
 
@@ -32,10 +33,15 @@ def create_app(profile: str = "full") -> FastMCP:
             "list_job_artifacts",
             "land_merge_request",
             "reply_to_thread",
+            "create_pipeline",
+            "create_merge_request_pipeline",
         },
         components={"tool"},
     )
     app.tool(annotations={"readOnlyHint": True, "openWorldHint": True})(read_snippet)
     app.tool(annotations={"readOnlyHint": True, "openWorldHint": True})(inspect_job)
+    app.tool(
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+    )(start_pipeline)
     app.add_middleware(CreatePipelineValidationMiddleware())
     return app

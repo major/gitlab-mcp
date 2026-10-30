@@ -23,11 +23,13 @@ Set `GITLAB_MCP_PROFILE` in the server environment before launch. Restart the se
 | Profile | Tool catalog |
 | --- | --- |
 | `full` (default) | All tools, including `get_snippet` and `get_snippet_file`. |
-| `compact` | Replaces snippet reads with `read_snippet`, job metadata and artifact reads with `inspect_job`, and uses batch tools for landing and thread replies. |
+| `compact` | Replaces snippet reads with `read_snippet`, job reads with `inspect_job`, and pipeline creation with `start_pipeline`; uses batch tools for landing and thread replies. |
 
 Empty or unknown profile values are rejected.
 
 The compact `read_snippet` and `inspect_job` tools advertise generic object output schemas, but their runtime payloads preserve the corresponding full response shapes.
+
+In compact, `start_pipeline` requires `target="ref"` with `ref` and optional environment `variables`, or `target="merge_request"` with `iid`. A branch pipeline does not satisfy the MR pipeline gate. The expected SHA preflight is not atomic; `validate_only` skips the write. An observed active MR pipeline is refused but this is not a concurrency guarantee. Check GitLab before retrying an unknown or unverified write.
 
 In compact, use `land_merge_requests` with a one-item list for one merge request, or up to 20 items for a batch. Its response is a `results` list with per-item status and landing details, not the scalar landing response available in full. Check both the status and the nested landing result.
 
@@ -158,6 +160,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_job` | Read a runner job's status, timing, failure reason, and runner metadata. |
 | `get_job_artifact` | Read a bounded UTF-8 text prefix from a known job artifact path. |
 | `inspect_job` (compact only) | Read job metadata, artifact text, or an artifact tree. |
+| `start_pipeline` (compact only) | Start a ref or merge request pipeline after a SHA preflight. |
 | `get_job_log` | Read a bounded job log view, such as its tail, search results, or failure markers. |
 | `get_merge_request` | Read merge request status, reviewers, approvals, CI status and tested commit, and optional details. |
 | `get_merge_request_diff` | List changed files or read selected merge request patches, optionally compared with an earlier version. |

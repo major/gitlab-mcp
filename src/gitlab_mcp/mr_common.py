@@ -227,7 +227,7 @@ def full_sha(value: Any) -> bool:
 # Shown when GitLab waits for CI that no current pipeline can satisfy. 🚦
 PIPELINE_STALL_HINT = (
     "GitLab waits for CI (ci_must_pass), but the MR has no head pipeline. This often happens after a retarget "
-    "with no new push. If none starts soon, start one with create_merge_request_pipeline."
+    "with no new push. If none starts soon, start a merge request pipeline, not a branch pipeline."
 )
 
 

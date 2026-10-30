@@ -17,6 +17,10 @@ from gitlab_mcp.review_batches import ReviewBatchCache
 CREATE_PIPELINE_VALIDATION_ERROR = (
     "Invalid create_pipeline arguments. Provide project, ref, expected_sha, and valid variables; see the tool schema."
 )
+START_PIPELINE_VALIDATION_ERROR = (
+    "Invalid start_pipeline arguments. Provide project, target, expected_sha, and the target's ref or iid; "
+    "see the tool schema."
+)
 
 
 @lifespan
@@ -46,13 +50,14 @@ class CreatePipelineValidationMiddleware(Middleware):
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         """Replace only create_pipeline argument validation errors with a safe hint."""
-        if context.message.name != "create_pipeline":
+        hints = {"create_pipeline": CREATE_PIPELINE_VALIDATION_ERROR, "start_pipeline": START_PIPELINE_VALIDATION_ERROR}
+        if context.message.name not in hints:
             return await call_next(context)
 
         try:
             return await call_next(context)
         except ValidationError:
-            raise ToolError(CREATE_PIPELINE_VALIDATION_ERROR) from None
+            raise ToolError(hints[context.message.name]) from None
 
 
 mcp = FastMCP(

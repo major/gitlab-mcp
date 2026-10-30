@@ -472,5 +472,5 @@ async def test_ci_wait_with_no_head_pipeline_warns_and_keeps_the_train_warning(g
 
     # Assert
     assert data["result"] == "merge_train"
-    assert "create_merge_request_pipeline" in data["warning"]
+    assert "start a merge request pipeline, not a branch pipeline" in data["warning"]
     assert data["warning"].endswith("The merge train position could not be read. Check list_merge_train.")
