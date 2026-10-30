@@ -23,13 +23,15 @@ Set `GITLAB_MCP_PROFILE` in the server environment before launch. Restart the se
 | Profile | Tool catalog |
 | --- | --- |
 | `full` (default) | All tools, including `get_snippet` and `get_snippet_file`. |
-| `compact` | Replaces snippet reads with `read_snippet`, job metadata and artifact reads with `inspect_job`, and uses `land_merge_requests` for landing. |
+| `compact` | Replaces snippet reads with `read_snippet`, job metadata and artifact reads with `inspect_job`, and uses batch tools for landing and thread replies. |
 
 Empty or unknown profile values are rejected.
 
 The compact `read_snippet` and `inspect_job` tools advertise generic object output schemas, but their runtime payloads preserve the corresponding full response shapes.
 
 In compact, use `land_merge_requests` with a one-item list for one merge request, or up to 20 items for a batch. Its response is a `results` list with per-item status and landing details, not the scalar landing response available in full. Check both the status and the nested landing result.
+
+For thread replies or resolutions in compact, use `reply_to_threads` with a one-item list for one thread or up to 20 items for a batch. The response has per-item results rather than the full profile's scalar reply response. Even a singleton adds best-effort per-merge-request post-write summary reads; read failures do not undo writes. `resolve_open_threads` remains available separately.
 
 ## Authentication 🔐
 

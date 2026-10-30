@@ -1017,10 +1017,11 @@ async def reply_to_threads(
 
     Bodies containing truncation markers are rejected. Malformed input rejects the whole batch before writes;
     runtime failures are reported per item.
-    Like `glab mr note create --reply` and `glab mr note resolve`. Get user approval before posting. Each item uses
-    the same reply and resolution behavior as `reply_to_thread`; items run sequentially, and a failed item does not
-    stop later items or roll back successful writes. Writes are never retried. Check each status and warning before
-    deciding what to do next, especially when an outcome is unknown.
+    Like `glab mr note create --reply` and `glab mr note resolve`. Use a one-item list for one thread. Get explicit
+    APPROVE before replying or resolving. A missing body requires `resolve=true`; `resolve=false` does not reopen.
+    Reply and resolution are separate writes, in that order. Items run sequentially; failure does not stop later
+    items or roll back writes. Writes are never retried. Check each status, warning, and `note_id`. If a reply was
+    posted but resolution failed or is unknown, do not repost the whole item; check GitLab before proceeding.
 
     Each result includes `note_id` when a reply was posted, including when a later resolution fails or is unknown.
     Resolve-only results do not include a note ID.
@@ -1028,7 +1029,8 @@ async def reply_to_threads(
     After a successful `resolve=true`, `open_threads` is sent once per merge request, on that MR's last item with
     `resolve=true`. It is left out if that count cannot be read or if that last resolution failed. The top-level
     `merge_requests` list contains one best-effort post-write summary per distinct IID, in first-request order, read
-    only after all writes finish. It includes `open_threads` when exact counts are available, `approved`, nullable
+    only after all writes finish, including for a singleton. These are additional reads. It includes `open_threads`
+    when exact counts are available, `approved`, nullable
     `approvals_left`, and `auto_merge_strategy` (an empty string means auto-merge is cleared). Unknown optional values
     are omitted. A `warning` is included when status or count reads fail; these read failures do not change write
     results. On GitLab CE, an explicit unknown `approvalsLeft` field error triggers one read-only fallback without
