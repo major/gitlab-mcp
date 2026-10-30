@@ -14,8 +14,10 @@ from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionErro
 from gitlab_mcp.common import (
     MAX_PAGES,
     REVIEW_NOTE_BODY_CAP,
+    TRUNCATION_MARKER_ERROR,
     Iid,
     Project,
+    has_truncation_marker,
     read_server_local_utf8_file,
 )
 from gitlab_mcp.errors import raise_review_preflight_error
@@ -287,6 +289,8 @@ def _read_review_note_body(note: ReviewNote, body_dir: str | None) -> str:
         raise_review_preflight_error("body must not be blank")
     if len(body.encode("utf-8")) > REVIEW_NOTE_BODY_CAP:
         raise_review_preflight_error(f"body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes")
+    if has_truncation_marker(body):
+        raise_review_preflight_error(f"{TRUNCATION_MARKER_ERROR} Use body_path for a full server-local file.")
     return body
 
 
@@ -1208,6 +1212,7 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
+    Bodies containing truncation markers are rejected.
     Like `glab mr note create`. Omit `file`, `line`, and `old_line` for a general merge-request discussion. Set only
     `file` for a file-level diff discussion, or set `file` and one line coordinate for an inline diff discussion.
     Provide exactly one of `notes` or `batch_id`. `validate_only` cannot be combined with `batch_id`. Set

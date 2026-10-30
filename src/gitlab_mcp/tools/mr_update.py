@@ -14,9 +14,11 @@ from gitlab_mcp.client import GitLabAPIError, GitLabClient, GitLabConnectionErro
 from gitlab_mcp.common import (
     MAX_PAGES,
     REVIEW_NOTE_BODY_CAP,
+    TRUNCATION_MARKER_ERROR,
     Iid,
     Project,
     has_quick_action,
+    has_truncation_marker,
     lower_or_empty,
     validate_project_labels,
 )
@@ -181,6 +183,8 @@ class _Changes:
             not self.comment.strip() or len(self.comment) > REVIEW_NOTE_BODY_CAP or has_quick_action(self.comment)
         ):
             raise CommentBodyError
+        if self.comment is not None and has_truncation_marker(self.comment):
+            raise ToolError(TRUNCATION_MARKER_ERROR)
         if self.approve and not self.sha:
             raise ApprovalShaError
         # Approval may not survive a rebase or a target branch change, so GitLab needs them in separate calls.
@@ -520,6 +524,7 @@ async def update_merge_request(  # noqa: PLR0913, PLR0917 - each argument is one
 ) -> MergeRequestUpdate:
     """Reviewer and assignee changes for merge request review. Like `glab mr update`.
 
+    Comments containing truncation markers are rejected.
     Also like `glab mr note`, `glab mr close`, `glab mr reopen`, `glab mr approve`, and `glab mr rebase`.
 
     Lower risk than a merge, but not always reversible. A rebase rewrites the

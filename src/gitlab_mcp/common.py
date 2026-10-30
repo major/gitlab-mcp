@@ -35,6 +35,12 @@ PROJECT_LABELS_PAGE_SIZE = 100
 REVIEW_NOTE_BODY_CAP = 100000
 # A line that starts with a slash and a letter may be a GitLab quick action.
 _QUICK_ACTION = re.compile(r"/[A-Za-z]")
+TRUNCATION_MARKER_ERROR = (
+    "Body contains a truncation marker. Get the full original text; do not just remove the marker."
+)
+# Stop at another opening parenthesis so incomplete markers cannot repeatedly scan the rest of a long line.
+_TRUNCATION_MARKER = re.compile(r"\([0-9]+ more lines[ \t]*(?:→|->)[ \t]*[^\s()\r\n][^()\r\n]*\)")
+_TRUNCATION_SUFFIX = re.compile(r"(?:^|\s)\[(?:output truncated|truncated)\]\s*\Z")
 # Shared argument types. Every tool repeats these in the catalog, so the descriptions stay short. ✂️
 Project = Annotated[str, Field(description="Project path, like group/project.")]
 Iid = Annotated[int, Field(description="MR number.")]
@@ -82,6 +88,11 @@ def has_quick_action(body: str) -> bool:
     lines inside code fences, so a harmless example can be rejected too.
     """
     return any(_QUICK_ACTION.match(line.lstrip()) for line in body.replace("\r", "").splitlines())
+
+
+def has_truncation_marker(body: str) -> bool:
+    """Return whether the body contains a recognizable truncated-output marker."""
+    return bool(_TRUNCATION_MARKER.search(body) or _TRUNCATION_SUFFIX.search(body))
 
 
 def page_text(text: str, limit: int, offset: int) -> tuple[str, bool, int | None]:

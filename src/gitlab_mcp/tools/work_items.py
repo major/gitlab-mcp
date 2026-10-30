@@ -160,6 +160,7 @@ async def create_work_item_note(  # noqa: PLR0913, PLR0917 - each argument is a 
 ) -> _work_items.WorkItemNoteCreateResult:
     """Create one work-item note, like `glab issue note`.
 
+    Bodies containing truncation markers are rejected.
     Scope is explicit, with no project/group fallback. Group work-item support is experimental in GitLab 18.1 and
     later, so permission or API errors can occur. Provide exactly one nonblank inline body or server-local body_file.
     `validate_only` checks the input and target but does not guarantee write permission. GitLab quick actions may run
