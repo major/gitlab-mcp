@@ -79,6 +79,35 @@ async def test_request_returns_none_for_an_empty_body(client, status):
     assert result is None
 
 
+@pytest.mark.parametrize("status", [200, 202, 302])
+@respx.mock
+async def test_request_expected_status_rejects_unexpected_empty_responses(client, status):
+    """A status-aware delete must not mistake a redirect or an unexpected status for success."""
+    # Arrange
+    route = respx.delete(NOTES_URL).mock(return_value=httpx.Response(status))
+
+    # Act / Assert
+    with pytest.raises(GitLabAPIError) as error:
+        await client.request("DELETE", NOTES_PATH, expected_status=204)
+    assert error.value.status == status
+    assert route.call_count == 1
+    assert "expected_status" not in route.calls.last.request.url.params
+
+
+@respx.mock
+async def test_request_expected_status_accepts_a_confirmed_delete(client):
+    """An expected 204 succeeds without leaking the status check into query parameters."""
+    # Arrange
+    route = respx.delete(NOTES_URL).mock(return_value=httpx.Response(204))
+
+    # Act
+    result = await client.request("DELETE", NOTES_PATH, expected_status=204)
+
+    # Assert
+    assert result is None
+    assert route.calls.last.request.url.query == b""
+
+
 @respx.mock
 async def test_request_without_a_body_sends_none(client):
     """Without `json`, the request has no body and no query string."""
