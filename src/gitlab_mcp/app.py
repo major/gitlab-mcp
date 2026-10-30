@@ -37,7 +37,7 @@ async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         await client.aclose()
 
 
-class _CreatePipelineValidationMiddleware(Middleware):
+class CreatePipelineValidationMiddleware(Middleware):
     """Hide argument validation details for create_pipeline calls."""
 
     async def on_call_tool(
@@ -109,7 +109,7 @@ mcp = FastMCP(
     ),
     lifespan=gitlab_lifespan,
 )
-mcp.add_middleware(_CreatePipelineValidationMiddleware())
+mcp.add_middleware(CreatePipelineValidationMiddleware())
 
 
 def get_client(ctx: Context) -> GitLabClient:

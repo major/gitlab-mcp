@@ -16,6 +16,17 @@ export GITLAB_TOKEN="<your-gitlab-access-token>"
 export GITLAB_URL="https://gitlab.example.com"
 ```
 
+## Tool profiles 🧰
+
+Set `GITLAB_MCP_PROFILE` in the server environment before launch. Restart the server after changing it.
+
+| Profile | Tool catalog |
+| --- | --- |
+| `full` (default) | All tools, including `get_snippet` and `get_snippet_file`. |
+| `compact` | Replaces those two reads with `read_snippet` for metadata or file content. |
+
+Empty or unknown profile values are rejected.
+
 ## Authentication 🔐
 
 For personal interactive use, a personal access token is recommended. Choose the smallest suitable token role, resource scope, and API scope.

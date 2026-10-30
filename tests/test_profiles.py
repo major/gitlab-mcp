@@ -30,18 +30,26 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
     assert gitlab_mcp.create_app("compact") is not compact
 
 
-@pytest.mark.parametrize(("arguments", "endpoint", "response", "expected"), [
-    ({}, "/snippets/42", {"id": 42, "title": "Example"}, {"id": 42, "title": "Example"}),
-    ({"view": "file"}, "/snippets/42/raw", "hello", {"content": "hello"}),
-    ({"view": "file", "project": "group/project", "file_path": "a/b", "ref": "main"},
-     "/projects/group%2Fproject/snippets/42/files/main/a%2Fb/raw", "hello", {"content": "hello"}),
-])
+@pytest.mark.parametrize(
+    ("arguments", "endpoint", "response", "expected"),
+    [
+        ({}, "/snippets/42", {"id": 42, "title": "Example"}, {"id": 42, "title": "Example"}),
+        ({"view": "file"}, "/snippets/42/raw", "hello", {"content": "hello"}),
+        (
+            {"view": "file", "project": "group/project", "file_path": "a/b", "ref": "main"},
+            "/projects/group%2Fproject/snippets/42/files/main/a%2Fb/raw",
+            "hello",
+            {"content": "hello"},
+        ),
+    ],
+)
 async def test_read_routing(gitlab_env, arguments, endpoint, response, expected):
     """Both views preserve the delegated endpoint and response shape."""
     # Arrange
     with respx.mock(assert_all_called=True) as router:
         route = router.get("https://gitlab.example.com/api/v4" + endpoint).mock(
-            return_value=httpx.Response(200, json=response) if isinstance(response, dict)
+            return_value=httpx.Response(200, json=response)
+            if isinstance(response, dict)
             else httpx.Response(200, text=response)
         )
         # Act
@@ -51,10 +59,17 @@ async def test_read_routing(gitlab_env, arguments, endpoint, response, expected)
     assert route.called
 
 
-@pytest.mark.parametrize("arguments", [
-    {"file_path": "a"}, {"ref": "main"}, {"view": "file", "file_path": "a"},
-    {"view": "file", "ref": "main"}, {"view": "other"}, {"snippet_id": "42"},
-])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"file_path": "a"},
+        {"ref": "main"},
+        {"view": "file", "file_path": "a"},
+        {"view": "file", "ref": "main"},
+        {"view": "other"},
+        {"snippet_id": "42"},
+    ],
+)
 async def test_invalid_arguments_do_not_request(gitlab_env, arguments):
     """Invalid selectors, modes, and IDs fail before any GitLab request."""
     # Arrange / Act / Assert
@@ -73,7 +88,9 @@ async def test_hidden_tools_and_pipeline_validation(gitlab_env):
             with pytest.raises(ToolError):
                 await call_tool(name, {"snippet_id": 42}, app=app)
         with pytest.raises(ToolError) as error:
-            await call_tool("create_pipeline", {"variables": [{"key": "x", "value": {"secret": "private-value"}}]}, app=app)
+            await call_tool(
+                "create_pipeline", {"variables": [{"key": "x", "value": {"secret": "private-value"}}]}, app=app
+            )
         assert "private-value" not in str(error.value)
         assert not router.calls
 
@@ -82,16 +99,19 @@ def test_profile_selection_and_main(monkeypatch):
     """Startup defaults to full and rejects unknown or empty profiles."""
     # Arrange
     calls = []
-    monkeypatch.setattr(gitlab_mcp.mcp, "run", lambda: calls.append("full"))
+    monkeypatch.setattr(type(gitlab_mcp.mcp), "run", lambda self: calls.append("full"))
     monkeypatch.delenv("GITLAB_MCP_PROFILE", raising=False)
     # Act / Assert
     gitlab_mcp.main()
     assert calls == ["full"]
+    monkeypatch.setenv("GITLAB_MCP_PROFILE", "compact")
+    gitlab_mcp.main()
+    assert calls == ["full", "full"]
     for profile in ("", "other"):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Unknown GitLab MCP profile"):
             gitlab_mcp.create_app(profile)
         monkeypatch.setenv("GITLAB_MCP_PROFILE", profile)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Unknown GitLab MCP profile"):
             gitlab_mcp.main()
 
 
