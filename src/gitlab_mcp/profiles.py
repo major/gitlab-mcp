@@ -16,6 +16,11 @@ def create_app(profile: str = "full") -> FastMCP:
     instructions = (mcp.instructions or "").replace(
         "use get_job for runner-job metadata", "use inspect_job(view='metadata') for runner-job metadata"
     )
+    instructions = instructions.replace(
+        "reply_to_thread(resolve=true) to respond or resolve; "
+        "use reply_to_threads for batched replies and post-write approval and auto-merge summaries",
+        "use reply_to_threads for one or more replies or resolutions and post-write approval and auto-merge summaries",
+    )
     app = FastMCP(name="gitlab-mcp", instructions=instructions, lifespan=gitlab_lifespan)
     app.add_provider(mcp.local_provider)
     app.disable(
@@ -26,6 +31,7 @@ def create_app(profile: str = "full") -> FastMCP:
             "get_job_artifact",
             "list_job_artifacts",
             "land_merge_request",
+            "reply_to_thread",
         },
         components={"tool"},
     )

@@ -1,6 +1,7 @@
 """Contracts for isolated compact tool profiles."""
 
 import json
+import re
 
 import httpx
 import pytest
@@ -28,13 +29,26 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
         "get_job_artifact",
         "list_job_artifacts",
         "land_merge_request",
+        "reply_to_thread",
     } | {"read_snippet", "inspect_job"}
     assert short["read_snippet"].annotations.read_only_hint is True
     assert short["read_snippet"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731
     assert size(short["read_snippet"]) < sum(size(full[name]) for name in ("get_snippet", "get_snippet_file"))
     assert len(full) == 44  # noqa: PLR2004
-    assert len(short) == 40  # noqa: PLR2004
+    assert len(short) == 39  # noqa: PLR2004
+    batch = short["reply_to_threads"]
+    assert batch.annotations.read_only_hint is False
+    assert batch.annotations.destructive_hint is False
+    assert batch.annotations.idempotent_hint is False
+    assert size(batch) < sum(size(full[name]) for name in ("reply_to_thread", "reply_to_threads"))
+    assert "resolve_open_threads" in short
+    assert not re.search(r"\breply_to_thread\b", compact.instructions or "")
+    assert not re.search(r"\breply_to_thread\b", batch.description)
+    assert "reply_to_threads" in (compact.instructions or "")
+    assert "reply_to_thread(resolve=true)" in (gitlab_mcp.mcp.instructions or "")
+    for text in ("one-item list", "APPROVE", "resolve=true", "resolve=false", "note_id", "repost"):
+        assert text in batch.description
     landing = short["land_merge_requests"]
     assert landing.annotations.read_only_hint is False
     assert landing.annotations.destructive_hint is True
@@ -136,6 +150,8 @@ async def test_hidden_tools_and_pipeline_validation(gitlab_env):
                 await call_tool(name, {"snippet_id": 42}, app=app)
         with pytest.raises(ToolError, match="Unknown tool"):
             await call_tool("land_merge_request", {"project": "group/project", "iid": 42}, app=app)
+        with pytest.raises(ToolError, match="Unknown tool"):
+            await call_tool("reply_to_thread", {"project": "group/project", "iid": 42, "thread_id": "x"}, app=app)
         with pytest.raises(ToolError) as error:
             await call_tool(
                 "create_pipeline", {"variables": [{"key": "x", "value": {"secret": "private-value"}}]}, app=app
