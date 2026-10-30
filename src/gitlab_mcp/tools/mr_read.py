@@ -1393,56 +1393,34 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
 ) -> MergeRequestDetail | MergeRequestDescriptionPage:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
-    - `merge_status` is the source of truth for mergeability. Open threads and failed CI do not always block a merge.
-    - `approved`: Free means one approval. Premium and Ultimate mean all approval rules pass.
-    - `auto_merge_strategy`: `merge_when_checks_pass`, `merge_train`, `add_to_merge_train_when_checks_pass` (waiting).
-    - `threads.open` IDs go to get_merge_request_threads. `index_complete` false means some are missing.
-      Set `include_threads=false` to omit the index while keeping `open_thread_count`, `resolved_thread_count`, and
-      `comment_thread_count`. `open_thread_count` is resolvable discussions minus resolved discussions;
-      `resolved_thread_count` is GitLab's resolved discussion count; `comment_thread_count` counts comment-only
-      threads that cannot be resolved and is left out when 0. When all three are 0, skip `get_merge_request_threads`.
-      For discussion details across several MRs, use the batch mode of `get_merge_request_threads` instead.
-    - `line` is the new-file line. `old_line` replaces it on a deleted line.
-    - Empty fields are left out: a missing `draft` means false, a missing list is empty.
-    - `created_at` is the creation date in YYYY-MM-DD format when available.
-    - The description is skipped by default. Set `include_description=true` to read it when you need it.
-    - `include_labels=true` includes up to 100 labels; `labels_truncated` says when more labels exist.
-    - `latest_pipeline_id` is the numeric ID of the head pipeline when one is attached, even when jobs are not
-      requested.
-    - `pipeline_sha` is the commit tested by that pipeline, omitted when the pipeline or its SHA is unavailable.
-      After a push, first confirm `head_sha` is the SHA you pushed, then compare `pipeline_sha` and check
-      `pipeline_status`. Matching old SHAs do not confirm CI for a new push.
-    - `pipeline_event_type` explains a different SHA. `merged_result` and `merge_train` pipelines test a temporary
-      merge commit, so a mismatch is expected. When it is left out (a branch pipeline) or is `detached`, a different
-      SHA means the pipeline is stale. A missing SHA means the tested commit is unknown; a missing pipeline may not
-      have been created yet.
-    - `issue_keys` lists unique uppercase-prefix-number keys from the title on the first page and from the raw
-      description when included, up to 100. By default, a match followed by `-<digits>` or `:<digits>` is skipped,
-      so advisory IDs like `CVE-2024-1`, `DSA-5432-1`, and `RHSA-2026:1234` add no key. `issue_key_prefixes`
-      filters by literal prefixes, not regular expressions, and keeps those partials. Set `issue_key_pattern` to
-      replace that extraction with a caller-authored regex; it cannot be combined with prefixes.
-      Custom patterns return full matches, preserve case, and use a bounded scan with a matching timeout.
-      `issue_keys_truncated=true` means a result, scan, or match-length limit excluded content.
-    - `description_limit` controls description length when the description is included. Zero skips it; the default is
-      4000 characters. The limit is soft: a final tail up to a quarter of it is included to save a call.
-    - `description_offset` starts a description page at that character offset. When `next_description_offset` is
-      returned, call again with that value to continue. Nonzero offsets return only the IID, description page,
-      continuation fields, and full description hash. Other detail flags are ignored on continuation pages.
-      Each page holds the limit plus that soft tail, so 5000 characters by default. Set
-      `include_description_hash=true` on the first page to compare hashes
-      across all pages and restart paging if the description changes. The hash is SHA-256 of the full raw description
-      encoded as UTF-8, with null treated as empty text.
-    - `headings_only=true` lists the description's ATX headings in `headings` (empty when there are none). `section`
-      reads only matching headings, matched the same way as `get_work_item`: an exact heading, ignoring case, or a
-      unique leading word or ID such as `AC-2`. Fenced code is ignored. A string returns `description` (left out
-      when the section is empty); a list returns `sections`. `description_limit` caps the total content, and an
-      unknown heading lists the available headings. Both need `include_description=true` and a positive
-      `description_limit`, and reject `description_offset`.
-    - `include_jobs` adds failed job IDs and names as a compact TSV only when requested. `jobs_complete` is false when
-      the failed-job scan reaches its page cap. No jobs are fetched when the merge request has no head pipeline.
-    - Blocked MRs include `blocked_by` IIDs, and `hidden_blockers` when some blockers are not visible to the token.
-    - `commits_behind` (with `include_commits_behind=true`) counts target branch commits missing from the source
-      branch. Only open MRs get it, and it is left out when GitLab gives no count or the read fails.
+    `merge_status` determines mergeability; open threads and failed CI do not always block merging. `approved` means
+    one approval on Free, all rules passed on Premium/Ultimate. `auto_merge_strategy` identifies checks or train waits.
+    Missing empty fields mean false or empty. `created_at` is YYYY-MM-DD.
+
+    `threads.open` IDs go to get_merge_request_threads; `index_complete=false` means the index is partial.
+    `include_threads=false` skips the index but keeps counts: open/resolved resolvable discussions and comment-only
+    threads (the latter omitted at zero). Skip thread reads when all three counts are zero. Use batch thread reads
+    for several MRs. `line` is a new-file line; `old_line` identifies a deleted line.
+
+    After a push, confirm `head_sha` matches the pushed SHA before checking `pipeline_sha` and `pipeline_status`.
+    A different pipeline SHA is expected for `pipeline_event_type=merged_result` or `merge_train`, which test merge
+    commits; for absent or `detached` event types it means stale CI. Missing SHA means unknown, not passed.
+    `latest_pipeline_id` identifies the head pipeline even without jobs. `include_jobs` adds failed-job TSV;
+    `jobs_complete=false` means the scan hit its cap. No head pipeline means no job fetch.
+
+    Descriptions are opt-in. With `include_description=true`, follow `next_description_offset` to continue.
+    Nonzero offsets return description-only pages and ignore detail flags. Pages allow a final tail up to 25% above
+    `description_limit`. Set `include_description_hash=true` on page one; compare the full raw UTF-8 SHA-256 hash
+    (`description_hash`, null treated as empty) on later pages and restart if changed.
+    `headings_only` lists ATX headings outside fences. `section` matches case-insensitive exact headings or unique
+    leading words/IDs; a string returns description, a list returns sections. Unknown headings list available ones.
+    Focused reads require a positive limit, reject offsets, and share one total content cap.
+
+    `issue_keys` contains up to 100 unique title/raw-description keys. Default extraction skips partial advisory IDs
+    such as CVE-2024-1 or RHSA-2026:1234. Literal `issue_key_prefixes` keep such partials; `issue_key_pattern` replaces
+    extraction, preserves full matches/case, and cannot be combined with prefixes. `issue_keys_truncated` flags limits.
+    `include_labels` adds up to 100 labels with `labels_truncated` when needed. `blocked_by` lists blocking IIDs;
+    `hidden_blockers` flags invisible blockers. Optional `commits_behind` is open-MR only and omitted if unavailable.
     """
     _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
     focused = _validate_focus(section, headings_only, include_description, description_limit, description_offset)
