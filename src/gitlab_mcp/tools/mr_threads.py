@@ -186,6 +186,7 @@ class ThreadHeading(BaseModel):
     heading: str
     last_by: str
     last_at: str  # Date only, YYYY-MM-DD.
+    last_reply: str = Field(default="", exclude_if=lambda v: not v)
     note_count: int  # Human notes in the fetched page, not necessarily the full thread.
     notes_truncated: bool = Field(default=False, exclude_if=lambda v: not v)
 
@@ -441,7 +442,9 @@ def _to_thread(
     )
 
 
-def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHeading:
+def _to_thread_heading(
+    discussion: dict[str, Any], thread: Thread, *, include_last_reply: bool = False
+) -> ThreadHeading:
     """Convert a thread to a compact summary of its fetched human notes."""
     notes = discussion["notes"]
     human_notes = [note for note in notes["nodes"] if not note["system"]]
@@ -453,6 +456,18 @@ def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHead
     )
     author = root_note["author"]  # A deleted or banned author comes back as null.
     last_author = last_note["author"]
+    last_reply = ""
+    if include_last_reply and len(human_notes) > 1:
+        reply = max(
+            human_notes[1:],
+            key=lambda note: datetime.fromisoformat(note["createdAt"].replace("Z", "+00:00").replace("z", "+00:00")),
+        )
+        body = _strip_trailing_finding(reply["body"])
+        last_reply = next((line.strip()[:THREAD_HEADING_CAP] for line in body.splitlines() if line.strip()), "")
+        if last_reply:
+            # Attribute the preview to its reply even when the root has the same timestamp.
+            last_note = reply
+            last_author = reply["author"]
     return ThreadHeading(
         id=thread.id,
         status=thread.status,
@@ -463,6 +478,7 @@ def _to_thread_heading(discussion: dict[str, Any], thread: Thread) -> ThreadHead
         heading=_thread_heading(root_note["body"]),
         last_by=author_display(last_author),
         last_at=last_note["createdAt"][:10],  # ISO 8601 timestamp, keep the date part.
+        last_reply=last_reply,
         note_count=len(human_notes),
         notes_truncated=notes["pageInfo"]["hasNextPage"],
     )
@@ -506,6 +522,7 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     view: ThreadView = "full",
     include_mr_status: bool = True,
     include_hashes: bool = False,
+    resolved_override: Literal["headings", "full"] | None = None,
 ) -> tuple[list[Thread | ThreadHeading], str, set[str], dict[str, str]]:
     """Read discussion pages from `start` and collect the matching threads.
 
@@ -517,7 +534,6 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
     threads: list[Thread | ThreadHeading] = []
     seen: set[str] = set()
     mr_headers: dict[str, str] = {}
-    full_view = view in {"full", "finding"}
     output_size = 2  # Count the serialized list brackets.
     for _ in range(MAX_PAGES):
         node = await fetch_merge_request(
@@ -533,15 +549,21 @@ async def _scan_threads(  # noqa: PLR0913, PLR0917 - each input describes the sc
         nodes = connection["nodes"]
         for index in range(skip, len(nodes)):
             seen.add(bare_id(nodes[index]["id"]))
+            override = resolved_override if _thread_status(nodes[index]) == "resolved" else None
+            auto_heading = override == "headings"
+            effective_view = override or view
+            full_view = effective_view in {"full", "finding"}
             thread = _to_thread(
                 nodes[index],
                 max_body_chars=max_body_chars,
-                compact_findings=view == "finding",
+                compact_findings=effective_view == "finding",
                 include_hashes=include_hashes,
             )
             if thread is None or not thread_filter.matches(thread, nodes[index]):
                 continue
-            output_thread = thread if full_view else _to_thread_heading(nodes[index], thread)
+            output_thread = (
+                thread if full_view else _to_thread_heading(nodes[index], thread, include_last_reply=auto_heading)
+            )
             size = len(output_thread.model_dump_json()) + (1 if threads else 0)
             budget = THREAD_BODY_BUDGET if full_view else THREAD_HEADING_BUDGET
             # Always return at least one thread, even when that thread alone is over budget.
@@ -642,7 +664,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     ] = NOTE_CAP,
     cursor: Annotated[
         str | None,
-        Field(description="next_cursor from an earlier call. Repeat the filters, view, and max_body_chars."),
+        Field(description="next_cursor from an earlier call. Repeat filters, view, resolved_view, and max_body_chars."),
     ] = None,
     iids: Annotated[
         list[PositiveIid] | None,
@@ -658,6 +680,10 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
         bool,
         Field(description="Add each note's body_hash in full and finding views, for edit_merge_request_note."),
     ] = False,
+    resolved_view: Annotated[
+        Literal["headings", "full"],
+        Field(description="With state all and no IDs, summarize resolved threads or return full notes."),
+    ] = "headings",
 ) -> Any:
     """Read compact MR triage status and review thread notes for one MR or a batch, like `glab mr note list`.
 
@@ -665,6 +691,10 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     their note bodies.
 
     - `state`: `open` (default), `resolved`, `comments` (cannot be resolved), or `all`. `ids` ignore `state`.
+    - When `state` contains `all` and no nonempty `ids` are given, resolved threads use `resolved_view` (default
+      `headings`), while open threads and comments use `view`. Summaries include the latest fetched human reply's
+      first nonempty line as `last_reply`, capped at 200 characters. Set `resolved_view="full"` for full notes.
+      Other state filters and explicit IDs use `view` for every thread.
     - `count_only=true` returns exact counts from GitLab's resolvable and resolved discussion totals. `open` is total
       minus resolved. It ignores `state`, counts both states, and fetches no discussion notes. It cannot be combined
       with `cursor`, `ids`, `file`, or `author`. Batch results contain `iid`, `open`, and `resolved` per MR.
@@ -685,7 +715,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
     - Trailing `review-bot:finding` comments are removed.
     - `view="headings"` returns thread details, the root human note's first Markdown heading (or first nonempty line),
       the latest fetched human note's author and date, and the number of fetched human notes. Headings are capped at
-      200 characters. It includes no note bodies or replies.
+      200 characters. It includes no full note bodies; automatic resolved summaries also include `last_reply`.
     - `view="finding"` returns full notes like `full`, but compacts recognized bot findings. Numbered findings lose
       separate greetings and signoffs. Section findings keep the bold title and the "Needs to be improved", "Failure
       scenario", and "How to fix" sections, including their code and diagrams. A bold-heading action-bullet format
@@ -694,7 +724,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
       body text. A cut note gets `next_body_offset`; pass it with the note's `note_id` to `get_merge_request_note`
       to read the rest. Each view returns about 30000 serialized thread characters, unless the first thread exceeds
       the budget.
-      Continue with `next_cursor` using the same filters, `view`, and `max_body_chars`.
+      Continue with `next_cursor` using the same filters, `view`, `resolved_view`, and `max_body_chars`.
     - `not_found_ids` is only set after a full scan from the first page.
     - Each batch result includes its own `iid`, `threads`, `next_cursor`, and `not_found_ids`. Batch cursors are not
       accepted: resume a result with a single `iid` call and that result's cursor. Every merge request gets its own
@@ -713,6 +743,8 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
 
     # An empty list means no IDs were given, so the state filter applies.
     wanted = _bare_ids(ids) if ids else None
+    override_resolved = not wanted and (state == "all" or (isinstance(state, list) and "all" in state))
+    resolved_override = resolved_view if override_resolved else None
     thread_filter = _ThreadFilter(statuses=statuses, ids=wanted, file=file, author=author)
     if iid is not None:
         client = get_client(ctx)
@@ -727,6 +759,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
             view,
             include_mr_status,
             include_hashes,
+            resolved_override,
         )
         # A resumed call did not read the first page, so it cannot prove an ID is missing.
         not_found_ids: list[str] = []
@@ -764,6 +797,7 @@ async def get_merge_request_threads(  # noqa: C901, PLR0913, PLR0917 - filters a
                 view,
                 include_mr_status,
                 include_hashes,
+                resolved_override,
             )
         except MergeRequestNotFoundError:
             missing_iids.append(requested_iid)

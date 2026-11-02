@@ -160,6 +160,79 @@ async def call_tool(**arguments: Any) -> dict[str, Any]:
     return await call_mcp_tool("get_merge_request_threads", tool_arguments)
 
 
+@pytest.mark.parametrize("state", ["all", ["open", "all"]])
+@respx.mock
+async def test_all_summarizes_resolved_with_latest_reply(gitlab_env, state):
+    """All keeps open and comment bodies while summarizing resolved human replies."""
+    # Arrange
+    reply = make_note("\n  Fixed it  \n<!-- review-bot:finding details -->", note_id=2, author="reviewer")
+    resolved = make_discussion("resolved", make_note("root"), make_note("system", system=True), reply, resolved=True)
+    respx.post(GRAPHQL).mock(
+        return_value=respond(
+            page(
+                make_discussion("open"),
+                resolved,
+                make_discussion("root-only", resolved=True),
+                make_discussion("comment", resolvable=False),
+            )
+        )
+    )
+    # Act
+    data = await call_tool(state=state)
+    # Assert
+    opened, summary, root_only, comment = data["threads"]
+    assert "notes" in opened
+    assert "notes" in comment
+    assert summary["heading"] == "root"
+    assert summary["last_reply"] == "Fixed it"
+    assert summary["last_by"] == "reviewer"
+    assert "notes" not in summary
+    assert "last_reply" not in root_only
+
+
+@pytest.mark.parametrize(
+    ("arguments", "has_notes", "has_preview"),
+    [
+        ({"state": "all", "resolved_view": "full"}, True, False),
+        ({"state": "all", "view": "headings", "resolved_view": "full"}, True, False),
+        ({"state": "all", "ids": ["resolved"]}, True, False),
+        ({"state": "all", "ids": []}, False, True),
+        ({"state": "resolved"}, True, False),
+        ({"state": ["resolved", "comments"]}, True, False),
+        ({"state": "resolved", "view": "headings"}, False, False),
+    ],
+)
+@respx.mock
+async def test_resolved_view_scope(gitlab_env, arguments, has_notes, has_preview):
+    """Only all without explicit IDs overrides the requested view."""
+    # Arrange
+    discussion = make_discussion("resolved", make_note("root"), make_note("reply", note_id=2), resolved=True)
+    respx.post(GRAPHQL).mock(return_value=respond(page(discussion)))
+    # Act
+    thread = (await call_tool(**arguments))["threads"][0]
+    # Assert
+    assert ("notes" in thread) is has_notes
+    assert ("last_reply" in thread) is has_preview
+
+
+@respx.mock
+async def test_all_batch_and_cursor_preserve_resolved_view(gitlab_env, monkeypatch):
+    """Batch and resumed calls retain compact resolved output and its serialized budget."""
+    # Arrange
+    monkeypatch.setattr("gitlab_mcp.tools.mr_threads.THREAD_HEADING_BUDGET", 250)
+    discussions = [
+        make_discussion(str(i), make_note("root"), make_note("reply", note_id=2), resolved=True) for i in range(3)
+    ]
+    respx.post(GRAPHQL).mock(return_value=respond(page(*discussions)))
+    # Act
+    batch = await call_tool(iids=[1, 2], state="all")
+    first = batch["merge_requests"][0]
+    second = await call_tool(iid=1, state="all", cursor=first["next_cursor"])
+    # Assert
+    assert all(item["threads"][0]["last_reply"] == "reply" for item in batch["merge_requests"])
+    assert second["threads"][0]["id"] != first["threads"][0]["id"]
+
+
 def encode_cursor(raw: str) -> str:
     """Encode raw text the same way the server encodes cursors, so tests can build bad ones."""
     return base64.urlsafe_b64encode(raw.encode()).decode()
