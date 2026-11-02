@@ -2,6 +2,7 @@
 
 import json
 from typing import Any
+from unittest.mock import Mock
 from urllib.parse import quote
 
 import httpx
@@ -283,6 +284,112 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
     assert len(diff_route.calls) == 1
     assert not post_route.called
     assert not raw_blob_calls()
+
+
+@respx.mock
+@pytest.mark.parametrize("include_draft", [False, True], ids=["positions-only", "mixed-with-draft"])
+async def test_validate_only_checks_bodyless_positions_without_caching(gitlab_env, monkeypatch, include_draft):
+    """New-side, old-side, and file-only checks never cache a batch containing bodyless notes."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    cache_put = Mock()
+    monkeypatch.setattr("gitlab_mcp.review_batches.ReviewBatchCache.put", cache_put)
+    notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 1}, {"file": "src.py"}]
+    if include_draft:
+        notes.append(review_note("src.py", 1))
+
+    # Act
+    data = await call_tool(notes=notes, validate_only=True, add_reviewers=["alice"], add_assignees=["bob"])
+
+    # Assert
+    assert data == {"validated_count": len(notes)}
+    cache_put.assert_not_called()
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@pytest.mark.parametrize(
+    ("invalid_note", "reason"),
+    [
+        ({"file": "src.py", "line": 99}, "line 99 on the new side"),
+        ({"file": "src.py", "line": 1, "body": ""}, "body must not be blank"),
+        ({"file": "src.py", "line": 1, "body": "   "}, "body must not be blank"),
+    ],
+    ids=["invalid-position", "empty-body", "blank-body"],
+)
+@respx.mock
+async def test_bodyless_validation_reports_position_and_supplied_body_failures(gitlab_env, invalid_note, reason):
+    """A usable bodyless position still passes when another position or an explicit body fails."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    add_blobs(("src.py", BASE_SHA, b"old\n"), ("src.py", HEAD, b"new\n"), status=404)
+
+    # Act
+    data = await call_tool(notes=[{"file": "src.py", "line": 1}, invalid_note], validate_only=True)
+
+    # Assert
+    assert data["validated_count"] == 1
+    assert len(data["results"]) == 1
+    assert data["results"][0]["index"] == 1
+    assert data["results"][0]["status"] == "failed"
+    assert reason in data["results"][0]["reason"]
+    assert "batch_id" not in data
+    assert "ttl_seconds" not in data
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+async def test_bodyless_note_blocks_mixed_posting_before_requests(gitlab_env):
+    """One missing body rejects a posting call before any note or people changes."""
+    # Arrange
+    notes = [review_note("src.py", 1), {"file": "src.py", "line": 1}]
+
+    # Act
+    result = await call_tool_result(notes=notes, add_reviewers=["alice"], add_assignees=["bob"])
+
+    # Assert
+    assert result.is_error
+    assert not respx.calls
+
+
+@respx.mock
+async def test_bodyless_extra_is_rejected_without_consuming_cached_batch(gitlab_env):
+    """Missing extra bodies fail before claiming the original approved draft batch."""
+    # Arrange
+    mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
+    post_route = respx.post(DISCUSSIONS_URL).mock(
+        return_value=response({"id": "general", "notes": [{"id": POSTED_NOTE_ID}]}, status=201)
+    )
+    async with Client(mcp) as client:
+        prepared = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": [{"body": "Draft."}], "validate_only": True},
+        )
+        arguments = {"project": PROJECT, "iid": IID, "batch_id": prepared.structured_content["batch_id"]}
+        preflight_count = len(mr_route.calls)
+
+        # Act
+        rejected = await client.call_tool(
+            "post_review_notes", {**arguments, "extra_notes": [{"file": "src.py", "line": 1}]}, raise_on_error=False
+        )
+
+        # Assert
+        assert rejected.is_error
+        assert len(mr_route.calls) == preflight_count
+        assert not post_route.called
+        posted = await client.call_tool("post_review_notes", arguments)
+        assert posted.structured_content["posted_count"] == 1
+        assert len(post_route.calls) == 1
+
+
+@respx.mock
+async def test_bodyless_general_note_is_not_a_position_check(gitlab_env):
+    """A bodyless validation note must identify a diff file."""
+    # Arrange / Act
+    result = await call_tool_result(notes=[{}], validate_only=True)
+
+    # Assert
+    assert result.is_error
+    assert not respx.calls
 
 
 @respx.mock

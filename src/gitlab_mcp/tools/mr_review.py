@@ -43,8 +43,9 @@ class ReviewNote(BaseModel):
 
     Omit ``file``, ``line``, and ``old_line`` for a general merge-request discussion. Set ``file`` without either
     line coordinate for a file-level note, or set a file and at most one line coordinate for an inline note. Set
-    exactly one of ``body`` or ``body_path``. The body may contain up to 100000 UTF-8 bytes. ``body_path`` must be an
-    absolute server-local path to a regular UTF-8 file, or a path relative to the tool's ``body_dir``.
+    exactly one of ``body`` or ``body_path``, or omit both for position-only validation with ``file``. The body may
+    contain up to 100000 UTF-8 bytes. ``body_path`` must be an absolute server-local path to a regular UTF-8 file,
+    or a path relative to the tool's ``body_dir``.
     """
 
     file: str | None = Field(default=None, min_length=1, description="Diff path. Omit for a general MR note.")
@@ -58,7 +59,7 @@ class ReviewNote(BaseModel):
     )
     body: str | None = Field(
         default=None,
-        description="Inline note text.",
+        description="Inline note text. Omit both body sources only for position-only validation with file.",
     )
     body_path: str | None = Field(
         default=None,
@@ -67,14 +68,16 @@ class ReviewNote(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_location(self) -> ReviewNote:
-        """Require exactly one line side and exactly one body source."""
+        """Check location and body sources, allowing bodyless diff positions for validation."""
         if self.file is not None and not self.file.strip():
             raise_review_preflight_error("file must not be blank")
         if self.line is not None and self.old_line is not None:
             raise_review_preflight_error("Set at most one of line or old_line")
         if self.file is None and (self.line is not None or self.old_line is not None):
             raise_review_preflight_error("file is required when line or old_line is set")
-        if (self.body is None) == (self.body_path is None):
+        if self.body is not None and self.body_path is not None:
+            raise_review_preflight_error("Set exactly one of body or body_path")
+        if self.body is None and self.body_path is None and self.file is None:
             raise_review_preflight_error("Set exactly one of body or body_path")
         return self
 
@@ -295,9 +298,15 @@ def _read_review_note_body(note: ReviewNote, body_dir: str | None) -> str:
 
 
 def _read_review_note_bodies(notes: list[ReviewNote], body_dir: str | None) -> list[_CheckedNote]:
-    """Read every note body before any GitLab request, recording a reason for each unusable one."""
+    """Read supplied bodies before GitLab requests, recording failures and skipping position-only notes.
+
+    The public tool rejects bodyless notes in posting mode before calling this helper.
+    """
     checks: list[_CheckedNote] = []
     for note in notes:
+        if note.body is None and note.body_path is None:
+            checks.append(_CheckedNote())
+            continue
         try:
             checks.append(_CheckedNote(body=_read_review_note_body(note, body_dir)))
         except OSError as exc:
@@ -1069,7 +1078,12 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     has_failed_checks = any(check.reason for check in checks)
     if validate_only or has_failed_checks:
         result = _review_preflight_result(checks)
-        if validate_only and not has_failed_checks:
+        # Position-only checks cannot be posted, so never cache even a bodyful subset of a mixed call.
+        if (
+            validate_only
+            and not has_failed_checks
+            and all(note.body is not None or note.body_path is not None for note in notes)
+        ):
             cached_notes = tuple(
                 CachedReviewNote(
                     file=note.file,
@@ -1121,7 +1135,7 @@ async def _add_people_after_posts(  # noqa: PLR0913, PLR0917 - each argument is 
         "openWorldHint": True,
     }
 )
-async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch contract keeps its checks explicit.
+async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the public contract keeps its checks explicit.
     ctx: Context,
     project: Project,
     iid: Iid,
@@ -1173,7 +1187,12 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     ] = None,
     validate_only: Annotated[
         bool,
-        Field(description="Run all checks without posting. Counts validated notes and returns a batch_id if all pass."),
+        Field(
+            description=(
+                "Run checks without posting. Returns a batch_id only if all notes pass and supply bodies; "
+                "bodyless notes check positions only."
+            )
+        ),
     ] = False,
     batch_id: Annotated[
         str | None,
@@ -1217,9 +1236,12 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     Bodies containing truncation markers are rejected.
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
-    check bodies, paths, lines, and SHA without writing or needing approval. Success returns a single-use `batch_id`
-    with body/location snapshots and `ttl_seconds` (upper lifetime bound). Show final text and get explicit APPROVE
-    before posting; placeholder approval is insufficient. Then send `batch_id`, not notes or validate_only.
+    check bodies, paths, lines, and SHA without writing or needing approval. If all notes supply bodies and pass,
+    success returns a single-use `batch_id` with body/location snapshots and `ttl_seconds` (upper lifetime bound).
+    To check LOW/NIT positions before drafting, omit both body sources with `file` and optional `line` or `old_line`
+    under `validate_only=true`; any bodyless note suppresses batch creation, returning counts/errors only.
+    Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
+    Then send `batch_id`, not notes or validate_only.
     A handle is not approval. It expires after 30 minutes, cache eviction, or restart, and any posting attempt
     consumes it, including failed preflight, invalid indices, excess notes, or project/MR/head mismatch.
 
@@ -1240,7 +1262,7 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
     live head when unavailable batch_id was sent without head_sha.
 
     `body_path` names a server-local file, not a file on the client's computer. With absolute `body_dir`, relative
-    paths must stay inside that directory; absolute paths still work. Each body needs exactly one source.
+    paths must stay inside that directory; absolute paths still work. Posting requires exactly one body source per note.
     Any preflight failure prevents all posting: `results` gives failed-note reasons, `validated_count` counts passes,
     and batch-wide problems add warning/unattempted indices. After writes, inspect every result: posted notes appear
     only in `posted_count` and `note_ids` (selection order, then extras); failed/unknown/unverified rows retain reasons
@@ -1263,6 +1285,11 @@ async def post_review_notes(  # noqa: C901, PLR0913, PLR0917 - the public batch 
         raise ToolError("extra_notes can only be used with batch_id.")  # noqa: TRY003
     if body_dir is not None and not Path(body_dir).is_absolute():
         raise ToolError("body_dir must be an absolute server-local directory.")  # noqa: TRY003
+    if not validate_only and any(
+        note.body is None and note.body_path is None for note in [*(notes or []), *(extra_notes or [])]
+    ):
+        # Reject missing bodies before claiming a cached batch, as input validation did previously.
+        raise ToolError("Set exactly one of body or body_path for every note when posting.")  # noqa: TRY003
 
     selected_indices = list(range(len(notes or [])))
     if batch_id is not None:
