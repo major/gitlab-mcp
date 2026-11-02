@@ -162,7 +162,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `inspect_job` (compact only) | Read job metadata, artifact text, or an artifact tree. |
 | `start_pipeline` (compact only) | Start a ref or merge request pipeline after a SHA preflight. |
 | `get_job_log` | Read a bounded job log view, such as its tail, search results, or failure markers. |
-| `get_merge_request` | Read merge request status, reviewers, approvals, CI status and tested commit, and optional details. |
+| `get_merge_request` | Read merge request status, reviewers, approvals, CI, and optional commit subjects and details. |
 | `get_merge_request_diff` | List changed files or read selected merge request patches, optionally compared with an earlier version. |
 | `get_merge_request_note` | Read one merge request note body in bounded pages, such as the rest of a cut thread note. |
 | `get_merge_request_threads` | Read review threads and status for one or more merge requests; `state="all"` summarizes resolved threads by default. |

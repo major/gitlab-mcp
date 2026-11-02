@@ -79,7 +79,8 @@ mcp = FastMCP(
         "Skip get_merge_request_threads when the open, resolved, and comment thread counts are all 0 "
         "(a missing count is 0). For re-reviews, start with "
         'view="headings" and use view="full" only for selected thread IDs. '
-        "Use get_merge_request for approvals and jobs (add include_description=true for the description). "
+        "Use get_merge_request for approvals and jobs (add include_description=true for the description, or "
+        "include_commits=true for commit order and subjects). "
         "For long descriptions, pass the returned next offset as description_offset with include_description=true; "
         "restart if the merge request is edited. To read part of a long description, list its headings with "
         "headings_only=true, then read only the parts you need with section. "
