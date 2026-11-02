@@ -276,6 +276,7 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
     # Assert
     assert data["validated_count"] == TWO_POSTS
     assert data["batch_id"]
+    assert "batch_indices" not in data
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
     assert "results" not in data
     assert "hint" not in data
@@ -287,16 +288,13 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
 
 
 @respx.mock
-@pytest.mark.parametrize("include_draft", [False, True], ids=["positions-only", "mixed-with-draft"])
-async def test_validate_only_checks_bodyless_positions_without_caching(gitlab_env, monkeypatch, include_draft):
-    """New-side, old-side, and file-only checks never cache a batch containing bodyless notes."""
+async def test_validate_only_checks_bodyless_positions_without_caching(gitlab_env, monkeypatch):
+    """New-side, old-side, and file-only checks do not create a batch."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)])
     cache_put = Mock()
     monkeypatch.setattr("gitlab_mcp.review_batches.ReviewBatchCache.put", cache_put)
     notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 1}, {"file": "src.py"}]
-    if include_draft:
-        notes.append(review_note("src.py", 1))
 
     # Act
     data = await call_tool(notes=notes, validate_only=True, add_reviewers=["alice"], add_assignees=["bob"])
@@ -305,6 +303,69 @@ async def test_validate_only_checks_bodyless_positions_without_caching(gitlab_en
     assert data == {"validated_count": len(notes)}
     cache_put.assert_not_called()
     assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+@pytest.mark.parametrize("fail_extra", [False, True])
+async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitlab_env, fail_extra):
+    """Mixed validation maps original positions to compact posting indices."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)] * 2, merge_requests=[merge_request()] * 4)
+
+    def post_response(request: httpx.Request) -> httpx.Response:
+        """Fail only the extra note when the scenario requests it."""
+        if fail_extra and json.loads(request.content)["body"] == "extra":
+            return response({"message": "bad request"}, status=400)
+        return create_response(request)
+
+    post = respx.post(DISCUSSIONS_URL).mock(side_effect=post_response)
+    notes = [review_note("src.py", 1, "first"), {"file": "src.py", "line": 1}, review_note("src.py", 1, "third")]
+    async with Client(mcp) as client:
+        prepared = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": notes, "validate_only": True},
+        )
+
+        # Act
+        data = prepared.structured_content
+        assert data["batch_indices"] == [0, 2]
+        posted = await client.call_tool(
+            "post_review_notes",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "batch_id": data["batch_id"],
+                "indices": [1, 0],
+                "body_overrides": [{"index": 1, "body": "replacement"}],
+                "extra_notes": [{"file": "src.py", "line": 1, "body": "extra"}],
+            },
+        )
+
+    # Assert
+    assert data["validated_count"] == THREE_POSTS
+    assert posted.structured_content["posted_count"] == (TWO_POSTS if fail_extra else THREE_POSTS)
+    if fail_extra:
+        assert posted.structured_content["results"][0]["index"] == TWO_POSTS
+    assert [json.loads(call.request.content)["body"] for call in post.calls] == ["replacement", "first", "extra"]
+
+
+@respx.mock
+async def test_invalid_mixed_validation_never_caches(gitlab_env, monkeypatch):
+    """A failed bodyless position prevents caching even when bodied notes pass."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    add_blobs(("src.py", BASE_SHA, b"old\n"), ("src.py", HEAD, b"new\n"), status=404)
+    cache_put = Mock()
+    monkeypatch.setattr("gitlab_mcp.review_batches.ReviewBatchCache.put", cache_put)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1), {"file": "src.py", "line": 99}], validate_only=True)
+
+    # Assert
+    assert data["results"][0]["index"] == 1
+    assert "batch_id" not in data
+    assert "batch_indices" not in data
+    cache_put.assert_not_called()
 
 
 @pytest.mark.parametrize(

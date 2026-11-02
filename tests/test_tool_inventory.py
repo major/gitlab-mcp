@@ -213,9 +213,14 @@ async def test_server_instruction_tool_references_are_registered(gitlab_env):
 
     assert instructions is not None
     registered_names = {tool.name for tool in listed}
-    # Argument names such as validate_only, and nested ones such as old_line inside notes, are not tool names.
-    argument_names = {name for tool in listed for name in _schema_property_names(tool.input_schema)}
-    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - argument_names
+    # Input and output fields, including nested properties, are not tool names.
+    field_names = {
+        name
+        for tool in listed
+        for schema in (tool.input_schema, tool.output_schema)
+        for name in _schema_property_names(schema)
+    }
+    referenced_names = set(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", instructions)) - field_names
 
     # Assert
     assert referenced_names <= registered_names, (
