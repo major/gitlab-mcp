@@ -163,6 +163,11 @@ class PostReviewNotesResult(BaseModel):
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    batch_indices: list[int] | None = Field(
+        default=None,
+        description="For a mixed validation, original input index for each compact cached batch index.",
+        exclude_if=lambda value: value is None,
+    )
     ttl_seconds: int | None = Field(
         default=None,
         description="Upper bound in seconds until a validated batch expires; use, eviction, or restart may shorten it.",
@@ -1078,12 +1083,8 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     has_failed_checks = any(check.reason for check in checks)
     if validate_only or has_failed_checks:
         result = _review_preflight_result(checks)
-        # Position-only checks cannot be posted, so never cache even a bodyful subset of a mixed call.
-        if (
-            validate_only
-            and not has_failed_checks
-            and all(note.body is not None or note.body_path is not None for note in notes)
-        ):
+        batch_indices = [i for i, note in enumerate(notes) if note.body is not None or note.body_path is not None]
+        if validate_only and not has_failed_checks and batch_indices:
             cached_notes = tuple(
                 CachedReviewNote(
                     file=note.file,
@@ -1092,10 +1093,13 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                     body=check.body,
                 )
                 for note, check in zip(notes, checks, strict=True)
+                if note.body is not None or note.body_path is not None
             )
             cache = get_review_batch_cache(ctx)
             batch_id = cache.put(project, iid, refs["head_sha"], cached_notes)
             result = result.model_copy(update={"batch_id": batch_id, "ttl_seconds": cache.TTL_SECONDS})
+            if len(batch_indices) != len(notes):
+                result = result.model_copy(update={"batch_indices": batch_indices})
         return result
     return await _post_review_note_batch(client, project, iid, checks, refs)
 
@@ -1153,7 +1157,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         Field(
             min_length=1,
             description=(
-                "Unique zero-based indices to post from a cached batch, in posting order. Requires batch_id. "
+                "Unique zero-based compact cached batch indices to post, in posting order. Requires batch_id. "
                 "Omit to post every note in the batch."
             ),
         ),
@@ -1189,8 +1193,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         bool,
         Field(
             description=(
-                "Run checks without posting. Returns a batch_id only if all notes pass and supply bodies; "
-                "bodyless notes check positions only."
+                "Run checks without posting. If all pass, cache notes with bodies; bodyless notes check positions. "
+                "Mixed batches return batch_indices mapping compact cache indices to original input indices."
             )
         ),
     ] = False,
@@ -1212,7 +1216,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             min_length=1,
             max_length=20,
             description=(
-                "Sparse replacements for a claimed batch, using zero-based unique in-range indices and exactly one "
+                "Sparse replacements for a claimed batch, using compact cache indices and exactly one "
                 "of body or body_path per entry. Requires batch_id; omitted indices keep their cached body snapshots. "
                 "Show the final replacement text to the user and get approval before posting."
             ),
@@ -1236,20 +1240,21 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     Bodies containing truncation markers are rejected.
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
-    check bodies, paths, lines, and SHA without writing or needing approval. If all notes supply bodies and pass,
-    success returns a single-use `batch_id` with body/location snapshots and `ttl_seconds` (upper lifetime bound).
+    check bodies, paths, lines, and SHA without writing or needing approval. If all notes pass and any supply bodies,
+    success caches those notes and returns a single-use `batch_id` and `ttl_seconds` (upper lifetime bound).
     To check LOW/NIT positions before drafting, omit both body sources with `file` and optional `line` or `old_line`
-    under `validate_only=true`; any bodyless note suppresses batch creation, returning counts/errors only.
+    under `validate_only=true`; all-bodyless checks return counts/errors only. For a successful mixed batch,
+    `batch_indices[k]` gives the original input index of cached note k. Validation errors use input indices.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
     Then send `batch_id`, not notes or validate_only.
     A handle is not approval. It expires after 30 minutes, cache eviction, or restart, and any posting attempt
     consumes it, including failed preflight, invalid indices, excess notes, or project/MR/head mismatch.
 
-    With batch_id, `indices` selects original zero-based indices in posting order; omit it for the whole batch.
-    `body_overrides` replaces selected body sources; omitted entries retain snapshots. Indices must be unique/in range.
+    With batch_id, `indices` selects compact zero-based cache indices in posting order; omit it for the whole batch.
+    `body_overrides` uses compact cache indices; omitted entries retain snapshots. Indices must be unique/in range.
     Show changed final text and get explicit APPROVE again. `extra_notes` appends approved new notes without resending
     cached ones. Selected notes plus extras must total at most 20. Extras cannot be selected/overridden; their result
-    indices start at the original full batch length. All other indices also refer to the original batch.
+    indices start at the full compact batch length. Posting result indices refer to the compact batch and extras.
 
     All selected final bodies and fresh SHA/path/position checks must pass before any write. `head_sha` is required
     with notes, optional with batch_id (stored SHA reused); live checks still run. General notes skip diff reads but

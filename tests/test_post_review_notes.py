@@ -306,11 +306,16 @@ async def test_validate_only_checks_bodyless_positions_without_caching(gitlab_en
 
 
 @respx.mock
-async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitlab_env):
+@pytest.mark.parametrize("fail_extra", [False, True])
+async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitlab_env, fail_extra):
     """Mixed validation maps original positions to compact posting indices."""
     # Arrange
-    add_preflight([([diff_file("src.py")], None)])
-    post = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    add_preflight([([diff_file("src.py")], None)] * 2, merge_requests=[merge_request()] * 4)
+    post = respx.post(DISCUSSIONS_URL).mock(
+        side_effect=[create_response, create_response, response({"message": "bad request"}, status=400)]
+        if fail_extra
+        else create_response
+    )
     notes = [review_note("src.py", 1, "first"), {"file": "src.py", "line": 1}, review_note("src.py", 1, "third")]
     async with Client(mcp) as client:
         prepared = await client.call_tool(
@@ -334,8 +339,10 @@ async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitla
         )
 
     # Assert
-    assert data["validated_count"] == 3
-    assert posted.structured_content["posted_count"] == 3
+    assert data["validated_count"] == THREE_POSTS
+    assert posted.structured_content["posted_count"] == (TWO_POSTS if fail_extra else THREE_POSTS)
+    if fail_extra:
+        assert posted.structured_content["results"][0]["index"] == TWO_POSTS
     assert [json.loads(call.request.content)["body"] for call in post.calls] == ["replacement", "first", "extra"]
 
 
