@@ -175,6 +175,59 @@ async def validate_and_post_batch(notes: list[dict[str, Any]]) -> tuple[dict[str
     return validation.structured_content, posting.structured_content
 
 
+@respx.mock
+async def test_preview_contains_cached_body_snapshots(gitlab_env: Any, tmp_path: Any) -> None:
+    """The preview and cached post use the same resolved UTF-8 bodies."""
+    # Arrange
+    source = tmp_path / "body.md"
+    source.write_text("File café", encoding="utf-8")
+    preview = tmp_path / "preview.md"
+    add_preflight([([diff_file("a.py")], None)], merge_requests=[merge_request()] * 4)
+    respx.post(DISCUSSIONS_URL).mock(side_effect=lambda request: response({"id": "d", "notes": [{"id": 1, "position": json.loads(request.content).get("position")}]}))
+    notes = [{"body": "Hello 🌍"}, {"file": "a.py"}, {"file": "a.py", "line": 1, "body_path": str(source)}]
+    # Act
+    async with Client(mcp) as client:
+        result = await client.call_tool("post_review_notes", {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": notes, "validate_only": True, "preview_path": str(preview)})
+        source.write_text("changed", encoding="utf-8")
+        await client.call_tool("post_review_notes", {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": result.structured_content["batch_id"]})
+    # Assert
+    text = preview.read_text(encoding="utf-8")
+    assert result.structured_content["preview_path"] == str(preview)
+    assert result.structured_content["batch_indices"] == [0, 2]
+    assert "Hello 🌍" in text and "File café" in text and "position-only" in text
+    assert [json.loads(call.request.content)["body"] for call in respx.calls if call.request.method == "POST"] == ["Hello 🌍", "File café"]
+    assert preview.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("path_kind", ["relative", "nul", "existing", "missing_parent"])
+@respx.mock
+async def test_preview_rejects_bad_paths_without_network(gitlab_env: Any, tmp_path: Any, path_kind: str) -> None:
+    """Invalid preview destinations cannot overwrite files or trigger GitLab reads."""
+    # Arrange
+    existing = tmp_path / "existing"
+    existing.write_text("keep", encoding="utf-8")
+    path = {"relative": "relative.md", "nul": "/tmp/bad\x00path", "existing": str(existing), "missing_parent": str(tmp_path / "missing" / "file")}[path_kind]
+    # Act
+    result = await call_tool_result(notes=[{"body": "draft"}], validate_only=True, preview_path=path)
+    # Assert
+    assert result.is_error
+    assert not respx.calls
+    assert existing.read_text(encoding="utf-8") == "keep"
+
+
+@respx.mock
+async def test_preview_reports_invalid_sha(gitlab_env: Any, tmp_path: Any) -> None:
+    """An early invalid SHA produces a warning without claiming an exact body."""
+    # Arrange
+    preview = tmp_path / "preview.md"
+    # Act
+    result = await call_tool(notes=[{"body": "draft"}], head_sha="bad", validate_only=True, preview_path=str(preview))
+    # Assert
+    assert result["preview_path"] == str(preview)
+    assert "head_sha" in preview.read_text(encoding="utf-8")
+    assert not respx.calls
+
+
 @pytest.mark.parametrize("validate_only", [True, False])
 @pytest.mark.parametrize("source", ["body", "body_path"])
 @respx.mock
