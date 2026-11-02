@@ -165,7 +165,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `get_merge_request` | Read merge request status, reviewers, approvals, CI status and tested commit, and optional details. |
 | `get_merge_request_diff` | List changed files or read selected merge request patches, optionally compared with an earlier version. |
 | `get_merge_request_note` | Read one merge request note body in bounded pages, such as the rest of a cut thread note. |
-| `get_merge_request_threads` | Read review threads, note IDs, optional body hashes, and status for one or more merge requests. |
+| `get_merge_request_threads` | Read review threads and status for one or more merge requests; `state="all"` summarizes resolved threads by default. |
 | `get_merge_requests` | Read compact status, and optionally last push and last activity, for up to 20 merge requests. |
 | `get_pipeline` | Read pipeline metadata and one page of its jobs. |
 | `get_pipeline_failures` | List failed runner and build jobs with optional diagnostic log excerpts. |

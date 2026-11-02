@@ -165,7 +165,7 @@ async def call_tool(**arguments: Any) -> dict[str, Any]:
 async def test_all_summarizes_resolved_with_latest_reply(gitlab_env, state):
     """All keeps open and comment bodies while summarizing resolved human replies."""
     # Arrange
-    reply = make_note("\n  Fixed it  \n<!-- review-bot:finding details -->", note_id=2)
+    reply = make_note("\n  Fixed it  \n<!-- review-bot:finding details -->", note_id=2, author="reviewer")
     resolved = make_discussion("resolved", make_note("root"), make_note("system", system=True), reply, resolved=True)
     respx.post(GRAPHQL).mock(
         return_value=respond(
@@ -181,15 +181,20 @@ async def test_all_summarizes_resolved_with_latest_reply(gitlab_env, state):
     data = await call_tool(state=state)
     # Assert
     opened, summary, root_only, comment = data["threads"]
-    assert "notes" in opened and "notes" in comment
-    assert summary["heading"] == "root" and summary["last_reply"] == "Fixed it"
-    assert "notes" not in summary and "last_reply" not in root_only
+    assert "notes" in opened
+    assert "notes" in comment
+    assert summary["heading"] == "root"
+    assert summary["last_reply"] == "Fixed it"
+    assert summary["last_by"] == "reviewer"
+    assert "notes" not in summary
+    assert "last_reply" not in root_only
 
 
 @pytest.mark.parametrize(
     ("arguments", "has_notes", "has_preview"),
     [
         ({"state": "all", "resolved_view": "full"}, True, False),
+        ({"state": "all", "view": "headings", "resolved_view": "full"}, True, False),
         ({"state": "all", "ids": ["resolved"]}, True, False),
         ({"state": "all", "ids": []}, False, True),
         ({"state": "resolved"}, True, False),

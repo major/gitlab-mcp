@@ -72,6 +72,7 @@ mcp = FastMCP(
         "use resolve_open_threads to close every open thread, and "
         "use edit_merge_request_description to update the description. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
+        'With state="all", resolved threads default to headings; set resolved_view="full" for full notes. '
         "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "
         "get_merge_request_threads(include_mr_status=false) to avoid duplicate data. For a note cut with "
         "[truncated], pass its note_id and returned offset as body_offset to get_merge_request_note. "
