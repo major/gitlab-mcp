@@ -212,7 +212,7 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
 async def test_optional_commits_show_newest_page_in_oldest_first_order(gitlab_env, count, has_next, truncated):
     """Return only short SHAs and subjects, reversing the newest page without extra requests."""
     # Arrange
-    nodes = [{"sha": f"{i:040x}", "title": f"Subject {i}", "message": "secret body"} for i in range(count)]
+    nodes = [{"sha": f"{i:09x}" + "0" * 31, "title": f"Subject {i}", "message": "secret body"} for i in range(count)]
     connection = {"nodes": nodes, "pageInfo": {"hasNextPage": has_next}}
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(commits=connection)))
 

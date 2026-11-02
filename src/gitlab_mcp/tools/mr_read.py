@@ -78,13 +78,18 @@ query(
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
 query(
-  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeLabels: Boolean!, $includeThreads: Boolean!
+  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeLabels: Boolean!, $includeThreads: Boolean!,
+  $includeCommits: Boolean!
 ) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
       iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch createdAt
       labels(first: 100) @include(if: $includeLabels) {
         nodes { title }
+        pageInfo { hasNextPage }
+      }
+      commits(first: 50) @include(if: $includeCommits) {
+        nodes { sha title }
         pageInfo { hasNextPage }
       }
       author { id username }
@@ -275,6 +280,8 @@ class MergeRequestDetail(BaseModel):
     author_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
     labels: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     labels_truncated: bool | None = Field(default=None, exclude_if=lambda value: value is None)
+    commits: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    commits_truncated: bool = Field(default=False, exclude_if=lambda value: not value)
     created_at: str | None = Field(
         default=None,
         description="Creation date in YYYY-MM-DD format, when available.",
@@ -1275,7 +1282,7 @@ async def _add_activity(
     annotations={"readOnlyHint": True, "openWorldHint": True},
     output_schema=GET_MERGE_REQUEST_OUTPUT_SCHEMA,
 )
-async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls one optional detail.
+async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details each need a branch or argument.
     ctx: Context,
     project: Project,
     iid: Iid,
@@ -1390,6 +1397,10 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
             ),
         ),
     ] = False,
+    include_commits: Annotated[
+        bool,
+        Field(description="Include subjects of the newest 50 commits, oldest first. Ignored on continuation pages."),
+    ] = False,
 ) -> MergeRequestDetail | MergeRequestDescriptionPage:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
@@ -1421,6 +1432,9 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
     extraction, preserves full matches/case, and cannot be combined with prefixes. `issue_keys_truncated` flags limits.
     `include_labels` adds up to 100 labels with `labels_truncated` when needed. `blocked_by` lists blocking IIDs;
     `hidden_blockers` flags invisible blockers. Optional `commits_behind` is open-MR only and omitted if unavailable.
+    `include_commits` returns the newest 50 commits in oldest-first order as nine-character SHAs and subjects;
+    `commits_truncated` means older commits were omitted. Use `api_get(resource='mr_commits')` for full messages
+    and trailers.
     """
     _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
     focused = _validate_focus(section, headings_only, include_description, description_limit, description_offset)
@@ -1448,6 +1462,7 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         includeDescription=include_description,
         includeLabels=include_labels,
         includeThreads=include_threads,
+        includeCommits=include_commits,
     )
     detail = _to_detail(
         node,
@@ -1459,6 +1474,12 @@ async def get_merge_request(  # noqa: PLR0913, PLR0917 - each argument controls 
         description_offset=description_offset,
         custom_issue_key_pattern=custom_issue_key_pattern,
     )
+    if include_commits:
+        connection = node["commits"]
+        commits = connection["nodes"]
+        # GitLab returns the newest commits first; reverse only the selected page, not the full history.
+        detail.commits = [f"{commit['sha'][:9]} {commit['title']}" for commit in reversed(commits[:50])]
+        detail.commits_truncated = connection["pageInfo"]["hasNextPage"] or len(commits) > 50  # noqa: PLR2004
     if focused:
         _focus_description(detail, node.get("description") or "", section, headings_only, description_limit)
     if include_description_hash:
