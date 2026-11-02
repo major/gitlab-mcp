@@ -70,7 +70,8 @@ mcp = FastMCP(
         'get_merge_request_threads(state="open") to triage, reply_to_thread(resolve=true) to respond or resolve; '
         "use reply_to_threads for batched replies and post-write approval and auto-merge summaries; "
         "use resolve_open_threads to close every open thread, and "
-        "use edit_merge_request_description to update the description. "
+        "use edit_merge_request_description to update the description; prefer edits=[...] for several changes "
+        "instead of a loop. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
         'With state="all", resolved threads default to headings; set resolved_view="full" for full notes. '
         "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "

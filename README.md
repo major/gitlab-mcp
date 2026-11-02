@@ -153,7 +153,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `create_snippet` | Create a personal or project snippet with bounded files. |
 | `create_work_item_note` | Add a project or group work item comment from inline text or a server-local file. |
 | `delete_snippet` | Delete a personal or project snippet. |
-| `edit_merge_request_description` | Replace one unique exact-text match in a merge request description. |
+| `edit_merge_request_description` | Apply one or a batch of unique exact-text replacements to a merge request description. |
 | `edit_merge_request_note` | Edit an existing discussion note with a body hash guard and post-write verification. |
 | `edit_work_item_description` | Apply guarded text replacements or edit a selected table cell in a work item description. |
 | `get_current_user` | Return the username and ID of the user who owns the GitLab token. |
