@@ -204,6 +204,107 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
 
 
 @pytest.mark.parametrize(
+    ("pipeline", "diff_refs", "counts", "approved", "expected"),
+    [
+        (
+            {"id": "gid://gitlab/Ci::Pipeline/123", "status": "SUCCESS", "sha": "pipe"},
+            {"headSha": HEAD_SHA},
+            (5, 2),
+            True,
+            (HEAD_SHA, "success", 123, "pipe", True, 3),
+        ),
+        (None, None, (None, None), False, ("", "", None, "", False, 0)),
+        ({"id": None, "status": None, "sha": None}, None, (1, 0), False, ("", "", None, "", False, 1)),
+    ],
+)
+@respx.mock
+async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR0913, PLR0917
+    gitlab_env, pipeline, diff_refs, counts, approved, expected
+):
+    """Status returns all seven keys with one minimal request, even with conflicting detail options."""
+    # Arrange
+    node = make_mr(
+        headPipeline=pipeline,
+        diffRefs=diff_refs,
+        approved=approved,
+        detailedMergeStatus="BLOCKED_STATUS",
+        resolvableDiscussionsCount=counts[0],
+        resolvedDiscussionsCount=counts[1],
+    )
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+
+    # Act
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "get_merge_request",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "view": "status",
+                "include_jobs": True,
+                "include_description": False,
+                "description_offset": 1,
+                "description_limit": 0,
+                "include_description_hash": True,
+                "include_labels": True,
+                "include_threads": True,
+                "include_commits": True,
+                "include_commits_behind": True,
+                "section": "missing",
+                "headings_only": True,
+                "issue_key_pattern": "[",
+                "issue_key_prefixes": ["INVALID"],
+            },
+        )
+
+    # Assert
+    head, status, pipeline_id, sha, is_approved, open_count = expected
+    assert result.structured_content == {
+        "head_sha": head,
+        "pipeline_status": status,
+        "latest_pipeline_id": pipeline_id,
+        "pipeline_sha": sha,
+        "merge_status": "blocked_status",
+        "approved": is_approved,
+        "open_thread_count": open_count,
+    }
+    assert route.call_count == 1
+    assert len(respx.calls) == 1
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID)}
+    query = json.loads(route.calls.last.request.content)["query"]
+    for field in (
+        "diffRefs",
+        "headSha",
+        "headPipeline",
+        "status",
+        "id",
+        "sha",
+        "detailedMergeStatus",
+        "approved",
+        "resolvableDiscussionsCount",
+        "resolvedDiscussionsCount",
+    ):
+        assert re.search(rf"\b{field}\b", query)
+    for field in ("title", "description", "discussions", "approvedBy", "reviewers", "commits", "mergeRequestEventType"):
+        assert not re.search(rf"\b{field}\b", query)
+
+
+@respx.mock
+async def test_status_view_rejects_malformed_pipeline_id(gitlab_env):
+    """Malformed pipeline IDs use the same error as the full view."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(
+        return_value=graphql_response(make_mr(headPipeline={"id": "bad", "status": "SUCCESS"}))
+    )
+
+    # Act and assert
+    with pytest.raises(ToolError, match="unexpected format"):
+        await call_tool(view="status")
+    assert route.call_count == 1
+    assert len(respx.calls) == 1
+
+
+@pytest.mark.parametrize(
     ("count", "has_next", "truncated"),
     [(0, False, False), (2, False, False), (50, False, False), (50, True, True), (51, False, True)],
     ids=["empty", "normal", "exact-cap", "next-page", "oversized-response"],

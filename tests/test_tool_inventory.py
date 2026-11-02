@@ -491,7 +491,7 @@ async def test_edit_merge_request_note_schema_and_annotations(tools):
 
 
 async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
-    """The two detail shapes share an object output schema without a result wrapper."""
+    """The detail, page, and status shapes have an object schema without a wrapper."""
     # Arrange
     schema = tools["get_merge_request"].output_schema
 
@@ -502,7 +502,21 @@ async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
 
     # Assert
     assert schema["type"] == "object"
-    assert set(branches) == {"MergeRequestDetail", "MergeRequestDescriptionPage"}
+    assert set(branches) == {"MergeRequestDetail", "MergeRequestDescriptionPage", "MergeRequestStatus"}
+    status = branches["MergeRequestStatus"]
+    assert (
+        set(status["required"])
+        == set(status["properties"])
+        == {
+            "head_sha",
+            "pipeline_status",
+            "latest_pipeline_id",
+            "pipeline_sha",
+            "merge_status",
+            "approved",
+            "open_thread_count",
+        }
+    )
     assert {"iid", "title", "state", "source_branch", "target_branch", "approved"} <= set(detail["required"])
     assert "description_hash" in detail["properties"]
     assert "description_hash" not in detail["required"]
