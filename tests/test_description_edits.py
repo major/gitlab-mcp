@@ -349,6 +349,88 @@ async def test_mr_read_error_raises_and_writes_nothing(router):
     assert put.call_count == 0
 
 
+@pytest.mark.parametrize("count", [2, 100])
+async def test_mr_batch_applies_sequentially_with_one_read_and_write(router, count):
+    """Each replacement sees the prior result, including at the batch limit."""
+    # Arrange
+    put = serve_merge_request(router, "value-0")
+    edits = [{"old_text": f"value-{i}", "new_text": f"value-{i + 1}"} for i in range(count)]
+
+    # Act
+    result = await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, edits=edits)
+
+    # Assert
+    assert result["status"] == "applied"
+    assert json.loads(put.calls.last.request.content) == {"description": f"value-{count}"}
+    assert [call.request.method for call in router.calls] == ["GET", "PUT"]
+
+
+@pytest.mark.parametrize(
+    ("description", "old_text", "message"),
+    [("first", "missing", "not found"), ("first xx xx", "xx", "more than once"), ("first aaa", "aa", "more than once")],
+)
+async def test_mr_batch_later_bad_match_never_writes(router, description, old_text, message):
+    """A missing, duplicate, or overlapping later match aborts the whole batch."""
+    # Arrange
+    put = serve_merge_request(router, description)
+    edits = [{"old_text": "first", "new_text": "second"}, {"old_text": old_text, "new_text": "other"}]
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=f"Edit 2 failed: old_text .*{message}"):
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, edits=edits)
+    assert put.call_count == 0
+    assert [call.request.method for call in router.calls] == ["GET"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({}, "Provide both old_text and new_text, or edits"),
+        ({"old_text": "one"}, "Provide both old_text and new_text, or edits"),
+        ({"new_text": "two"}, "Provide both old_text and new_text, or edits"),
+        ({"old_text": "one", "edits": [{"old_text": "one", "new_text": "two"}]}, "not both"),
+        ({"new_text": "two", "edits": [{"old_text": "one", "new_text": "two"}]}, "not both"),
+        ({"edits": []}, "at least one"),
+        ({"edits": [{"old_text": "a", "new_text": "b"}] * 101}, "no more than 100"),
+        ({"edits": [{"old_text": "a", "new_text": "b"}, {"old_text": "", "new_text": "b"}]}, "empty"),
+        ({"edits": [{"old_text": "a", "new_text": "b"}, {"old_text": "c", "new_text": "c"}]}, "identical"),
+    ],
+)
+async def test_mr_batch_preflight_rejects_invalid_inputs(router, arguments, message):
+    """All invalid batch modes and replacements fail before any network request."""
+    # Arrange
+    serve_merge_request(router, "one")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=message):
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, **arguments)
+    assert not router.calls
+
+
+async def test_mr_batch_net_no_op_never_writes(router):
+    """A successful sequence that cancels itself does not write."""
+    # Arrange
+    put = serve_merge_request(router, "one")
+    edits = [{"old_text": "one", "new_text": "two"}, {"old_text": "two", "new_text": "one"}]
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="do not change the description"):
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, edits=edits)
+    assert put.call_count == 0
+    assert [call.request.method for call in router.calls] == ["GET"]
+
+
+async def test_mr_legacy_match_error_keeps_exact_wording(router):
+    """Single-pair match errors retain their original wording without a batch prefix."""
+    # Arrange
+    serve_merge_request(router, "one")
+
+    # Act / Assert
+    with pytest.raises(ToolError) as error:
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, old_text="missing", new_text="two")
+    assert str(error.value) == "old_text was not found in the description. No write was made."
+
+
 async def test_work_item_edit_writes_exact_global_id_and_full_description(router):
     """The work-item write sends the global ID and the whole new description in one mutation."""
     # Arrange

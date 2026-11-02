@@ -176,19 +176,25 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     ctx: Context,
     project: Project,
     iid: Iid,
-    old_text: Annotated[str, Field(description="Text that must appear exactly once in the description.")],
-    new_text: Annotated[str, Field(description="Replacement text. Empty text deletes the match.")],
+    old_text: Annotated[str | None, Field(description="Text that must appear exactly once. Use with new_text.")] = None,
+    new_text: Annotated[str | None, Field(description="Replacement text. Empty text deletes the match.")] = None,
     return_diff: Annotated[bool, Field(description="False omits changed lines. Defaults to true.")] = True,
+    edits: Annotated[
+        list[_description_edits.DescriptionReplacement] | None,
+        Field(description="Ordered exact-text replacements. Use instead of old_text/new_text; provide 1 to 100."),
+    ] = None,
 ) -> _description_edits.DescriptionEditResult:
-    """Replace one exact text match, like a guarded `glab api --method PUT projects/:id/merge_requests/:iid`.
+    """Replace exact text, like a guarded `glab api --method PUT projects/:id/merge_requests/:iid`.
 
-    The full description is read and written, and replacement cannot be automatically undone. `old_text` must match
-    exactly once, including overlapping matches. GitLab has no compare-and-swap, so a concurrent edit may be
+    Choose either the `old_text`/`new_text` pair or `edits`, not both. Replacements run in order in memory, so each
+    match sees earlier results and must occur exactly once, including overlapping matches. All must succeed before
+    the full description is written once; this is not server-side atomic. Replacement cannot be automatically undone.
+    GitLab has no compare-and-swap, so a concurrent edit may be
     overwritten. Require explicit user `APPROVE` before writing. Writes are never retried. `status` is `applied`,
     `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit changed lines.
     """
     return await _description_edits.edit_merge_request_description(
-        get_client(ctx), project, iid, old_text, new_text, return_diff
+        get_client(ctx), project, iid, old_text, new_text, return_diff, edits
     )
 
 

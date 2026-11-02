@@ -347,7 +347,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
                 "diff_limit",
             },
         ),
-        ("edit_merge_request_description", {"project", "iid", "old_text", "new_text"}, set()),
+        ("edit_merge_request_description", {"project", "iid"}, {"old_text", "new_text", "return_diff", "edits"}),
         (
             "edit_merge_request_note",
             {"project", "iid", "thread_id", "note_id", "expected_hash"},

@@ -10,7 +10,7 @@ import difflib
 import hashlib
 import re
 from itertools import islice
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, cast
 from urllib.parse import quote
 lazy from collections.abc import Awaitable
 
@@ -41,7 +41,7 @@ mutation($input: WorkItemUpdateInput!) {
 
 
 class DescriptionReplacement(BaseModel):
-    """One exact-text replacement for a work-item description."""
+    """One exact-text replacement for a description."""
 
     model_config = {"extra": "forbid"}
 
@@ -98,13 +98,13 @@ def _replace_exactly_once(description: str, old_text: str, new_text: str) -> str
     return description[:first] + new_text + description[first + len(old_text) :]
 
 
-def _validated_work_item_replacements(
+def _validated_description_replacements(
     old_text: str | None,
     new_text: str | None,
     edits: list[DescriptionReplacement] | None,
     table_cell: DescriptionTableCell | None,
 ) -> list[DescriptionReplacement] | None:
-    """Validate work-item edit inputs before fetching any data from GitLab."""
+    """Validate description edit inputs before fetching any data from GitLab."""
     if table_cell is not None:
         if old_text is not None or new_text is not None or edits is not None:
             _raise_edit_error("Provide only one edit mode: old_text/new_text, edits, or table_cell.")
@@ -203,11 +203,12 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     client: GitLabClient,
     project: str,
     iid: int,
-    old_text: str,
-    new_text: str,
+    old_text: str | None = None,
+    new_text: str | None = None,
     return_diff: bool = True,
+    edits: list[DescriptionReplacement] | None = None,
 ) -> DescriptionEditResult:
-    """Replace one exact match of `old_text` in a merge request's description.
+    """Apply one or more exact replacements to a merge request's description.
 
     The full description is read first, so nothing is cut before the write. A null
     description counts as empty. Set `return_diff` to false to omit changed lines.
@@ -216,11 +217,24 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
         ToolError: Before any write, when `old_text` is empty, equals `new_text`,
             or does not match exactly once. Also when the read fails.
     """
-    _validate_edit(old_text, new_text)
+    if edits is None and (old_text is None or new_text is None):
+        _raise_edit_error("Provide both old_text and new_text, or edits.")
+    replacements = cast(
+        "list[DescriptionReplacement]", _validated_description_replacements(old_text, new_text, edits, table_cell=None)
+    )
     path = f"/projects/{quote(project, safe='')}/merge_requests/{iid}"
     merge_request = await client.get(path)
     before = merge_request.get("description") or ""
-    after = _replace_exactly_once(before, old_text, new_text)
+    after = before
+    for index, replacement in enumerate(replacements, start=1):
+        try:
+            after = _replace_exactly_once(after, replacement.old_text, replacement.new_text)
+        except ToolError as exc:
+            if edits is None:
+                raise
+            _raise_edit_error(f"Edit {index} failed: {exc}")
+    if after == before:
+        _raise_edit_error("The replacements do not change the description. No write was made.")
     return await _write_edit(client.request("PUT", path, json={"description": after}), before, after, return_diff)
 
 
@@ -252,7 +266,7 @@ async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument 
             hash does not match, or the final description is unchanged. Also when
             the read fails.
     """
-    replacements = _validated_work_item_replacements(old_text, new_text, edits, table_cell)
+    replacements = _validated_description_replacements(old_text, new_text, edits, table_cell)
     _validate_work_item_options(expected_hash, diff_limit)
 
     source = await read_work_item_for_edit(client, project, iid, scope)
