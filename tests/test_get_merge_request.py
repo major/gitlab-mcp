@@ -140,6 +140,7 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
         "includeDescription": True,
         "includeLabels": False,
         "includeThreads": True,
+        "includeCommits": False,
     }
     assert data == {
         "iid": IID,
@@ -184,6 +185,7 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
 
     # Assert
     assert route.call_count == 1
+    assert sent_variables(route)["includeCommits"] is False
     assert result.structured_content == {
         "iid": IID,
         "title": "Rebuild support",
@@ -199,6 +201,32 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
         "changes": {"files": 7, "additions": 483, "deletions": 15},
         "threads": {"open_count": 0, "resolved_count": 0, "index_complete": True},
     }
+
+
+@pytest.mark.parametrize(
+    ("count", "has_next", "truncated"),
+    [(0, False, False), (2, False, False), (50, False, False), (50, True, True), (51, False, True)],
+    ids=["empty", "normal", "exact-cap", "next-page", "oversized-response"],
+)
+@respx.mock
+async def test_optional_commits_show_newest_page_in_oldest_first_order(gitlab_env, count, has_next, truncated):
+    """Return only short SHAs and subjects, reversing the newest page without extra requests."""
+    # Arrange
+    nodes = [{"sha": f"{i:040x}", "title": f"Subject {i}", "message": "secret body"} for i in range(count)]
+    connection = {"nodes": nodes, "pageInfo": {"hasNextPage": has_next}}
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(commits=connection)))
+
+    # Act
+    data = await call_tool(include_commits=True)
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert route.call_count == 1
+    assert request["variables"]["includeCommits"] is True
+    assert "commits(first: 50) @include(if: $includeCommits)" in request["query"]
+    assert data["commits"] == [f"{node['sha'][:9]} {node['title']}" for node in reversed(nodes[:50])]
+    assert data.get("commits_truncated", False) is truncated
+    assert ("commits_truncated" in data) is truncated
 
 
 @pytest.mark.parametrize(
@@ -877,6 +905,7 @@ async def test_description_obeys_requested_limit(gitlab_env, description_limit, 
         "includeDescription": True,
         "includeLabels": False,
         "includeThreads": True,
+        "includeCommits": False,
     }
     assert len(data["description"]) == expected_length
     assert ("description_truncated" in data) is expected_truncated
@@ -964,6 +993,7 @@ async def test_description_offset_returns_only_description_page_with_no_extra_re
         include_labels=True,
         include_threads=True,
         include_commits_behind=True,
+        include_commits=True,
         issue_key_pattern=r"KEY-[0-9]+",
     )
 
@@ -1237,6 +1267,7 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
         "includeDescription": False,
         "includeLabels": False,
         "includeThreads": True,
+        "includeCommits": False,
     }
     assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"
