@@ -1,9 +1,12 @@
 """Tests for safe, sequential inline review-note posting through the MCP client 📝."""
 
 import json
+import os
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import Mock
 from urllib.parse import quote
+lazy from collections.abc import Generator
 
 import httpx
 import pytest
@@ -175,6 +178,153 @@ async def validate_and_post_batch(notes: list[dict[str, Any]]) -> tuple[dict[str
     return validation.structured_content, posting.structured_content
 
 
+@respx.mock
+async def test_preview_contains_cached_body_snapshots(gitlab_env: Any, tmp_path: Any) -> None:
+    """The preview and cached post use the same resolved UTF-8 bodies."""
+    # Arrange
+    source = tmp_path / "body.md"
+    source.write_text("File café", encoding="utf-8")
+    preview = tmp_path / "preview.md"
+    add_preflight([([diff_file("a.py")], None)] * 2, merge_requests=[merge_request()] * 4)
+    respx.post(DISCUSSIONS_URL).mock(
+        side_effect=lambda request: response(
+            {"id": "d", "notes": [{"id": 1, "position": json.loads(request.content).get("position")}]}
+        )
+    )
+    notes = [
+        {"body": "Hello 🌍"},
+        {"file": "a.py"},
+        {"file": "a.py", "line": 1, "body_path": str(source)},
+        {"file": "a.py", "old_line": 1, "body": "Old side"},
+        {"file": "a.py", "body": "Whole file"},
+    ]
+    # Act
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "post_review_notes",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "head_sha": HEAD,
+                "notes": notes,
+                "validate_only": True,
+                "preview_path": str(preview),
+            },
+        )
+        source.write_text("changed", encoding="utf-8")
+        await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": result.structured_content["batch_id"]},
+        )
+    # Assert
+    text = preview.read_text(encoding="utf-8")
+    assert result.structured_content["preview_path"] == str(preview)
+    assert result.structured_content["batch_indices"] == [0, 2, 3, 4]
+    assert "Hello 🌍" in text
+    assert "File café" in text
+    assert "position-only" in text
+    assert "## Input 0: general\n\nvalidated; cached index 0" in text
+    assert "## Input 1: file a.py\n\nvalidated; not cached; position-only" in text
+    assert "## Input 2: file a.py, new_line 1\n\nvalidated; cached index 1" in text
+    assert "## Input 3: file a.py, old_line 1\n\nvalidated; cached index 2" in text
+    assert "## Input 4: file a.py\n\nvalidated; cached index 3" in text
+    assert [json.loads(call.request.content)["body"] for call in respx.calls if call.request.method == "POST"] == [
+        "Hello 🌍",
+        "File café",
+        "Old side",
+        "Whole file",
+    ]
+    assert preview.stat().st_mode & 0o777 == 0o600  # noqa: PLR2004
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "flush"])
+@respx.mock
+async def test_preview_write_failure_removes_incomplete_file(gitlab_env, tmp_path, monkeypatch, failure_phase):
+    """Filesystem failures return a friendly error without leaving an approval artifact."""
+    # Arrange
+    preview = tmp_path / "preview.md"
+    real_fdopen = os.fdopen
+
+    @contextmanager
+    def failing_fdopen(*args: Any, **kwargs: Any) -> Generator[Any]:
+        """Simulate a write or final flush failure while closing the actual descriptor."""
+        with real_fdopen(*args, **kwargs) as stream:
+            if failure_phase == "write":
+                failing_stream = Mock(wraps=stream)
+                failing_stream.write.side_effect = OSError("preview disk full")
+                yield failing_stream
+            else:
+                yield stream
+                raise OSError("preview flush failed")  # noqa: TRY003 - simulate a filesystem error.
+
+    monkeypatch.setattr("gitlab_mcp.tools.mr_review.os.fdopen", failing_fdopen)
+
+    # Act
+    result = await call_tool_result(
+        notes=[{"body": "draft"}], head_sha="bad", validate_only=True, preview_path=str(preview)
+    )
+
+    # Assert
+    assert result.is_error
+    assert "preview_path could not be written" in result.content[0].text
+    assert not preview.exists()
+    assert not respx.calls
+
+
+@pytest.mark.parametrize("path_kind", ["relative", "nul", "existing", "missing_parent"])
+@respx.mock
+async def test_preview_rejects_bad_paths_without_network(gitlab_env: Any, tmp_path: Any, path_kind: str) -> None:
+    """Invalid preview destinations cannot overwrite files or trigger GitLab reads."""
+    # Arrange
+    existing = tmp_path / "existing"
+    existing.write_text("keep", encoding="utf-8")
+    path = {
+        "relative": "relative.md",
+        "nul": str(tmp_path / "bad\x00path"),
+        "existing": str(existing),
+        "missing_parent": str(tmp_path / "missing" / "file"),
+    }[path_kind]
+    # Act
+    result = await call_tool_result(notes=[{"body": "draft"}], validate_only=True, preview_path=path)
+    # Assert
+    assert result.is_error
+    assert not respx.calls
+    assert existing.read_text(encoding="utf-8") == "keep"
+
+
+@respx.mock
+async def test_preview_reports_invalid_sha(gitlab_env: Any, tmp_path: Any) -> None:
+    """An early invalid SHA produces a warning without claiming an exact body."""
+    # Arrange
+    preview = tmp_path / "preview.md"
+    # Act
+    result = await call_tool(notes=[{"body": "draft"}], head_sha="bad", validate_only=True, preview_path=str(preview))
+    # Assert
+    assert result["preview_path"] == str(preview)
+    assert "head_sha" in preview.read_text(encoding="utf-8")
+    assert not respx.calls
+
+
+@respx.mock
+async def test_preview_failure_and_posting_flag(gitlab_env: Any, tmp_path: Any) -> None:
+    """Failed validation is not postable and preview requires validation mode."""
+    # Arrange
+    preview = tmp_path / "failure.md"
+    add_preflight([([], None)])
+    # Act
+    result = await call_tool(
+        notes=[{"body": "good"}, {"file": "missing", "body": "bad"}], validate_only=True, preview_path=str(preview)
+    )
+    invalid = await call_tool_result(notes=[{"body": "draft"}], preview_path=str(tmp_path / "invalid.md"))
+    # Assert
+    text = preview.read_text(encoding="utf-8")
+    assert "No postable batch" in text
+    assert "Input 1" in text
+    assert "failed" in text
+    assert "batch_id" not in result
+    assert invalid.is_error
+
+
 @pytest.mark.parametrize("validate_only", [True, False])
 @pytest.mark.parametrize("source", ["body", "body_path"])
 @respx.mock
@@ -277,6 +427,7 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
     assert data["validated_count"] == TWO_POSTS
     assert data["batch_id"]
     assert "batch_indices" not in data
+    assert "preview_path" not in data
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
     assert "results" not in data
     assert "hint" not in data

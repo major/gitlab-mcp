@@ -277,7 +277,7 @@ async def test_review_tools_have_searchable_first_line_descriptions(tools, name,
         ),
         (
             "post_review_notes",
-            3600,
+            3900,
             ("APPROVE", "ttl_seconds", "prior", "never retried", "not an atomic", "truncation markers"),
         ),
     ],

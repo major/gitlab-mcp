@@ -1,9 +1,12 @@
 """Merge request inline review note tools: validate and post diff comments 📝."""
 
+import os
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TextIO
 from urllib.parse import quote
+lazy from collections.abc import Generator
 
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field, model_validator
@@ -174,6 +177,64 @@ class PostReviewNotesResult(BaseModel):
         exclude_if=lambda value: value is None,
     )
     batch_error: Literal["unavailable"] | None = Field(default=None, exclude_if=lambda value: value is None)
+    preview_path: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+@contextmanager
+def _review_preview_file(path: str | None) -> Generator[TextIO | None]:
+    """Create a private preview exclusively and remove incomplete files on error."""
+    if path is None:
+        yield None
+        return
+    created = False
+    fd = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            yield stream
+    except BaseException as exc:
+        if fd is not None:
+            os.close(fd)
+        if created:
+            with suppress(OSError):
+                Path(path).unlink()
+        if isinstance(exc, (OSError, UnicodeError)):
+            raise ToolError(f"preview_path could not be written: {exc}") from exc  # noqa: TRY003
+        raise
+
+
+def _write_review_preview(
+    stream: TextIO, notes: list[ReviewNote], checks: list[_CheckedNote] | None, result: PostReviewNotesResult
+) -> None:
+    """Render the exact resolved body snapshots and their validation outcomes."""
+    stream.write("# Review preview\n\n")
+    if result.warning:
+        stream.write(f"Warning: {result.warning}\n\n")
+    if not result.batch_id:
+        stream.write("No postable batch is available.\n\n")
+    mapping = result.batch_indices if result.batch_indices is not None else list(range(len(notes)))
+    cached = {original: index for index, original in enumerate(mapping)} if result.batch_id else {}
+    for index, note in enumerate(notes):
+        row = result.results[index]
+        location = "general" if note.file is None else f"file {note.file}"
+        if note.line is not None:
+            location += f", new_line {note.line}"
+        if note.old_line is not None:
+            location += f", old_line {note.old_line}"
+        position_only = note.body is None and note.body_path is None
+        cache_label = f"cached index {cached[index]}" if index in cached else "not cached"
+        stream.write(f"## Input {index}: {location}\n\n{row.status}; {cache_label}")
+        if position_only:
+            stream.write("; position-only")
+        stream.write("\n\n")
+        if row.reason:
+            stream.write(f"Reason: {row.reason}\n\n")
+        if checks is not None and checks[index].body:
+            stream.write(f"{checks[index].body}\n\n")
+        elif not position_only:
+            stream.write("Body unavailable.\n\n")
 
 
 def _lean_review_result(result: PostReviewNotesResult, *, validate_only: bool) -> PostReviewNotesResult:
@@ -1062,24 +1123,37 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     notes: list[ReviewNote],
     validate_only: bool,
     body_dir: str | None,
+    preview_file: TextIO | None = None,
 ) -> PostReviewNotesResult:
     """Run preflight, then validate or post the notes. The public tool adds people changes after this returns."""
+
+    def finish(result: PostReviewNotesResult, resolved: list[_CheckedNote] | None = None) -> PostReviewNotesResult:
+        """Write a preview using the already resolved bodies before returning."""
+        if preview_file is not None:
+            _write_review_preview(preview_file, notes, resolved, result)
+        return result
+
     if not full_sha(head_sha):
-        return _unattempted_review_notes(
-            len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
+        return finish(
+            _unattempted_review_notes(
+                len(notes), "head_sha must be a full 40-character hexadecimal SHA. No notes were posted."
+            )
         )
     checks = _read_review_note_bodies(notes, body_dir)
     if all(check.reason for check in checks):
-        return _review_preflight_result(checks)
+        return finish(_review_preflight_result(checks), checks)
 
     try:
         client = get_client(ctx)
     except ToolError as exc:
-        return _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted.")
+        return finish(
+            _unattempted_review_notes(len(notes), f"Review-note setup failed: {exc}. No notes were posted."), checks
+        )
+    resolved = checks
     checks, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, checks)
     if warning:
         current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
-        return _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
+        return finish(_unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha), resolved)
     has_failed_checks = any(check.reason for check in checks)
     if validate_only or has_failed_checks:
         result = _review_preflight_result(checks)
@@ -1100,7 +1174,7 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
             result = result.model_copy(update={"batch_id": batch_id, "ttl_seconds": cache.TTL_SECONDS})
             if len(batch_indices) != len(notes):
                 result = result.model_copy(update={"batch_indices": batch_indices})
-        return result
+        return finish(result, resolved)
     return await _post_review_note_batch(client, project, iid, checks, refs)
 
 
@@ -1232,6 +1306,10 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             ),
         ),
     ] = None,
+    preview_path: Annotated[
+        str | None,
+        Field(description="New absolute server-local Markdown preview path, only with validate_only and notes."),
+    ] = None,
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
@@ -1246,6 +1324,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     under `validate_only=true`; all-bodyless checks return counts/errors only. For a successful mixed batch,
     `batch_indices[k]` gives the original input index of cached note k. Validation errors use input indices.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
+    With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
+    snapshots and outcomes. A filename is not approval. The preview does not cover later overrides or extras: show
+    edited final content and get fresh APPROVE, or resubmit revised notes for a new preview and batch handle.
     Then send `batch_id`, not notes or validate_only.
     A handle is not approval. It expires after 30 minutes, cache eviction, or restart, and any posting attempt
     consumes it, including failed preflight, invalid indices, excess notes, or project/MR/head mismatch.
@@ -1276,6 +1357,11 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     """
     if (notes is None) == (batch_id is None):
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
+    if preview_path is not None:
+        if not validate_only or notes is None:
+            raise ToolError("preview_path requires validate_only and notes.")  # noqa: TRY003
+        if not preview_path.strip() or "\x00" in preview_path or not Path(preview_path).is_absolute():
+            raise ToolError("preview_path must be an absolute server-local path without NUL.")  # noqa: TRY003
     if notes is not None and head_sha is None:
         raise ToolError("head_sha is required with notes.")  # noqa: TRY003
     if batch_id is not None and not batch_id.strip():
@@ -1311,7 +1397,10 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     if notes is None or head_sha is None:
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
 
-    result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only, body_dir)
+    with _review_preview_file(preview_path) as preview_file:
+        result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only, body_dir, preview_file)
+    if preview_path is not None:
+        result = result.model_copy(update={"preview_path": preview_path})
     result = result.model_copy(
         update={
             "results": [row.model_copy(update={"index": selected_indices[row.index]}) for row in result.results],
