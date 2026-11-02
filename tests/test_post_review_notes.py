@@ -182,21 +182,43 @@ async def test_preview_contains_cached_body_snapshots(gitlab_env: Any, tmp_path:
     source = tmp_path / "body.md"
     source.write_text("File café", encoding="utf-8")
     preview = tmp_path / "preview.md"
-    add_preflight([([diff_file("a.py")], None)], merge_requests=[merge_request()] * 4)
-    respx.post(DISCUSSIONS_URL).mock(side_effect=lambda request: response({"id": "d", "notes": [{"id": 1, "position": json.loads(request.content).get("position")}]}))
+    add_preflight([([diff_file("a.py")], None)] * 2, merge_requests=[merge_request()] * 4)
+    respx.post(DISCUSSIONS_URL).mock(
+        side_effect=lambda request: response(
+            {"id": "d", "notes": [{"id": 1, "position": json.loads(request.content).get("position")}]}
+        )
+    )
     notes = [{"body": "Hello 🌍"}, {"file": "a.py"}, {"file": "a.py", "line": 1, "body_path": str(source)}]
     # Act
     async with Client(mcp) as client:
-        result = await client.call_tool("post_review_notes", {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": notes, "validate_only": True, "preview_path": str(preview)})
+        result = await client.call_tool(
+            "post_review_notes",
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "head_sha": HEAD,
+                "notes": notes,
+                "validate_only": True,
+                "preview_path": str(preview),
+            },
+        )
         source.write_text("changed", encoding="utf-8")
-        await client.call_tool("post_review_notes", {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": result.structured_content["batch_id"]})
+        await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": result.structured_content["batch_id"]},
+        )
     # Assert
     text = preview.read_text(encoding="utf-8")
     assert result.structured_content["preview_path"] == str(preview)
     assert result.structured_content["batch_indices"] == [0, 2]
-    assert "Hello 🌍" in text and "File café" in text and "position-only" in text
-    assert [json.loads(call.request.content)["body"] for call in respx.calls if call.request.method == "POST"] == ["Hello 🌍", "File café"]
-    assert preview.stat().st_mode & 0o777 == 0o600
+    assert "Hello 🌍" in text
+    assert "File café" in text
+    assert "position-only" in text
+    assert [json.loads(call.request.content)["body"] for call in respx.calls if call.request.method == "POST"] == [
+        "Hello 🌍",
+        "File café",
+    ]
+    assert preview.stat().st_mode & 0o777 == 0o600  # noqa: PLR2004
 
 
 @pytest.mark.parametrize("path_kind", ["relative", "nul", "existing", "missing_parent"])
@@ -206,7 +228,12 @@ async def test_preview_rejects_bad_paths_without_network(gitlab_env: Any, tmp_pa
     # Arrange
     existing = tmp_path / "existing"
     existing.write_text("keep", encoding="utf-8")
-    path = {"relative": "relative.md", "nul": "/tmp/bad\x00path", "existing": str(existing), "missing_parent": str(tmp_path / "missing" / "file")}[path_kind]
+    path = {
+        "relative": "relative.md",
+        "nul": str(tmp_path / "bad\x00path"),
+        "existing": str(existing),
+        "missing_parent": str(tmp_path / "missing" / "file"),
+    }[path_kind]
     # Act
     result = await call_tool_result(notes=[{"body": "draft"}], validate_only=True, preview_path=path)
     # Assert
@@ -226,6 +253,26 @@ async def test_preview_reports_invalid_sha(gitlab_env: Any, tmp_path: Any) -> No
     assert result["preview_path"] == str(preview)
     assert "head_sha" in preview.read_text(encoding="utf-8")
     assert not respx.calls
+
+
+@respx.mock
+async def test_preview_failure_and_posting_flag(gitlab_env: Any, tmp_path: Any) -> None:
+    """Failed validation is not postable and preview requires validation mode."""
+    # Arrange
+    preview = tmp_path / "failure.md"
+    add_preflight([([], None)])
+    # Act
+    result = await call_tool(
+        notes=[{"body": "good"}, {"file": "missing", "body": "bad"}], validate_only=True, preview_path=str(preview)
+    )
+    invalid = await call_tool_result(notes=[{"body": "draft"}], preview_path=str(tmp_path / "invalid.md"))
+    # Assert
+    text = preview.read_text(encoding="utf-8")
+    assert "No postable batch" in text
+    assert "Input 1" in text
+    assert "failed" in text
+    assert "batch_id" not in result
+    assert invalid.is_error
 
 
 @pytest.mark.parametrize("validate_only", [True, False])
