@@ -311,11 +311,14 @@ async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitla
     """Mixed validation maps original positions to compact posting indices."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)] * 2, merge_requests=[merge_request()] * 4)
-    post = respx.post(DISCUSSIONS_URL).mock(
-        side_effect=[create_response, create_response, response({"message": "bad request"}, status=400)]
-        if fail_extra
-        else create_response
-    )
+
+    def post_response(request: httpx.Request) -> httpx.Response:
+        """Fail only the extra note when the scenario requests it."""
+        if fail_extra and json.loads(request.content)["body"] == "extra":
+            return response({"message": "bad request"}, status=400)
+        return create_response(request)
+
+    post = respx.post(DISCUSSIONS_URL).mock(side_effect=post_response)
     notes = [review_note("src.py", 1, "first"), {"file": "src.py", "line": 1}, review_note("src.py", 1, "third")]
     async with Client(mcp) as client:
         prepared = await client.call_tool(
