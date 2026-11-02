@@ -82,6 +82,8 @@ mcp = FastMCP(
         'view="headings" and use view="full" only for selected thread IDs. '
         "Use get_merge_request for approvals and jobs (add include_description=true for the description, or "
         "include_commits=true for commit order and subjects). "
+        'Use get_merge_request(view="status") for rechecks; it omits the pipeline event type, so use the full view '
+        "to classify a different pipeline SHA as merged-result, train, or stale CI. "
         "For long descriptions, pass the returned next offset as description_offset with include_description=true; "
         "restart if the merge request is edited. To read part of a long description, list its headings with "
         "headings_only=true, then read only the parts you need with section. "
@@ -108,7 +110,8 @@ mcp = FastMCP(
         "push with --force-with-lease. "
         # 🔍 Main arguments, so one tool search is enough. Client searches often cut long signatures.
         "Main arguments: "
-        "get_merge_request(project, iid, include_threads, include_description, description_limit, description_offset, "
+        "get_merge_request(project, iid, view=full|status, include_threads, include_description, "
+        "description_limit, description_offset, "
         "section, headings_only); "
         "get_merge_request_threads(project, iid or iids, state=open|resolved|comments|all, "
         "view=full|headings|finding, include_mr_status, include_hashes, count_only, cursor); "

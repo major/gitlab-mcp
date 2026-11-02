@@ -117,6 +117,19 @@ query(
 }
 """
 
+# Status rechecks need no detail metadata or discussion bodies.
+MERGE_REQUEST_STATUS_QUERY = """
+query($fullPath: ID!, $iid: String!) {
+  project(fullPath: $fullPath) {
+    mergeRequest(iid: $iid) {
+      diffRefs { headSha }
+      headPipeline { status id sha }
+      detailedMergeStatus approved resolvableDiscussionsCount resolvedDiscussionsCount
+    }
+  }
+}
+"""
+
 # Continuation pages need no status or discussion data.
 MERGE_REQUEST_DESCRIPTION_QUERY = """
 query($fullPath: ID!, $iid: String!) {
@@ -361,6 +374,18 @@ class MergeRequestDetail(BaseModel):
     threads: ThreadIndex | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
+class MergeRequestStatus(BaseModel):
+    """Required compact status facts for a merge request recheck."""
+
+    head_sha: str
+    pipeline_status: str
+    latest_pipeline_id: int | None
+    pipeline_sha: str
+    merge_status: str
+    approved: bool
+    open_thread_count: int
+
+
 class MergeRequestDescriptionPage(BaseModel):
     """A description-only continuation page with the hash of the full description."""
 
@@ -376,7 +401,9 @@ class MergeRequestDescriptionPage(BaseModel):
 # FastMCP otherwise wraps an inferred union in a `result` property.
 GET_MERGE_REQUEST_OUTPUT_SCHEMA = {
     "type": "object",
-    **TypeAdapter(MergeRequestDetail | MergeRequestDescriptionPage).json_schema(mode="serialization"),
+    **TypeAdapter(MergeRequestDetail | MergeRequestDescriptionPage | MergeRequestStatus).json_schema(
+        mode="serialization"
+    ),
 }
 
 
@@ -947,6 +974,22 @@ def _to_thread_counts(node: dict[str, Any]) -> tuple[int, int]:
     return resolvable - resolved, resolved
 
 
+def _to_status(node: dict[str, Any]) -> MergeRequestStatus:
+    """Convert the minimal GraphQL response into required status facts."""
+    pipeline = node["headPipeline"]
+    return MergeRequestStatus(
+        head_sha=diff_refs_head_sha(node["diffRefs"]),
+        pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
+        latest_pipeline_id=(
+            numeric_gid(pipeline.get("id"), {"Ci::Pipeline"}) if pipeline and pipeline.get("id") is not None else None
+        ),
+        pipeline_sha=(pipeline.get("sha") or "") if pipeline else "",
+        merge_status=lower_or_empty(node["detailedMergeStatus"]),
+        approved=node["approved"],
+        open_thread_count=_to_thread_counts(node)[0],
+    )
+
+
 def _comment_thread_count(node: dict[str, Any]) -> int:
     """Return the count of human discussions that cannot be resolved, like a plain `LGTM` comment.
 
@@ -1401,7 +1444,11 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
         bool,
         Field(description="Include subjects of the newest 50 commits, oldest first. Ignored on continuation pages."),
     ] = False,
-) -> MergeRequestDetail | MergeRequestDescriptionPage:
+    view: Annotated[
+        Literal["full", "status"],
+        Field(description="Use status for compact rechecks; it ignores all detail and description options."),
+    ] = "full",
+) -> MergeRequestDetail | MergeRequestDescriptionPage | MergeRequestStatus:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
     `merge_status` determines mergeability; open threads and failed CI do not always block merging. `approved` means
@@ -1413,9 +1460,11 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
     threads (the latter omitted at zero). Skip thread reads when all three counts are zero. Use batch thread reads
     for several MRs. `line` is a new-file line; `old_line` identifies a deleted line.
 
+    Use `view=status` for compact rechecks. It ignores detail flags, focus, and description paging.
     After a push, confirm `head_sha` matches the pushed SHA before checking `pipeline_sha` and `pipeline_status`.
     A different pipeline SHA is expected for `pipeline_event_type=merged_result` or `merge_train`, which test merge
-    commits; for absent or `detached` event types it means stale CI. Missing SHA means unknown, not passed.
+    commits; for absent or `detached` event types in the full view it means stale CI. Status omits the event type,
+    so use the full view to classify a different pipeline SHA. Missing SHA means unknown, not passed.
     `latest_pipeline_id` identifies the head pipeline even without jobs. `include_jobs` adds failed-job TSV;
     `jobs_complete=false` means the scan hit its cap. No head pipeline means no job fetch.
 
@@ -1436,6 +1485,9 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
     `commits_truncated` means older commits were omitted. Use `api_get(resource='mr_commits')` for full messages
     and trailers.
     """
+    if view == "status":
+        node = await fetch_merge_request(get_client(ctx), MERGE_REQUEST_STATUS_QUERY, project, iid)
+        return _to_status(node)
     _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
     focused = _validate_focus(section, headings_only, include_description, description_limit, description_offset)
     include_description = include_description and description_limit > 0
