@@ -1398,7 +1398,11 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
                 cached_batch = _claim_review_batch(ctx, batch_id, project, iid, head_sha)
             except ReviewBatchUnavailableError:
                 result = await _unavailable_review_batch(ctx, project, iid, head_sha)
-                return _lean_review_result(result, validate_only=validate_only)
+                if preview_file is not None:
+                    _write_review_preview(preview_file, [], None, result)
+                return _lean_review_result(
+                    result.model_copy(update={"preview_path": preview_path}), validate_only=validate_only
+                )
             head_sha = cached_batch.head_sha
             cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
             notes, selected_indices = _select_review_notes(cached_notes, indices)
