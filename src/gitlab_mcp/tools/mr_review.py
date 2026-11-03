@@ -1404,7 +1404,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             notes, selected_indices = _select_review_notes(cached_notes, indices)
             for index, note in zip(selected_indices, notes, strict=True):
                 if note.body is None and note.body_path is None:
-                    raise ToolError(f"Cached index {index} requires a body_overrides entry before posting or re-preview.")  # noqa: TRY003
+                    raise ToolError(  # noqa: TRY003
+                        f"Cached index {index} requires a body_overrides entry before posting or re-preview."
+                    )
             notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
         # Unreachable after the checks above; this narrows both types for the checker.
         if notes is None or head_sha is None:

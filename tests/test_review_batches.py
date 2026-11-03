@@ -377,6 +377,50 @@ async def test_cached_batch_repreview_freezes_full_batch(
     assert_unavailable(await call_review(review_client, **note_args(batch_id=new)))
 
 
+@pytest.mark.parametrize("complete", [True, False], ids=["complete", "missing-body"])
+@respx.mock
+async def test_position_only_batch_repreview_requires_all_bodies(
+    review_client: Client, tmp_path: Path, complete: bool
+) -> None:
+    """Position-only re-preview keeps indices stable or rejects missing bodies before requests."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 2}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    overrides = [{"index": 0, "body": "first"}]
+    if complete:
+        overrides.append({"index": 1, "body": "second"})
+    preview = tmp_path / "positions.md"
+    before = len(respx.calls)
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(batch_id=batch_id, validate_only=True, preview_path=str(preview), body_overrides=overrides),
+    )
+
+    # Assert
+    assert not post_route.called
+    if complete:
+        assert not result.is_error
+        data = result.structured_content
+        assert "batch_indices" not in data
+        text = preview.read_text(encoding="utf-8")
+        for index, body in enumerate(("first", "second")):
+            assert f"cached index {index}" in text
+            assert body in text
+        posted = await call_review(review_client, **note_args(batch_id=data["batch_id"]))
+        assert posted.structured_content["posted_count"] == TWO_POSTS
+        assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["first", "second"]
+    else:
+        assert "Cached index 1" in assert_rejected(result)
+        assert len(respx.calls) == before
+        assert not preview.exists()
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)))
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -776,7 +820,7 @@ async def test_invalid_input_combinations_fail_without_gitlab_requests(
     review_client: Client,
     arguments: dict[str, Any],
 ) -> None:
-    """The caller supplies exactly one input mode, and tokens cannot be validation-only inputs."""
+    """The caller supplies one input mode and a preview path for cached validation."""
     # Arrange
     mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
