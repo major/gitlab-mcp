@@ -34,7 +34,7 @@ class CachedReviewNote:
     file: str | None
     line: int | None
     old_line: int | None
-    body: str
+    body: str | None
 
 
 @dataclass(frozen=True)
@@ -122,7 +122,7 @@ class ReviewBatchCache:
         """Estimate retained memory using UTF-8 text sizes and fixed record overhead."""
         size_bytes = cls.BATCH_OVERHEAD_BYTES + len(project.encode("utf-8")) + len(head_sha.encode("utf-8"))
         for note in notes:
-            size_bytes += cls.NOTE_OVERHEAD_BYTES + len(note.body.encode("utf-8"))
+            size_bytes += cls.NOTE_OVERHEAD_BYTES + len((note.body or "").encode("utf-8"))
             if note.file is not None:
                 size_bytes += len(note.file.encode("utf-8"))
         return size_bytes

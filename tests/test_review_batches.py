@@ -198,7 +198,8 @@ async def test_position_only_missing_selected_override_consumes_batch(review_cli
 
     # Assert
     message = assert_rejected(rejected)
-    assert "1" in message and "body_overrides" in message
+    assert "1" in message
+    assert "body_overrides" in message
     assert len(respx.calls) == before
     replay = await call_review(review_client, **note_args(batch_id=batch_id))
     assert_unavailable(replay)
