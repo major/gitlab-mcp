@@ -432,14 +432,16 @@ async def test_position_only_batch_repreview_requires_all_bodies(
     ids=["indices", "extras", "relative-path", "posting-preview"],
 )
 @respx.mock
-async def test_repreview_early_rejection_preserves_batch(review_client: Client, tmp_path: Path, extra: dict) -> None:
+async def test_repreview_early_rejection_preserves_batch(
+    review_client: Client, tmp_path: Path, extra: dict[str, Any]
+) -> None:
     """Invalid re-preview arguments fail before the old handle is claimed."""
     # Arrange
     add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     prepared = await call_review(review_client, **note_args(notes=[{"body": "draft"}], validate_only=True))
     batch_id = prepared.structured_content["batch_id"]
-    arguments = {"validate_only": True, "preview_path": str(tmp_path / "preview.md"), **extra}
+    arguments: dict[str, Any] = {"validate_only": True, "preview_path": str(tmp_path / "preview.md"), **extra}
 
     # Act
     rejected = await call_review(review_client, **note_args(batch_id=batch_id, **arguments))
