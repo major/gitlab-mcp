@@ -439,20 +439,25 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
 
 
 @respx.mock
-async def test_validate_only_checks_bodyless_positions_without_caching(gitlab_env, monkeypatch):
-    """New-side, old-side, and file-only checks do not create a batch."""
+async def test_validate_only_caches_bodyless_positions(gitlab_env, tmp_path):
+    """New-side, old-side, and file-only checks create a position-only batch and preview."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)])
-    cache_put = Mock()
-    monkeypatch.setattr("gitlab_mcp.review_batches.ReviewBatchCache.put", cache_put)
+    preview = tmp_path / "preview.md"
     notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 1}, {"file": "src.py"}]
 
     # Act
-    data = await call_tool(notes=notes, validate_only=True, add_reviewers=["alice"], add_assignees=["bob"])
+    data = await call_tool(notes=notes, validate_only=True, preview_path=str(preview))
 
     # Assert
-    assert data == {"validated_count": len(notes)}
-    cache_put.assert_not_called()
+    assert data["validated_count"] == len(notes)
+    assert data["batch_id"]
+    assert data["ttl_seconds"] == REVIEW_BATCH_TTL
+    assert "batch_indices" not in data
+    text = preview.read_text(encoding="utf-8")
+    for index in range(len(notes)):
+        assert f"cached index {index}; position-only" in text
+    assert "body_overrides" in text
     assert all(call.request.method == "GET" for call in respx.calls)
 
 

@@ -144,6 +144,67 @@ def assert_unavailable(result: Any, *, head: str | None = HEAD) -> dict[str, Any
 
 
 @respx.mock
+async def test_position_only_batch_subset_overrides_and_extra(review_client: Client, tmp_path: Path) -> None:
+    """Selected positions use approved overrides in selection order without requiring unselected bodies."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    body_path = tmp_path / "body.md"
+    body_path.write_text("file body", encoding="utf-8")
+    notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 2}, {"file": "src.py"}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+
+    # Act
+    posted = await call_review(
+        review_client,
+        **note_args(
+            batch_id=prepared.structured_content["batch_id"],
+            indices=[2, 0],
+            body_overrides=[{"index": 2, "body_path": str(body_path)}, {"index": 0, "body": "inline"}],
+            extra_notes=[{"body": "extra"}],
+        ),
+    )
+
+    # Assert
+    assert not posted.is_error
+    requests = [json.loads(call.request.content) for call in post_route.calls]
+    assert [request["body"] for request in requests] == ["file body", "inline", "extra"]
+    assert requests[0]["position"]["position_type"] == "file"
+    assert requests[1]["position"]["new_line"] == 1
+    assert posted.structured_content["posted_count"] == THREE_NOTES
+
+
+@respx.mock
+async def test_position_only_missing_selected_override_consumes_batch(review_client: Client) -> None:
+    """A missing selected body names its original index and consumes the batch before I/O."""
+    # Arrange
+    add_preflight()
+    notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 2}, {"file": "src.py"}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    before = len(respx.calls)
+
+    # Act
+    rejected = await call_review(
+        review_client,
+        **note_args(
+            batch_id=batch_id,
+            indices=[2, 1],
+            body_overrides=[{"index": 2, "body": "ok"}],
+            add_reviewers=["alice"],
+            add_assignees=["bob"],
+        ),
+    )
+
+    # Assert
+    message = assert_rejected(rejected)
+    assert "1" in message and "body_overrides" in message
+    assert len(respx.calls) == before
+    replay = await call_review(review_client, **note_args(batch_id=batch_id))
+    assert_unavailable(replay)
+
+
+@respx.mock
 async def test_validated_batch_posts_frozen_bodies_and_positions(
     review_client: Client,
     tmp_path: Path,
