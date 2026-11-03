@@ -184,7 +184,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `list_pipelines` | List one page of project, merge request, or schedule pipelines. |
 | `list_snippets` | List one page of personal, visible, public, or project snippets. |
 | `list_work_item_notes` | Read a bounded page of human notes and their IDs for a work item. |
-| `post_review_notes` | Validate or post review notes, cache bodies or all-bodyless positions for approved overrides, and optionally write a server-local Markdown preview. |
+| `post_review_notes` | Validate or post review notes, cache bodies or all-bodyless positions, and preview notes or cached body overrides in server-local Markdown. |
 | `reply_to_thread` | Reply to or resolve one merge request review thread. |
 | `reply_to_threads` | Reply to or resolve up to 20 review threads in order. |
 | `resolve_open_threads` | Resolve open review threads on one merge request. |

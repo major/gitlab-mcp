@@ -326,6 +326,187 @@ async def test_batch_body_override_keeps_coordinates_and_resolves_fresh_position
     assert len(diff_route.calls) == DIFF_CALLS_FOR_VALIDATE_AND_POST
 
 
+@pytest.mark.parametrize("with_overrides", [True, False], ids=["overrides", "unchanged"])
+@respx.mock
+async def test_cached_batch_repreview_freezes_full_batch(
+    review_client: Client, tmp_path: Path, with_overrides: bool
+) -> None:
+    """Re-preview consumes the old batch and freezes all final bodies in a new single-use batch."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    people_route = respx.post(GRAPHQL).mock(return_value=response({}))
+    body = tmp_path / "body.md"
+    body.write_text("file replacement", encoding="utf-8")
+    preview = tmp_path / "preview.md"
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"body": "first"}, {"body": "second"}, {"body": "third"}], validate_only=True),
+    )
+    old = prepared.structured_content["batch_id"]
+    overrides = [{"index": 0, "body": "inline replacement"}, {"index": 2, "body_path": str(body)}]
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(
+            batch_id=old,
+            validate_only=True,
+            preview_path=str(preview),
+            body_overrides=overrides if with_overrides else None,
+            add_reviewers=["alice"],
+        ),
+    )
+
+    # Assert
+    assert not result.is_error
+    new = result.structured_content["batch_id"]
+    assert new != old
+    text = preview.read_text(encoding="utf-8")
+    expected = ["inline replacement", "second", "file replacement"] if with_overrides else ["first", "second", "third"]
+    for index, value in enumerate(expected):
+        assert f"cached index {index}" in text
+        assert value in text
+    assert not post_route.called
+    assert not people_route.called
+    body.unlink()
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=old)))
+    posted = await call_review(review_client, **note_args(batch_id=new))
+    assert posted.structured_content["posted_count"] == THREE_NOTES
+    assert [json.loads(call.request.content)["body"] for call in post_route.calls] == expected
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=new)))
+
+
+@pytest.mark.parametrize("complete", [True, False], ids=["complete", "missing-body"])
+@respx.mock
+async def test_position_only_batch_repreview_requires_all_bodies(
+    review_client: Client, tmp_path: Path, complete: bool
+) -> None:
+    """Position-only re-preview keeps indices stable or rejects missing bodies before requests."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 2}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    overrides = [{"index": 0, "body": "first"}]
+    if complete:
+        overrides.append({"index": 1, "body": "second"})
+    preview = tmp_path / "positions.md"
+    before = len(respx.calls)
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(batch_id=batch_id, validate_only=True, preview_path=str(preview), body_overrides=overrides),
+    )
+
+    # Assert
+    assert not post_route.called
+    if complete:
+        assert not result.is_error
+        data = result.structured_content
+        assert "batch_indices" not in data
+        text = preview.read_text(encoding="utf-8")
+        for index, body in enumerate(("first", "second")):
+            assert f"cached index {index}" in text
+            assert body in text
+        posted = await call_review(review_client, **note_args(batch_id=data["batch_id"]))
+        assert posted.structured_content["posted_count"] == TWO_POSTS
+        assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["first", "second"]
+    else:
+        assert "Cached index 1" in assert_rejected(result)
+        assert len(respx.calls) == before
+        assert not preview.exists()
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"indices": [0]},
+        {"extra_notes": [{"body": "extra"}]},
+        {"preview_path": "relative.md"},
+        {"validate_only": False},
+    ],
+    ids=["indices", "extras", "relative-path", "posting-preview"],
+)
+@respx.mock
+async def test_repreview_early_rejection_preserves_batch(
+    review_client: Client, tmp_path: Path, extra: dict[str, Any]
+) -> None:
+    """Invalid re-preview arguments fail before the old handle is claimed."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(review_client, **note_args(notes=[{"body": "draft"}], validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    arguments: dict[str, Any] = {"validate_only": True, "preview_path": str(tmp_path / "preview.md"), **extra}
+
+    # Act
+    rejected = await call_review(review_client, **note_args(batch_id=batch_id, **arguments))
+    posted = await call_review(review_client, **note_args(batch_id=batch_id))
+
+    # Assert
+    assert_rejected(rejected)
+    assert posted.structured_content["posted_count"] == 1
+    assert len(post_route.calls) == 1
+
+
+@respx.mock
+async def test_unavailable_batch_repreview_returns_warning_preview(review_client: Client, tmp_path: Path) -> None:
+    """An unavailable handle produces a readable warning preview instead of an empty artifact."""
+    # Arrange
+    respx.get(MR_URL).mock(return_value=response(merge_request()))
+    preview = tmp_path / "unavailable.md"
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(batch_id="unknown", validate_only=True, preview_path=str(preview)),
+    )
+
+    # Assert
+    data = result.structured_content
+    assert data["preview_path"] == str(preview)
+    assert data["batch_error"] == "unavailable"
+    assert "batch_id" not in data
+    text = preview.read_text(encoding="utf-8")
+    assert "No postable batch is available" in text
+    assert data["warning"] in text
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+async def test_repreview_failed_validation_consumes_old_batch(review_client: Client, tmp_path: Path) -> None:
+    """A failed re-preview writes its errors but returns no replacement handle."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    prepared = await call_review(review_client, **note_args(notes=[{"body": "draft"}], validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    preview = tmp_path / "failure.md"
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(
+            batch_id=batch_id,
+            validate_only=True,
+            preview_path=str(preview),
+            body_overrides=[{"index": 0, "body": "bad [truncated]"}],
+        ),
+    )
+
+    # Assert
+    assert not result.is_error
+    assert "batch_id" not in result.structured_content
+    assert result.structured_content["results"][0]["status"] == "failed"
+    assert "Reason:" in preview.read_text(encoding="utf-8")
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)))
+    assert not post_route.called
+
+
 @respx.mock
 async def test_batch_indices_post_in_supplied_order_and_keep_original_result_indices(review_client: Client) -> None:
     """A noncontiguous subset posts in caller order and reports full-batch indices."""
@@ -665,7 +846,7 @@ async def test_invalid_input_combinations_fail_without_gitlab_requests(
     review_client: Client,
     arguments: dict[str, Any],
 ) -> None:
-    """The caller supplies exactly one input mode, and tokens cannot be validation-only inputs."""
+    """The caller supplies one input mode and a preview path for cached validation."""
     # Arrange
     mr_route = respx.get(MR_URL).mock(return_value=response(merge_request()))
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
