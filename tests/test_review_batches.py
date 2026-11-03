@@ -452,6 +452,30 @@ async def test_repreview_early_rejection_preserves_batch(review_client: Client, 
 
 
 @respx.mock
+async def test_unavailable_batch_repreview_returns_warning_preview(review_client: Client, tmp_path: Path) -> None:
+    """An unavailable handle produces a readable warning preview instead of an empty artifact."""
+    # Arrange
+    respx.get(MR_URL).mock(return_value=response(merge_request()))
+    preview = tmp_path / "unavailable.md"
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(batch_id="unknown", validate_only=True, preview_path=str(preview)),
+    )
+
+    # Assert
+    data = result.structured_content
+    assert data["preview_path"] == str(preview)
+    assert data["batch_error"] == "unavailable"
+    assert "batch_id" not in data
+    text = preview.read_text(encoding="utf-8")
+    assert "No postable batch is available" in text
+    assert data["warning"] in text
+    assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
 async def test_repreview_failed_validation_consumes_old_batch(review_client: Client, tmp_path: Path) -> None:
     """A failed re-preview writes its errors but returns no replacement handle."""
     # Arrange
