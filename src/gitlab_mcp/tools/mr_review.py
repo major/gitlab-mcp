@@ -1236,7 +1236,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             min_length=1,
             description=(
                 "Unique zero-based compact cached batch indices to post, in posting order. Requires batch_id. "
-                "Omit to post every note in the batch."
+                "Omit to post every note in the batch. Not allowed when re-previewing a batch."
             ),
         ),
     ] = None,
@@ -1272,7 +1272,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         Field(
             description=(
                 "Run checks without posting. If all pass, cache notes with bodies, or all positions if bodyless. "
-                "Mixed batches return batch_indices mapping compact cache indices to original input indices."
+                "Mixed batches return batch_indices mapping compact cache indices to original input indices. "
+                "With batch_id, requires preview_path and re-previews the full batch."
             )
         ),
     ] = False,
@@ -1284,7 +1285,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             description=(
                 "Single-use handle from a successful validate_only call. Provide this instead of notes. Without "
                 "indices, it posts every cached note. It is claimed before body_overrides indices are checked, so "
-                "an invalid index consumes the handle."
+                "an invalid index consumes the handle. Re-preview also consumes it and returns a new handle on success."
             ),
         ),
     ] = None,
@@ -1297,7 +1298,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
                 "Sparse replacements for a claimed batch, using compact cache indices and exactly one "
                 "of body or body_path per entry. Requires batch_id and an override for every selected bodyless note; "
                 "other omitted indices keep their cached body snapshots. "
-                "Show the final replacement text to the user and get approval before posting."
+                "Use validate_only and preview_path to preview replacements; get fresh approval before posting."
             ),
         ),
     ] = None,
@@ -1313,14 +1314,13 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     ] = None,
     preview_path: Annotated[
         str | None,
-        Field(description="New absolute server-local Markdown preview path, only with validate_only and notes."),
+        Field(description="New absolute server-local Markdown preview path, only with validate_only."),
     ] = None,
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
 
-    Like `glab mr note create`. Omit file/coordinates for general notes; set only file for file-level notes
-    (including outside hunks or collapsed diffs), or file and one line coordinate for inline notes.
-    Bodies containing truncation markers are rejected.
+    Like `glab mr note create`. Omit file for general notes; set file for file-level notes, or file and one
+    line coordinate for inline notes. Bodies containing truncation markers are rejected.
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
@@ -1329,11 +1329,14 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     `batch_indices[k]` gives the original input index of cached note k. Validation errors use input indices.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
     With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
-    snapshots and outcomes. A filename is not approval. The preview does not cover later overrides or extras: show
-    edited final content and get fresh APPROVE, or resubmit revised notes for a new preview and batch handle.
-    Then send `batch_id`, not notes or validate_only.
-    A handle is not approval. It expires after 30 minutes, cache eviction, or restart, and any posting attempt
-    consumes it, including failed preflight, invalid indices, excess notes, or project/MR/head mismatch.
+    snapshots and outcomes. A filename is not approval. To preview overrides, send `batch_id`, `validate_only=true`,
+    and a new `preview_path`, optionally with `body_overrides`. This re-previews the full batch, so omit `indices`
+    and `extra_notes`, and supply a body for every cached entry. It consumes the old handle after claim, even when
+    validation fails; early argument and preview path errors do not consume it. Success returns a new handle with
+    frozen bodies. Get fresh explicit APPROVE for the final content, then post the new handle without validate_only.
+    Later overrides or extras need their own final-text approval.
+    A handle is not approval. It expires after 30 minutes, eviction, or restart; a posting attempt consumes it,
+    including failed preflight or invalid indices.
 
     With batch_id, `indices` selects compact zero-based cache indices in posting order; omit it for the whole batch.
     `body_overrides` uses compact cache indices; selected bodyless entries require overrides, others retain snapshots.
@@ -1348,23 +1351,21 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     Writes are sequential and never retried. Check GitLab before retrying unknown or unverified outcomes.
 
     `batch_error="unavailable"` means this call wrote nothing, not that prior attempts did. Check prior results and
-    GitLab, and wait for in-flight attempts before resubmitting. Recheck head/positions and get APPROVE for changed
-    text. Warnings report current/stale/unknown head, not recovered cached content; `current_head_sha` supplies the
-    live head when unavailable batch_id was sent without head_sha.
+    GitLab and wait for in-flight attempts. Recheck head/positions and get APPROVE for changed text. Warnings report
+    current/stale/unknown head, not cached content; `current_head_sha` gives the live head when available.
 
-    `body_path` names a server-local file, not a file on the client's computer. With absolute `body_dir`, relative
-    paths must stay inside that directory; absolute paths still work. Posting requires exactly one body source per note.
-    Any preflight failure prevents all posting: `results` gives failed-note reasons, `validated_count` counts passes,
-    and batch-wide problems add warning/unattempted indices. After writes, inspect every result: posted notes appear
-    only in `posted_count` and `note_ids` (selection order, then extras); failed/unknown/unverified rows retain reasons
-    and available positions/IDs. `unattempted` identifies notes skipped after a stop or batch-wide problem.
+    `body_path` names a server-local file. With absolute `body_dir`, relative paths must stay inside that directory.
+    Posting requires one body source per note. Preflight failure prevents posting: `results` gives failed-note reasons,
+    `validated_count` counts passes, and batch-wide problems add warning/unattempted indices. Inspect every result:
+    posted notes appear in `posted_count` and `note_ids`; failed/unknown/unverified rows retain reasons and positions.
+    `unattempted` identifies skipped notes.
     `add_reviewers`/`add_assignees` run only after every note posts, never during validation.
     """
     if (notes is None) == (batch_id is None):
         raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
     if preview_path is not None:
-        if not validate_only or notes is None:
-            raise ToolError("preview_path requires validate_only and notes.")  # noqa: TRY003
+        if not validate_only:
+            raise ToolError("preview_path requires validate_only.")  # noqa: TRY003
         if not preview_path.strip() or "\x00" in preview_path or not Path(preview_path).is_absolute():
             raise ToolError("preview_path must be an absolute server-local path without NUL.")  # noqa: TRY003
     if notes is not None and head_sha is None:
@@ -1372,7 +1373,10 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     if batch_id is not None and not batch_id.strip():
         raise ToolError("batch_id must not be blank.")  # noqa: TRY003
     if validate_only and batch_id is not None:
-        raise ToolError("validate_only cannot be combined with batch_id.")  # noqa: TRY003
+        if preview_path is None:
+            raise ToolError("validate_only with batch_id requires preview_path.")  # noqa: TRY003
+        if indices is not None or extra_notes is not None:
+            raise ToolError("Batch re-preview does not allow indices or extra_notes.")  # noqa: TRY003
     if body_overrides is not None and batch_id is None:
         raise ToolError("body_overrides can only be used with batch_id.")  # noqa: TRY003
     if indices is not None and batch_id is None:
@@ -1387,25 +1391,24 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         # Reject missing bodies before claiming a cached batch, as input validation did previously.
         raise ToolError("Set exactly one of body or body_path for every note when posting.")  # noqa: TRY003
 
-    selected_indices = list(range(len(notes or [])))
-    if batch_id is not None:
-        try:
-            cached_batch = _claim_review_batch(ctx, batch_id, project, iid, head_sha)
-        except ReviewBatchUnavailableError:
-            result = await _unavailable_review_batch(ctx, project, iid, head_sha)
-            return _lean_review_result(result, validate_only=validate_only)
-        head_sha = cached_batch.head_sha
-        cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
-        notes, selected_indices = _select_review_notes(cached_notes, indices)
-        for index, note in zip(selected_indices, notes, strict=True):
-            if note.body is None and note.body_path is None:
-                raise ToolError(f"Cached index {index} requires an approved body_overrides entry before posting.")  # noqa: TRY003
-        notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
-    # Unreachable after the checks above; this narrows both types for the checker.
-    if notes is None or head_sha is None:
-        raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
-
     with _review_preview_file(preview_path) as preview_file:
+        selected_indices = list(range(len(notes or [])))
+        if batch_id is not None:
+            try:
+                cached_batch = _claim_review_batch(ctx, batch_id, project, iid, head_sha)
+            except ReviewBatchUnavailableError:
+                result = await _unavailable_review_batch(ctx, project, iid, head_sha)
+                return _lean_review_result(result, validate_only=validate_only)
+            head_sha = cached_batch.head_sha
+            cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
+            notes, selected_indices = _select_review_notes(cached_notes, indices)
+            for index, note in zip(selected_indices, notes, strict=True):
+                if note.body is None and note.body_path is None:
+                    raise ToolError(f"Cached index {index} requires a body_overrides entry before posting or re-preview.")  # noqa: TRY003
+            notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
+        # Unreachable after the checks above; this narrows both types for the checker.
+        if notes is None or head_sha is None:
+            raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
         result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only, body_dir, preview_file)
     if preview_path is not None:
         result = result.model_copy(update={"preview_path": preview_path})
