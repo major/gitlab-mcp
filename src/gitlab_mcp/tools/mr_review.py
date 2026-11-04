@@ -35,6 +35,7 @@ from gitlab_mcp.review_batches import CachedReviewBatch, CachedReviewNote, Revie
 
 REVIEW_NOTE_REASON_CAP = 200
 REVIEW_NOTE_HINT_CAP = 120
+REVIEW_NOTE_SUMMARY_HEAD_CAP = 60
 REVIEW_NOTE_BLOB_CAP = 131_072
 # One call writes at most this many notes, even when extra_notes are added to a cached batch. 🧱
 REVIEW_NOTE_CALL_CAP = 20
@@ -116,6 +117,26 @@ class ReviewNotePostResult(BaseModel):
     reason: str = Field(default="", exclude_if=lambda value: not value)
 
 
+class ReviewNoteSummary(BaseModel):
+    """A compact summary of one successfully cached review note."""
+
+    index: int = Field(description="Zero-based compact cached batch index.")
+    position: str = Field(description="Requested-side location, file, or general.")
+    status: Literal["validated"] = "validated"
+    head: str = Field(description="First nonempty body line, trimmed and limited to 60 characters, or empty.")
+
+
+def _review_note_summary(index: int, note: CachedReviewNote) -> ReviewNoteSummary:
+    """Summarize a cached note using its requested location and frozen body."""
+    position = note.file or "general"
+    if note.line is not None:
+        position = f"{position}:{note.line}"
+    elif note.old_line is not None:
+        position = f"{position}:old {note.old_line}"
+    head = next((line.strip() for line in (note.body or "").splitlines() if line.strip()), "")
+    return ReviewNoteSummary(index=index, position=position, head=head[:REVIEW_NOTE_SUMMARY_HEAD_CAP])
+
+
 @dataclass(frozen=True)
 class _CheckedNote:
     """One requested note after preflight: its body and GitLab position, or the reason it cannot be posted."""
@@ -166,6 +187,14 @@ class PostReviewNotesResult(BaseModel):
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    notes_summary: list[ReviewNoteSummary] = Field(
+        default_factory=list,
+        description=(
+            "Only for successfully cached validate_only batches: one per cached note, possibly fewer than "
+            "validated_count for mixed batches."
+        ),
+        exclude_if=lambda value: not value,
+    )
     batch_indices: list[int] | None = Field(
         default=None,
         description="For a mixed validation, original input index for each compact cached batch index.",
@@ -1175,7 +1204,13 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
             )
             cache = get_review_batch_cache(ctx)
             batch_id = cache.put(project, iid, refs["head_sha"], cached_notes)
-            result = result.model_copy(update={"batch_id": batch_id, "ttl_seconds": cache.TTL_SECONDS})
+            result = result.model_copy(
+                update={
+                    "batch_id": batch_id,
+                    "ttl_seconds": cache.TTL_SECONDS,
+                    "notes_summary": [_review_note_summary(index, note) for index, note in enumerate(cached_notes)],
+                }
+            )
             if batch_indices and len(batch_indices) != len(notes):
                 result = result.model_copy(update={"batch_indices": batch_indices})
         return finish(result, resolved)
@@ -1325,7 +1360,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching supplied bodies or all bodyless positions. For position checks, omit body sources and supply `file` and
+    caching supplied bodies or all bodyless positions. `notes_summary` summarizes cached notes. For position checks,
+    omit body sources and supply `file` and
     optional `line` or `old_line`. Selected bodyless positions require approved overrides. For a mixed batch,
     `batch_indices[k]` gives the original input index of cached note k. Validation errors use input indices.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.

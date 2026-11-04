@@ -364,6 +364,10 @@ async def test_cached_batch_repreview_freezes_full_batch(
     assert new != old
     text = preview.read_text(encoding="utf-8")
     expected = ["inline replacement", "second", "file replacement"] if with_overrides else ["first", "second", "third"]
+    assert result.structured_content["notes_summary"] == [
+        {"index": index, "position": "general", "status": "validated", "head": value}
+        for index, value in enumerate(expected)
+    ]
     for index, value in enumerate(expected):
         assert f"cached index {index}" in text
         assert value in text
@@ -373,6 +377,7 @@ async def test_cached_batch_repreview_freezes_full_batch(
     assert_unavailable(await call_review(review_client, **note_args(batch_id=old)))
     posted = await call_review(review_client, **note_args(batch_id=new))
     assert posted.structured_content["posted_count"] == THREE_NOTES
+    assert "notes_summary" not in posted.structured_content
     assert [json.loads(call.request.content)["body"] for call in post_route.calls] == expected
     assert_unavailable(await call_review(review_client, **note_args(batch_id=new)))
 

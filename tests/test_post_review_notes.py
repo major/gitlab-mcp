@@ -454,6 +454,11 @@ async def test_validate_only_caches_bodyless_positions(gitlab_env, tmp_path):
     assert data["batch_id"]
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
     assert "batch_indices" not in data
+    assert data["notes_summary"] == [
+        {"index": 0, "position": "src.py:1", "status": "validated", "head": ""},
+        {"index": 1, "position": "src.py:old 1", "status": "validated", "head": ""},
+        {"index": 2, "position": "src.py", "status": "validated", "head": ""},
+    ]
     text = preview.read_text(encoding="utf-8")
     for index in range(len(notes)):
         assert f"cached index {index}; position-only" in text
@@ -499,6 +504,11 @@ async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitla
 
     # Assert
     assert data["validated_count"] == THREE_POSTS
+    assert data["notes_summary"] == [
+        {"index": 0, "position": "src.py:1", "status": "validated", "head": "first"},
+        {"index": 1, "position": "src.py:1", "status": "validated", "head": "third"},
+    ]
+    assert "notes_summary" not in posted.structured_content
     assert posted.structured_content["posted_count"] == (TWO_POSTS if fail_extra else THREE_POSTS)
     if fail_extra:
         assert posted.structured_content["results"][0]["index"] == TWO_POSTS
@@ -521,7 +531,22 @@ async def test_invalid_mixed_validation_never_caches(gitlab_env, monkeypatch):
     assert data["results"][0]["index"] == 1
     assert "batch_id" not in data
     assert "batch_indices" not in data
+    assert "notes_summary" not in data
     cache_put.assert_not_called()
+
+
+@respx.mock
+async def test_validation_summary_uses_trimmed_first_nonempty_line(gitlab_env):
+    """Summary heads skip blank lines, trim whitespace, and stop at 60 characters."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)])
+    body = " \n\t\n  " + "x" * 65 + "  \nsecond"
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1, body)], validate_only=True)
+
+    # Assert
+    assert data["notes_summary"] == [{"index": 0, "position": "src.py:1", "status": "validated", "head": "x" * 60}]
 
 
 @pytest.mark.parametrize(
