@@ -120,11 +120,17 @@ class ReviewNotePostResult(BaseModel):
 class ReviewNoteSummary(BaseModel):
     """A compact summary of one successfully cached review note.
 
-    Every row means the note validated, so the row carries no status field. 🪙
+    Every row means the note validated, so the row carries no status field. Rows are grouped under their file, so
+    the row itself carries only the line coordinate. 🪙
     """
 
     index: int = Field(description="Zero-based cached batch index, the same as the input index.")
-    position: str = Field(description="Requested-side location, file, or general.")
+    line: int | None = Field(
+        default=None, description="Requested new-side line.", exclude_if=lambda value: value is None
+    )
+    old_line: int | None = Field(
+        default=None, description="Requested old-side line.", exclude_if=lambda value: value is None
+    )
     head: str = Field(
         default="",
         description=(
@@ -135,15 +141,19 @@ class ReviewNoteSummary(BaseModel):
     )
 
 
-def _review_note_summary(index: int, note: CachedReviewNote) -> ReviewNoteSummary:
-    """Summarize a cached note using its requested location and frozen body."""
-    position = note.file or "general"
-    if note.line is not None:
-        position = f"{position}:{note.line}"
-    elif note.old_line is not None:
-        position = f"{position}:old {note.old_line}"
-    head = next((line.strip() for line in (note.body or "").splitlines() if line.strip()), "")
-    return ReviewNoteSummary(index=index, position=position, head=head[:REVIEW_NOTE_SUMMARY_HEAD_CAP])
+def _review_notes_summary(notes: tuple[CachedReviewNote, ...]) -> dict[str, list[ReviewNoteSummary]]:
+    """Summarize cached notes grouped by file, so each path appears once.
+
+    Groups keep first-seen file order and rows keep input order. Notes without a file go under `general`. 🪙
+    """
+    summary: dict[str, list[ReviewNoteSummary]] = {}
+    for index, note in enumerate(notes):
+        head = next((line.strip() for line in (note.body or "").splitlines() if line.strip()), "")
+        row = ReviewNoteSummary(
+            index=index, line=note.line, old_line=note.old_line, head=head[:REVIEW_NOTE_SUMMARY_HEAD_CAP]
+        )
+        summary.setdefault(note.file or "general", []).append(row)
+    return summary
 
 
 @dataclass(frozen=True)
@@ -196,9 +206,12 @@ class PostReviewNotesResult(BaseModel):
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
-    notes_summary: list[ReviewNoteSummary] = Field(
-        default_factory=list,
-        description="Only for successfully cached validate_only batches: one per input note, in input order.",
+    notes_summary: dict[str, list[ReviewNoteSummary]] = Field(
+        default_factory=dict,
+        description=(
+            "Only for successfully cached validate_only batches: one row per input note, grouped by file in "
+            "first-seen order (general for notes without a file), with rows in input order."
+        ),
         exclude_if=lambda value: not value,
     )
     ttl_seconds: int | None = Field(
@@ -1237,7 +1250,7 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                 update={
                     "batch_id": batch_id,
                     "ttl_seconds": cache.TTL_SECONDS,
-                    "notes_summary": [_review_note_summary(index, note) for index, note in enumerate(cached_notes)],
+                    "notes_summary": _review_notes_summary(cached_notes),
                 }
             )
         return finish(result, resolved)
@@ -1389,8 +1402,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching every note at its input index. `notes_summary` summarizes cached notes; a row without `head` marks a
-    position-only entry. For position checks, omit body sources and supply `file` and optional `line` or
+    caching every note at its input index. `notes_summary` groups cached-note rows by file; a row without `head`
+    marks a position-only entry. For position checks, omit body sources and supply `file` and optional `line` or
     `old_line`; mix them with bodied notes in one batch. Selected position-only entries require approved overrides.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
     With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
