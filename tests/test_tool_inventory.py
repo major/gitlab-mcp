@@ -106,6 +106,19 @@ async def test_server_instructions_describe_the_review_workflow(gitlab_env):
     assert "with paths=[...] for patches" in instructions
 
 
+async def test_review_body_override_text_shows_list_shape(gitlab_env):
+    """Agents can find the override list shape without inspecting nested JSON schemas."""
+    # Arrange / Act
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        instructions = client.instructions or ""
+    description = tools["post_review_notes"].input_schema["properties"]["body_overrides"]["description"]
+
+    # Assert
+    assert '[{"index": 0, "body": "..."}, {"index": 3, "body_path": "note-3.md"}]' in description
+    assert "body_overrides=[{index, body or body_path}]" in instructions
+
+
 async def test_server_instructions_describe_the_ci_triage_workflow(gitlab_env):
     """CI guidance leads from pipeline discovery through job inspection to logs and metadata."""
     # Arrange / Act
