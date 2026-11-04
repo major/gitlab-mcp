@@ -214,20 +214,25 @@ async def test_preview_contains_cached_body_snapshots(gitlab_env: Any, tmp_path:
         source.write_text("changed", encoding="utf-8")
         await client.call_tool(
             "post_review_notes",
-            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "batch_id": result.structured_content["batch_id"]},
+            {
+                "project": PROJECT,
+                "iid": IID,
+                "head_sha": HEAD,
+                "batch_id": result.structured_content["batch_id"],
+                "indices": [0, 2, 3, 4],
+            },
         )
     # Assert
     text = preview.read_text(encoding="utf-8")
     assert result.structured_content["preview_path"] == str(preview)
-    assert result.structured_content["batch_indices"] == [0, 2, 3, 4]
+    assert "batch_indices" not in result.structured_content
     assert "Hello 🌍" in text
     assert "File café" in text
-    assert "position-only" in text
     assert "## Input 0: general\n\nvalidated; cached index 0" in text
-    assert "## Input 1: file a.py\n\nvalidated; not cached; position-only" in text
-    assert "## Input 2: file a.py, new_line 1\n\nvalidated; cached index 1" in text
-    assert "## Input 3: file a.py, old_line 1\n\nvalidated; cached index 2" in text
-    assert "## Input 4: file a.py\n\nvalidated; cached index 3" in text
+    assert "## Input 1: file a.py\n\nvalidated; cached index 1; position-only; approved body_overrides required" in text
+    assert "## Input 2: file a.py, new_line 1\n\nvalidated; cached index 2" in text
+    assert "## Input 3: file a.py, old_line 1\n\nvalidated; cached index 3" in text
+    assert "## Input 4: file a.py\n\nvalidated; cached index 4" in text
     assert [json.loads(call.request.content)["body"] for call in respx.calls if call.request.method == "POST"] == [
         "Hello 🌍",
         "File café",
@@ -468,8 +473,8 @@ async def test_validate_only_caches_bodyless_positions(gitlab_env, tmp_path):
 
 @respx.mock
 @pytest.mark.parametrize("fail_extra", [False, True])
-async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitlab_env, fail_extra):
-    """Mixed validation maps original positions to compact posting indices."""
+async def test_mixed_validation_caches_every_entry_at_input_indices(gitlab_env, fail_extra):
+    """Mixed validation caches bodied notes and positions under one batch, so cache indices match input indices."""
     # Arrange
     add_preflight([([diff_file("src.py")], None)] * 2, merge_requests=[merge_request()] * 4)
 
@@ -486,33 +491,74 @@ async def test_mixed_validation_caches_bodied_notes_with_compact_selection(gitla
             "post_review_notes",
             {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": notes, "validate_only": True},
         )
+        data = prepared.structured_content
 
         # Act
-        data = prepared.structured_content
-        assert data["batch_indices"] == [0, 2]
         posted = await client.call_tool(
             "post_review_notes",
             {
                 "project": PROJECT,
                 "iid": IID,
                 "batch_id": data["batch_id"],
-                "indices": [1, 0],
-                "body_overrides": [{"index": 1, "body": "replacement"}],
+                "indices": [1, 0, 2],
+                "body_overrides": [{"index": 1, "body": "approved low"}],
                 "extra_notes": [{"file": "src.py", "line": 1, "body": "extra"}],
             },
         )
 
     # Assert
     assert data["validated_count"] == THREE_POSTS
+    assert "batch_indices" not in data
     assert data["notes_summary"] == [
         {"index": 0, "position": "src.py:1", "status": "validated", "head": "first"},
-        {"index": 1, "position": "src.py:1", "status": "validated", "head": "third"},
+        {"index": 1, "position": "src.py:1", "status": "validated", "head": ""},
+        {"index": 2, "position": "src.py:1", "status": "validated", "head": "third"},
     ]
     assert "notes_summary" not in posted.structured_content
-    assert posted.structured_content["posted_count"] == (TWO_POSTS if fail_extra else THREE_POSTS)
+    assert posted.structured_content["posted_count"] == (THREE_POSTS if fail_extra else len(notes) + 1)
     if fail_extra:
-        assert posted.structured_content["results"][0]["index"] == TWO_POSTS
-    assert [json.loads(call.request.content)["body"] for call in post.calls] == ["replacement", "first", "extra"]
+        assert posted.structured_content["results"][0]["index"] == len(notes)
+    assert [json.loads(call.request.content)["body"] for call in post.calls] == [
+        "approved low",
+        "first",
+        "third",
+        "extra",
+    ]
+
+
+@respx.mock
+@pytest.mark.parametrize("indices", [None, [2, 0, 1]], ids=["whole-batch", "selected"])
+async def test_mixed_batch_post_names_every_missing_override_and_keeps_batch(gitlab_env, indices):
+    """A post missing overrides writes nothing, names every missing index, and leaves the batch_id usable."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)] * 2, merge_requests=[merge_request()] * 4)
+    post = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [review_note("src.py", 1, "first"), {"file": "src.py", "line": 1}, {"file": "src.py"}]
+    async with Client(mcp) as client:
+        prepared = await client.call_tool(
+            "post_review_notes",
+            {"project": PROJECT, "iid": IID, "head_sha": HEAD, "notes": notes, "validate_only": True},
+        )
+        arguments = {"project": PROJECT, "iid": IID, "batch_id": prepared.structured_content["batch_id"]}
+        if indices is not None:
+            arguments["indices"] = indices
+
+        # Act
+        rejected = await client.call_tool(
+            "post_review_notes", {**arguments, "add_reviewers": ["alice"]}, raise_on_error=False
+        )
+        writes_after_rejection = [call for call in respx.calls if call.request.method != "GET"]
+        overrides = [{"index": 1, "body": "low one"}, {"index": 2, "body": "low two"}]
+        retried = await client.call_tool("post_review_notes", {**arguments, "body_overrides": overrides})
+
+    # Assert
+    assert rejected.is_error
+    assert "Cached indices 1, 2 require body_overrides entries" in rejected.content[0].text
+    assert "batch_id is still valid" in rejected.content[0].text
+    assert not writes_after_rejection
+    assert retried.structured_content["posted_count"] == len(notes)
+    expected = ["low two", "first", "low one"] if indices else ["first", "low one", "low two"]
+    assert [json.loads(call.request.content)["body"] for call in post.calls] == expected
 
 
 @respx.mock

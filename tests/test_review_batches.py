@@ -175,37 +175,6 @@ async def test_position_only_batch_subset_overrides_and_extra(review_client: Cli
 
 
 @respx.mock
-async def test_position_only_missing_selected_override_consumes_batch(review_client: Client) -> None:
-    """A missing selected body names its original index and consumes the batch before I/O."""
-    # Arrange
-    add_preflight()
-    notes = [{"file": "src.py", "line": 1}, {"file": "src.py", "old_line": 2}, {"file": "src.py"}]
-    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
-    batch_id = prepared.structured_content["batch_id"]
-    before = len(respx.calls)
-
-    # Act
-    rejected = await call_review(
-        review_client,
-        **note_args(
-            batch_id=batch_id,
-            indices=[2, 1],
-            body_overrides=[{"index": 2, "body": "ok"}],
-            add_reviewers=["alice"],
-            add_assignees=["bob"],
-        ),
-    )
-
-    # Assert
-    message = assert_rejected(rejected)
-    assert "1" in message
-    assert "body_overrides" in message
-    assert len(respx.calls) == before
-    replay = await call_review(review_client, **note_args(batch_id=batch_id))
-    assert_unavailable(replay)
-
-
-@respx.mock
 async def test_validated_batch_posts_frozen_bodies_and_positions(
     review_client: Client,
     tmp_path: Path,
@@ -387,7 +356,7 @@ async def test_cached_batch_repreview_freezes_full_batch(
 async def test_position_only_batch_repreview_requires_all_bodies(
     review_client: Client, tmp_path: Path, complete: bool
 ) -> None:
-    """Position-only re-preview keeps indices stable or rejects missing bodies before requests."""
+    """Position-only re-preview keeps indices stable, or rejects missing bodies before requests and keeps the batch."""
     # Arrange
     add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -419,11 +388,20 @@ async def test_position_only_batch_repreview_requires_all_bodies(
         posted = await call_review(review_client, **note_args(batch_id=data["batch_id"]))
         assert posted.structured_content["posted_count"] == TWO_POSTS
         assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["first", "second"]
+        assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)))
     else:
         assert "Cached index 1" in assert_rejected(result)
         assert len(respx.calls) == before
         assert not preview.exists()
-    assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)))
+        # Nothing was attempted, so the same handle still works once every body is supplied. ♻️
+        retried = await call_review(
+            review_client,
+            **note_args(
+                batch_id=batch_id,
+                body_overrides=[*overrides, {"index": 1, "body": "second"}],
+            ),
+        )
+        assert retried.structured_content["posted_count"] == TWO_POSTS
 
 
 @pytest.mark.parametrize(
