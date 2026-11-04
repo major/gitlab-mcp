@@ -118,16 +118,20 @@ class ReviewNotePostResult(BaseModel):
 
 
 class ReviewNoteSummary(BaseModel):
-    """A compact summary of one successfully cached review note."""
+    """A compact summary of one successfully cached review note.
+
+    Every row means the note validated, so the row carries no status field. 🪙
+    """
 
     index: int = Field(description="Zero-based cached batch index, the same as the input index.")
     position: str = Field(description="Requested-side location, file, or general.")
-    status: Literal["validated"] = "validated"
     head: str = Field(
+        default="",
         description=(
-            "First nonempty body line, trimmed and limited to 60 characters. Empty marks a position-only entry "
+            "First nonempty body line, trimmed and limited to 60 characters. Omitted for a position-only entry "
             "that needs a body_overrides entry before posting."
-        )
+        ),
+        exclude_if=lambda value: not value,
     )
 
 
@@ -1385,7 +1389,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching every note at its input index. `notes_summary` summarizes cached notes; an empty `head` marks a
+    caching every note at its input index. `notes_summary` summarizes cached notes; a row without `head` marks a
     position-only entry. For position checks, omit body sources and supply `file` and optional `line` or
     `old_line`; mix them with bodied notes in one batch. Selected position-only entries require approved overrides.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
