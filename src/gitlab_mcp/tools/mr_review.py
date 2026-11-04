@@ -1295,7 +1295,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             min_length=1,
             max_length=20,
             description=(
-                "Sparse replacements for a claimed batch, using compact cache indices and exactly one "
+                'List of sparse replacements, e.g. [{"index": 0, "body": "..."}, '
+                '{"index": 3, "body_path": "note-3.md"}], using compact cache indices and exactly one '
                 "of body or body_path per entry. Requires batch_id and an override for every selected bodyless note; "
                 "other omitted indices keep their cached body snapshots. "
                 "Use validate_only and preview_path to preview replacements; get fresh approval before posting."
