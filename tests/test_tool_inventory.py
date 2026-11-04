@@ -172,6 +172,7 @@ async def test_server_instructions_list_real_main_arguments(gitlab_env):
             "old_text",
             "new_text",
         },
+        "edit_merge_request_description": {"project", "iid", "old_text", "new_text", "edits", "return_diff"},
         "post_review_notes": {
             "project",
             "iid",
