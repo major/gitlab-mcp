@@ -1023,6 +1023,75 @@ async def test_body_dir_resolves_relative_paths_and_keeps_absolute_paths(gitlab_
     assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["relative body", "absolute body"]
 
 
+async def call_body_dir_tool(body_dir: Any, **arguments: Any) -> Any:
+    """Call post_review_notes with only body_dir as the note source, so notes come from its files."""
+    return await call_mcp_tool_result(
+        "post_review_notes",
+        {"project": PROJECT, "iid": IID, "head_sha": HEAD, "body_dir": str(body_dir), **arguments},
+        raise_on_error=False,
+    )
+
+
+@respx.mock
+async def test_body_dir_without_notes_loads_positions_from_front_matter(gitlab_env, tmp_path):
+    """Without notes, every Markdown file in body_dir becomes a note, sorted by name, placed by its front matter."""
+    # Arrange
+    (tmp_path / "02-file.md").write_text("---\nfile: src.py\n---\nFile-level note.\n", encoding="utf-8")
+    # A leading BOM and CRLF line endings must not hide the front matter.
+    (tmp_path / "01-inline.md").write_text(
+        '\ufeff---\r\nfile: "src.py"\r\nline: 1\r\n---\r\n\r\nInline note.\r\n', encoding="utf-8"
+    )
+    (tmp_path / "03-general.md").write_text("General note.\n", encoding="utf-8")
+    (tmp_path / "skip.txt").write_text("Not Markdown, so not a note.", encoding="utf-8")
+    (tmp_path / "._01-inline.md").write_bytes(b"\x00\x05\x16\x07 macOS metadata, not a note")
+    add_preflight([([diff_file("src.py")], None)])
+
+    # Act
+    result = await call_body_dir_tool(tmp_path, validate_only=True)
+
+    # Assert
+    data = result.structured_content
+    assert data["validated_count"] == THREE_POSTS
+    assert data["body_files"] == ["01-inline.md", "02-file.md", "03-general.md"]
+    assert data["notes_summary"] == {
+        "src.py": [{"index": 0, "line": 1, "head": "Inline note."}, {"index": 1, "head": "File-level note."}],
+        "general": [{"index": 2, "head": "General note."}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("files", "preview_inside", "message"),
+    [
+        pytest.param({}, False, "body_dir has no .md note files", id="empty"),
+        pytest.param({"01.md": "---\nfile: src.py\nline: 1\n"}, False, "01.md: front matter", id="unclosed"),
+        pytest.param({"01.md": "---\nfile: src.py\nside: new\n---\nx"}, False, "01.md: unknown", id="unknown-key"),
+        pytest.param({"01.md": "---\nfile: src.py\nline: one\n---\nx"}, False, "01.md: line", id="bad-line"),
+        pytest.param({"01.md": "---\nline: 1\n---\nx"}, False, "01.md: Value error, file is required", id="no-file"),
+        pytest.param({"01.md": "x"}, True, "preview_path must be outside body_dir", id="preview-inside"),
+    ],
+)
+@respx.mock
+async def test_body_dir_without_notes_rejects_bad_note_files(
+    gitlab_env, tmp_path, files: dict[str, str], preview_inside: bool, message: str
+):
+    """Bad note files stop the call before any GitLab request, and the error names the file."""
+    # Arrange
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    for name, text in files.items():
+        (notes_dir / name).write_text(text, encoding="utf-8")
+    preview = (notes_dir if preview_inside else tmp_path) / "preview.md"
+
+    # Act
+    result = await call_body_dir_tool(notes_dir, validate_only=True, preview_path=str(preview))
+
+    # Assert
+    assert result.is_error
+    assert message in result.content[0].text
+    assert not respx.calls
+    assert not preview.exists()
+
+
 @respx.mock
 async def test_long_body_read_reason_is_capped_at_200_characters(gitlab_env, tmp_path):
     """An OS error that quotes a long path keeps only the first 200 characters of its reason."""
