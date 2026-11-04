@@ -123,6 +123,8 @@ mcp = FastMCP(
         "view=full|headings|finding, include_mr_status, include_hashes, count_only, cursor); "
         "get_merge_request_note(project, iid, note_id, body_offset, body_limit); "
         "edit_merge_request_note(project, iid, thread_id, note_id, expected_hash, body, old_text, new_text); "
+        "edit_merge_request_description(project, iid, old_text, new_text, edits=[{old_text, new_text}], "
+        "return_diff); "
         "post_review_notes(project, iid, head_sha (optional with batch_id), notes=[{file, line or old_line "
         "(neither for a file-level note), body or body_path}] or batch_id, indices, "
         "body_overrides=[{index, body or body_path}], extra_notes, "
