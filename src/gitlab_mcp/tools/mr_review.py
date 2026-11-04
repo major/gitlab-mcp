@@ -120,10 +120,15 @@ class ReviewNotePostResult(BaseModel):
 class ReviewNoteSummary(BaseModel):
     """A compact summary of one successfully cached review note."""
 
-    index: int = Field(description="Zero-based compact cached batch index.")
+    index: int = Field(description="Zero-based cached batch index, the same as the input index.")
     position: str = Field(description="Requested-side location, file, or general.")
     status: Literal["validated"] = "validated"
-    head: str = Field(description="First nonempty body line, trimmed and limited to 60 characters, or empty.")
+    head: str = Field(
+        description=(
+            "First nonempty body line, trimmed and limited to 60 characters. Empty marks a position-only entry "
+            "that needs a body_overrides entry before posting."
+        )
+    )
 
 
 def _review_note_summary(index: int, note: CachedReviewNote) -> ReviewNoteSummary:
@@ -189,16 +194,8 @@ class PostReviewNotesResult(BaseModel):
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     notes_summary: list[ReviewNoteSummary] = Field(
         default_factory=list,
-        description=(
-            "Only for successfully cached validate_only batches: one per cached note, possibly fewer than "
-            "validated_count for mixed batches."
-        ),
+        description="Only for successfully cached validate_only batches: one per input note, in input order.",
         exclude_if=lambda value: not value,
-    )
-    batch_indices: list[int] | None = Field(
-        default=None,
-        description="For a mixed validation, original input index for each compact cached batch index.",
-        exclude_if=lambda value: value is None,
     )
     ttl_seconds: int | None = Field(
         default=None,
@@ -243,8 +240,6 @@ def _write_review_preview(
         stream.write(f"Warning: {result.warning}\n\n")
     if not result.batch_id:
         stream.write("No postable batch is available.\n\n")
-    mapping = result.batch_indices if result.batch_indices is not None else list(range(len(notes)))
-    cached = {original: index for index, original in enumerate(mapping)} if result.batch_id else {}
     for index, note in enumerate(notes):
         row = result.results[index]
         location = "general" if note.file is None else f"file {note.file}"
@@ -253,12 +248,13 @@ def _write_review_preview(
         if note.old_line is not None:
             location += f", old_line {note.old_line}"
         position_only = note.body is None and note.body_path is None
-        cache_label = f"cached index {cached[index]}" if index in cached else "not cached"
+        # Every input note is cached at its own index, so the cache index is the input index. 🎯
+        cache_label = f"cached index {index}" if result.batch_id else "not cached"
         stream.write(f"## Input {index}: {location}\n\n{row.status}; {cache_label}")
         if position_only:
             stream.write(
                 "; position-only; approved body_overrides required before posting"
-                if index in cached
+                if result.batch_id
                 else "; position-only"
             )
         stream.write("\n\n")
@@ -1088,6 +1084,35 @@ async def _post_review_note_batch(
     return PostReviewNotesResult(results=results, warning=warning[:500])
 
 
+def _require_selected_overrides(
+    ctx: Context,
+    batch_id: str,
+    batch: CachedReviewBatch,
+    notes: list[ReviewNote],
+    selected_indices: list[int],
+) -> None:
+    """Reject selected position-only entries that still lack a body, naming every one so one retry fixes them all.
+
+    This runs before any await or GitLab request, so nothing was attempted and the claimed batch goes back into
+    the cache. A forgotten override then costs one retry instead of a full re-validation. ♻️
+    """
+    missing = sorted(
+        index
+        for index, note in zip(selected_indices, notes, strict=True)
+        if note.body is None and note.body_path is None
+    )
+    if not missing:
+        return
+    get_review_batch_cache(ctx).restore(batch_id, batch)
+    if len(missing) == 1:
+        problem = f"Cached index {missing[0]} requires a body_overrides entry"
+    else:
+        problem = f"Cached indices {', '.join(map(str, missing))} require body_overrides entries"
+    raise ToolError(  # noqa: TRY003
+        f"{problem}. Nothing was posted and the batch_id is still valid; retry with those overrides."
+    )
+
+
 def _cached_review_notes_with_overrides(
     cached_notes: tuple[CachedReviewNote, ...],
     body_overrides: list[ReviewNoteBodyOverride] | None,
@@ -1190,8 +1215,9 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     has_failed_checks = any(check.reason for check in checks)
     if validate_only or has_failed_checks:
         result = _review_preflight_result(checks)
-        batch_indices = [i for i, note in enumerate(notes) if note.body is not None or note.body_path is not None]
         if validate_only and not has_failed_checks:
+            # Cache every note, including position-only ones (body=None), so cache indices match input indices
+            # and a partial approval can post bodied notes plus overridden positions in one call. 🪙
             cached_notes = tuple(
                 CachedReviewNote(
                     file=note.file,
@@ -1200,7 +1226,6 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                     body=check.body if note.body is not None or note.body_path is not None else None,
                 )
                 for note, check in zip(notes, checks, strict=True)
-                if not batch_indices or note.body is not None or note.body_path is not None
             )
             cache = get_review_batch_cache(ctx)
             batch_id = cache.put(project, iid, refs["head_sha"], cached_notes)
@@ -1211,8 +1236,6 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                     "notes_summary": [_review_note_summary(index, note) for index, note in enumerate(cached_notes)],
                 }
             )
-            if batch_indices and len(batch_indices) != len(notes):
-                result = result.model_copy(update={"batch_indices": batch_indices})
         return finish(result, resolved)
     return await _post_review_note_batch(client, project, iid, checks, refs)
 
@@ -1270,8 +1293,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         Field(
             min_length=1,
             description=(
-                "Unique zero-based compact cached batch indices to post, in posting order. Requires batch_id. "
-                "Omit to post every note in the batch. Not allowed when re-previewing a batch."
+                "Unique zero-based cached batch indices (same as input indices) to post, in posting order. "
+                "Requires batch_id. Omit to post every note in the batch, which needs body_overrides for every "
+                "position-only entry. Not allowed when re-previewing a batch."
             ),
         ),
     ] = None,
@@ -1306,8 +1330,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         bool,
         Field(
             description=(
-                "Run checks without posting. If all pass, cache notes with bodies, or all positions if bodyless. "
-                "Mixed batches return batch_indices mapping compact cache indices to original input indices. "
+                "Run checks without posting. If all pass, cache every note at its input index; bodyless notes are "
+                "cached as position-only entries. "
                 "With batch_id, requires preview_path and re-previews the full batch."
             )
         ),
@@ -1320,7 +1344,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             description=(
                 "Single-use handle from a successful validate_only call. Provide this instead of notes. Without "
                 "indices, it posts every cached note. It is claimed before body_overrides indices are checked, so "
-                "an invalid index consumes the handle. Re-preview also consumes it and returns a new handle on success."
+                "an invalid index consumes the handle; a missing override for a selected position-only entry does "
+                "not. Re-preview also consumes it and returns a new handle on success."
             ),
         ),
     ] = None,
@@ -1331,7 +1356,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             max_length=20,
             description=(
                 'List of sparse replacements, e.g. [{"index": 0, "body": "..."}, '
-                '{"index": 3, "body_path": "note-3.md"}], using compact cache indices and exactly one '
+                '{"index": 3, "body_path": "note-3.md"}], using cached batch indices and exactly one '
                 "of body or body_path per entry. Requires batch_id and an override for every selected bodyless note; "
                 "other omitted indices keep their cached body snapshots. "
                 "Use validate_only and preview_path to preview replacements; get fresh approval before posting."
@@ -1360,10 +1385,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
 
     Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching supplied bodies or all bodyless positions. `notes_summary` summarizes cached notes. For position checks,
-    omit body sources and supply `file` and
-    optional `line` or `old_line`. Selected bodyless positions require approved overrides. For a mixed batch,
-    `batch_indices[k]` gives the original input index of cached note k. Validation errors use input indices.
+    caching every note at its input index. `notes_summary` summarizes cached notes; an empty `head` marks a
+    position-only entry. For position checks, omit body sources and supply `file` and optional `line` or
+    `old_line`; mix them with bodied notes in one batch. Selected position-only entries require approved overrides.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
     With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
     snapshots and outcomes. A filename is not approval. To preview overrides, send `batch_id`, `validate_only=true`,
@@ -1373,14 +1397,15 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     frozen bodies. Get fresh explicit APPROVE for the final content, then post the new handle without validate_only.
     Later overrides or extras need their own final-text approval.
     A handle is not approval. It expires after 30 minutes, eviction, or restart; a posting attempt consumes it,
-    including failed preflight or invalid indices.
+    including failed preflight or invalid indices. A missing override for a selected position-only entry is the
+    exception: nothing is attempted and the handle stays valid.
 
-    With batch_id, `indices` selects compact zero-based cache indices in posting order; omit it for the whole batch.
-    `body_overrides` uses compact cache indices; selected bodyless entries require overrides, others retain snapshots.
+    With batch_id, `indices` selects zero-based cache indices in posting order; omit it for the whole batch.
+    `body_overrides` uses the same indices; selected position-only entries require overrides, others keep snapshots.
     Indices must be unique/in range.
     Show changed final text and get explicit APPROVE again. `extra_notes` appends approved new notes without resending
     cached ones. Selected notes plus extras must total at most 20. Extras cannot be selected/overridden; their result
-    indices start at the full compact batch length. Posting result indices refer to the compact batch and extras.
+    indices start at the full cached batch length. Posting result indices refer to the cached batch and extras.
 
     All selected final bodies and fresh SHA/path/position checks must pass before any write. `head_sha` is required
     with notes, optional with batch_id (stored SHA reused); live checks still run. General notes skip diff reads but
@@ -1443,11 +1468,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             head_sha = cached_batch.head_sha
             cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
             notes, selected_indices = _select_review_notes(cached_notes, indices)
-            for index, note in zip(selected_indices, notes, strict=True):
-                if note.body is None and note.body_path is None:
-                    raise ToolError(  # noqa: TRY003
-                        f"Cached index {index} requires a body_overrides entry before posting or re-preview."
-                    )
+            _require_selected_overrides(ctx, batch_id, cached_batch, notes, selected_indices)
             notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
         # Unreachable after the checks above; this narrows both types for the checker.
         if notes is None or head_sha is None:
