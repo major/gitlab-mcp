@@ -9,7 +9,7 @@ from urllib.parse import quote
 lazy from collections.abc import Generator
 
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 lazy from fastmcp import Context
 
 from gitlab_mcp.app import get_client, get_review_batch_cache, mcp
@@ -39,6 +39,8 @@ REVIEW_NOTE_SUMMARY_HEAD_CAP = 60
 REVIEW_NOTE_BLOB_CAP = 131_072
 # One call writes at most this many notes, even when extra_notes are added to a cached batch. 🧱
 REVIEW_NOTE_CALL_CAP = 20
+# Keys a body_dir note file may set in its front matter. 🧭
+FRONT_MATTER_KEYS = frozenset({"file", "line", "old_line"})
 PEOPLE_SKIPPED_WARNING = "Reviewers and assignees were not changed because not every note posted."
 
 
@@ -206,6 +208,11 @@ class PostReviewNotesResult(BaseModel):
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    body_files: list[str] = Field(
+        default_factory=list,
+        description="Only when notes came from body_dir files: file names in note index order.",
+        exclude_if=lambda value: not value,
+    )
     notes_summary: dict[str, list[ReviewNoteSummary]] = Field(
         default_factory=dict,
         description=(
@@ -387,6 +394,73 @@ def _resolve_body_path(body_path: str, body_dir: str | None) -> str:
     if not resolved.is_relative_to(base):
         raise_review_preflight_error("body_path must stay inside body_dir")
     return str(resolved)
+
+
+def _split_front_matter(text: str) -> tuple[dict[str, str], str]:
+    """Split an optional `---` front-matter block of `key: value` lines from a note body.
+
+    Only `file`, `line`, and `old_line` are allowed. This is a tiny parser on purpose, not YAML. 🪶
+    """
+    # Some editors save a UTF-8 BOM, which would hide the opening --- line. 🧹
+    text = text.removeprefix("\ufeff")
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    end = next((index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"), None)
+    if end is None:
+        raise_review_preflight_error("front matter has no closing --- line")
+    fields: dict[str, str] = {}
+    for line in filter(str.strip, lines[1:end]):
+        key, separator, value = (part.strip() for part in line.partition(":"))
+        if not separator or key not in FRONT_MATTER_KEYS or key in fields:
+            raise_review_preflight_error(f"unknown or repeated front matter line: {line.strip()[:80]}")
+        # Agents often quote YAML strings, so accept one pair of matching quotes. 🙂
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":  # noqa: PLR2004 - two quote characters.
+            value = value[1:-1]
+        fields[key] = value
+    return fields, "".join(lines[end + 1 :]).lstrip("\r\n")
+
+
+def _note_from_file(path: str) -> ReviewNote:
+    """Build one note from a file: front matter sets the position, and the rest is the body."""
+    text = read_server_local_utf8_file(path, path_field="body_path", size_field="body", byte_limit=REVIEW_NOTE_BODY_CAP)
+    fields, body = _split_front_matter(text)
+    lines: dict[str, int] = {}
+    for key in ("line", "old_line"):
+        if key in fields:
+            if not (fields[key].isascii() and fields[key].isdecimal()):
+                raise_review_preflight_error(f"{key} must be a positive whole number")
+            lines[key] = int(fields[key])
+    try:
+        return ReviewNote(file=fields.get("file"), line=lines.get("line"), old_line=lines.get("old_line"), body=body)
+    except ValidationError as exc:
+        # Report only the first short reason, not pydantic's long multi-line error text.
+        raise_review_preflight_error(str(exc.errors()[0]["msg"]), cause=exc)
+
+
+def _load_body_dir_notes(body_dir: str, preview_path: str | None) -> tuple[list[ReviewNote], list[str]]:
+    """Load every `.md` file directly inside `body_dir` as a note, sorted by file name.
+
+    Errors name the file and stop the call before any GitLab request.
+    """
+    # A preview written into body_dir would be loaded as a note on the next call. 🙈
+    if preview_path is not None and Path(preview_path).resolve().parent == Path(body_dir).resolve():
+        raise ToolError("preview_path must be outside body_dir when notes come from body_dir.")  # noqa: TRY003
+    # Skip hidden files, such as macOS ._x.md metadata files, which are not notes.
+    names = sorted(
+        path.name for path in Path(body_dir).glob("*.md") if not path.name.startswith(".") and path.is_file()
+    )
+    if not names:
+        raise ToolError("body_dir has no .md note files.")  # noqa: TRY003
+    if len(names) > REVIEW_NOTE_CALL_CAP:
+        raise ToolError(f"body_dir has more than {REVIEW_NOTE_CALL_CAP} .md note files.")  # noqa: TRY003
+    notes: list[ReviewNote] = []
+    for name in names:
+        try:
+            notes.append(_note_from_file(_resolve_body_path(name, body_dir)))
+        except (OSError, ValueError) as exc:
+            raise ToolError(f"{name}: {str(exc)[:REVIEW_NOTE_REASON_CAP]}") from exc  # noqa: TRY003
+    return notes, names
 
 
 def _read_review_note_body(note: ReviewNote, body_dir: str | None) -> str:
@@ -1292,7 +1366,7 @@ async def _add_people_after_posts(  # noqa: PLR0913, PLR0917 - each argument is 
         "openWorldHint": True,
     }
 )
-async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the public contract keeps its checks explicit.
+async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 - the public contract keeps its checks explicit.
     ctx: Context,
     project: Project,
     iid: Iid,
@@ -1321,7 +1395,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         Field(
             min_length=1,
             max_length=REVIEW_NOTE_CALL_CAP,
-            description="Notes to validate or post. Required unless batch_id is set.",
+            description="Notes to validate or post. Required unless batch_id is set or body_dir loads note files.",
         ),
     ] = None,
     extra_notes: Annotated[
@@ -1386,7 +1460,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
             min_length=1,
             description=(
                 "Absolute server-local directory. Relative body_path values in notes and body_overrides resolve "
-                "inside it, so each note can send only a short file name."
+                "inside it, so each note can send only a short file name. Without notes and batch_id, every .md "
+                "file in it becomes a note, sorted by name; optional front matter (---, file:, line: or old_line:, "
+                "---) sets the position and is not posted."
             ),
         ),
     ] = None,
@@ -1400,7 +1476,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     Like `glab mr note create`. Omit file for general notes; set file for file-level notes, or file and one
     line coordinate for inline notes. Bodies containing truncation markers are rejected.
 
-    Provide exactly one of `notes` or `batch_id`. First use `notes`, full `head_sha`, and `validate_only=true` to
+    Send `notes`, `batch_id`, or only `body_dir`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
     caching every note at its input index. `notes_summary` groups cached-note rows by file; a row without `head`
     marks a position-only entry. For position checks, omit body sources and supply `file` and optional `line` or
@@ -1440,15 +1516,16 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
     `unattempted` identifies skipped notes.
     `add_reviewers`/`add_assignees` run only after every note posts, never during validation.
     """
-    if (notes is None) == (batch_id is None):
-        raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
+    load_body_dir = notes is None and batch_id is None and body_dir is not None
+    if (notes is None) == (batch_id is None) and not load_body_dir:
+        raise ToolError("Provide exactly one of notes or batch_id, or body_dir alone to load note files.")  # noqa: TRY003
     if preview_path is not None:
         if not validate_only:
             raise ToolError("preview_path requires validate_only.")  # noqa: TRY003
         if not preview_path.strip() or "\x00" in preview_path or not Path(preview_path).is_absolute():
             raise ToolError("preview_path must be an absolute server-local path without NUL.")  # noqa: TRY003
-    if notes is not None and head_sha is None:
-        raise ToolError("head_sha is required with notes.")  # noqa: TRY003
+    if batch_id is None and head_sha is None:
+        raise ToolError("head_sha is required with notes or body_dir.")  # noqa: TRY003
     if batch_id is not None and not batch_id.strip():
         raise ToolError("batch_id must not be blank.")  # noqa: TRY003
     if validate_only and batch_id is not None:
@@ -1464,6 +1541,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         raise ToolError("extra_notes can only be used with batch_id.")  # noqa: TRY003
     if body_dir is not None and not Path(body_dir).is_absolute():
         raise ToolError("body_dir must be an absolute server-local directory.")  # noqa: TRY003
+    body_files: list[str] = []
+    if load_body_dir and body_dir is not None:
+        notes, body_files = _load_body_dir_notes(body_dir, preview_path)
     if not validate_only and any(
         note.body is None and note.body_path is None for note in [*(notes or []), *(extra_notes or [])]
     ):
@@ -1495,6 +1575,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0917 - the publ
         result = result.model_copy(update={"preview_path": preview_path})
     result = result.model_copy(
         update={
+            "body_files": body_files,
             "results": [row.model_copy(update={"index": selected_indices[row.index]}) for row in result.results],
         }
     )
