@@ -333,9 +333,9 @@ async def test_cached_batch_repreview_freezes_full_batch(
     assert new != old
     text = preview.read_text(encoding="utf-8")
     expected = ["inline replacement", "second", "file replacement"] if with_overrides else ["first", "second", "third"]
-    assert result.structured_content["notes_summary"] == [
-        {"index": index, "position": "general", "head": value} for index, value in enumerate(expected)
-    ]
+    assert result.structured_content["notes_summary"] == {
+        "general": [{"index": index, "head": value} for index, value in enumerate(expected)]
+    }
     for index, value in enumerate(expected):
         assert f"cached index {index}" in text
         assert value in text
