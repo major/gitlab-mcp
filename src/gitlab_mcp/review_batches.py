@@ -79,13 +79,25 @@ class ReviewBatchCache:
             expires_at=time.monotonic() + self.TTL_SECONDS,
             size_bytes=size_bytes,
         )
+        self._store(batch_id, batch)
+        return batch_id
+
+    def restore(self, batch_id: str, batch: CachedReviewBatch) -> None:
+        """Put back a claimed batch after a rejection that attempted nothing, keeping its id and expiry.
+
+        Call this only before any await or GitLab request, so no other attempt can have used the handle. An
+        expired batch needs no special case: the next `claim` purges it. ♻️
+        """
+        self._store(batch_id, batch)
+
+    def _store(self, batch_id: str, batch: CachedReviewBatch) -> None:
+        """Insert a batch, evicting the oldest ones first when count or byte limits would be exceeded."""
         while self._batches and (
-            len(self._batches) >= self.MAX_BATCHES or self._cache_bytes + size_bytes > self.MAX_CACHE_BYTES
+            len(self._batches) >= self.MAX_BATCHES or self._cache_bytes + batch.size_bytes > self.MAX_CACHE_BYTES
         ):
             self._evict_oldest()
         self._batches[batch_id] = batch
-        self._cache_bytes += size_bytes
-        return batch_id
+        self._cache_bytes += batch.size_bytes
 
     def claim(self, batch_id: str, project: str, iid: int, head_sha: str | None) -> CachedReviewBatch:
         """Consume a batch, even if its project, merge request, or head SHA does not match.
