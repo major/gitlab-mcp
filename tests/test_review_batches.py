@@ -403,15 +403,59 @@ async def test_position_only_batch_repreview_requires_all_bodies(
         assert retried.structured_content["posted_count"] == TWO_POSTS
 
 
+@respx.mock
+async def test_repreview_selects_and_extends_batch(review_client: Client, tmp_path: Path) -> None:
+    """Re-preview can drop cached notes and add extras, renumbering the new batch in posting order 🔢."""
+    # Arrange
+    add_preflight()
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"body": "keep"}, {"body": "drop"}, {"file": "src.py", "line": 1}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+    old = prepared.structured_content["batch_id"]
+    preview = tmp_path / "preview.md"
+
+    # Act
+    result = await call_review(
+        review_client,
+        **note_args(
+            batch_id=old,
+            validate_only=True,
+            preview_path=str(preview),
+            indices=[2, 0],
+            body_overrides=[{"index": 2, "body": "low note"}],
+            extra_notes=[{"body": "new finding"}],
+        ),
+    )
+
+    # Assert
+    assert not result.is_error
+    data = result.structured_content
+    assert data["validated_count"] == THREE_NOTES
+    assert data["notes_summary"] == {
+        "src.py": [{"index": 0, "line": 1, "head": "low note"}],
+        "general": [{"index": 1, "head": "keep"}, {"index": 2, "head": "new finding"}],
+    }
+    text = preview.read_text(encoding="utf-8")
+    assert "cached index 2" in text
+    assert "drop" not in text
+    assert not post_route.called
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=old)))
+    posted = await call_review(review_client, **note_args(batch_id=data["batch_id"]))
+    assert posted.structured_content["posted_count"] == THREE_NOTES
+    assert [json.loads(call.request.content)["body"] for call in post_route.calls] == [
+        "low note",
+        "keep",
+        "new finding",
+    ]
+
+
 @pytest.mark.parametrize(
     "extra",
     [
-        {"indices": [0]},
-        {"extra_notes": [{"body": "extra"}]},
         {"preview_path": "relative.md"},
         {"validate_only": False},
     ],
-    ids=["indices", "extras", "relative-path", "posting-preview"],
+    ids=["relative-path", "posting-preview"],
 )
 @respx.mock
 async def test_repreview_early_rejection_preserves_batch(
