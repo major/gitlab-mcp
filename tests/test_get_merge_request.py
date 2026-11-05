@@ -2032,6 +2032,18 @@ async def test_focused_description_reads_return_only_requested_parts(gitlab_env,
             id="continuation-page",
         ),
         pytest.param({"headings_only": True}, "require include_description=true", False, id="no-description"),
+        pytest.param(
+            {"include_description": True, "section": "Scope", "headings_only": True},
+            "cannot be used together",
+            False,
+            id="section-with-headings-only",
+        ),
+        pytest.param(
+            {"include_description": True, "headings_only": True, "description_limit": 0},
+            "require description_limit greater than 0",
+            False,
+            id="zero-limit",
+        ),
     ],
 )
 @respx.mock
