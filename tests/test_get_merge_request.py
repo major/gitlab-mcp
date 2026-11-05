@@ -252,6 +252,8 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
                 "include_commits_behind": True,
                 "section": "missing",
                 "headings_only": True,
+                "find": ["x"],
+                "find_context": 2,
                 "issue_key_pattern": "[",
                 "issue_key_prefixes": ["INVALID"],
             },
@@ -1976,6 +1978,118 @@ async def test_graphql_errors_are_reported(gitlab_env):
 SECTIONED_DESCRIPTION = (
     "Intro\n\n## Summary\n\nShort summary.\n\n## Scope\n\nTwo files.\n\n```md\n## Not a heading\n```\n"
 )
+
+
+@respx.mock
+async def test_find_renders_exact_lines_offsets_and_merged_context(gitlab_env):
+    """Find preserves CRLF, tabs, Unicode offsets, and overlapping context at both ends."""
+    # Arrange
+    description = "é start\r\nalpha\tBETA\r\nnear\nalpha BETA\nend"
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, find=["alpha", "BETA"], find_context=2)
+
+    # Assert
+    assert data["find_matches"] == (
+        "line\toffset\tterms\tcut\ttext\n"
+        '1\t0\t\t\t"é start\\r"\n'
+        '2\t9\t1,2\t\t"alpha\\tBETA\\r"\n'
+        '3\t21\t\t\t"near"\n'
+        '4\t26\t1,2\t\t"alpha BETA"\n'
+        '5\t37\t\t\t"end"'
+    )
+    assert data["description_hash"] == hashlib.sha256(description.encode()).hexdigest()
+    assert (
+        not {"description", "description_truncated", "next_description_offset", "find_missing", "find_truncated"}
+        & data.keys()
+    )
+
+
+@respx.mock
+async def test_find_scans_after_hit_cap_for_missing_terms(gitlab_env):
+    """Terms beyond the rendered hit cap are found, while genuinely missing terms are reported."""
+    # Arrange
+    description = "hit\n" * 101 + "late"
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, find=["hit", "late", "absent"])
+
+    # Assert
+    assert len(data["find_matches"].splitlines()) == 101  # noqa: PLR2004 - header plus 100 hit lines.
+    assert data["find_missing"] == ["absent"]
+    assert data["find_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("description", "limit", "context", "expected"),
+    [
+        ("oversized hit", 4, 0, 'line\toffset\tterms\tcut\ttext\n1\t0\t1\ttrue\t"over"'),
+        ("before\nhit\nafter", 3, 1, 'line\toffset\tterms\tcut\ttext\n2\t7\t1\t\t"hit"'),
+        ("hit\nhit", 3, 0, 'line\toffset\tterms\tcut\ttext\n1\t0\t1\t\t"hit"'),
+        # Blank context lines cost no budget, so context must follow only the rendered hits.
+        ("hit\n\n" * 101, 3, 1, 'line\toffset\tterms\tcut\ttext\n1\t0\t1\t\t"hit"\n2\t4\t\t\t""'),
+    ],
+)
+@respx.mock
+async def test_find_budget_omits_or_cuts_rows(gitlab_env, description, limit, context, expected):
+    """Find prioritizes hits, clips an oversized hit, and reports omitted hits or context."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, find=["hit"], find_context=context, description_limit=limit)
+
+    # Assert
+    assert data["find_matches"] == expected
+    assert data["find_truncated"] is True
+
+
+@pytest.mark.parametrize("description", [None, ""])
+@respx.mock
+async def test_find_empty_description(gitlab_env, description):
+    """Null and empty descriptions have no hits and share the empty-string hash."""
+    # Arrange
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
+
+    # Act
+    data = await call_tool(include_description=True, find=["one", "two"])
+
+    # Assert
+    assert data["find_matches"] == "line\toffset\tterms\tcut\ttext"
+    assert data["find_missing"] == ["one", "two"]
+    assert data["description_hash"] == hashlib.sha256(b"").hexdigest()
+    assert "find_truncated" not in data
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"find": ["x"]}, "find requires include_description=true"),
+        ({"include_description": True, "find": ["x"], "section": "Scope"}, "find cannot be combined"),
+        ({"include_description": True, "find": ["x"], "headings_only": True}, "find cannot be combined"),
+        ({"include_description": True, "find": ["x"], "description_offset": 1}, "description_offset must be 0"),
+        ({"include_description": True, "find": ["x"], "description_limit": 0}, "description_limit greater than 0"),
+        ({"find_context": 1}, "find_context requires find"),
+        ({"include_description": True, "find": []}, "1 to 20 terms"),
+        ({"include_description": True, "find": [""]}, "must not contain CR or LF"),
+        ({"include_description": True, "find": ["a\nb"]}, "must not contain CR or LF"),
+        ({"include_description": True, "find": ["a\rb"]}, "must not contain CR or LF"),
+        ({"include_description": True, "find": ["x" * 201]}, "1 to 200 characters"),
+        ({"include_description": True, "find": ["x"] * 21}, "20"),
+    ],
+)
+@respx.mock
+async def test_find_validation_precedes_requests(gitlab_env, arguments, message):
+    """Invalid find arguments fail with a clear message and without making a GitLab request."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=re.escape(message)):
+        await call_tool(**arguments)
+    assert not route.called
 
 
 @pytest.mark.parametrize(

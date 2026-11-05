@@ -3,11 +3,16 @@
 Work items and merge requests share these helpers, so section names match the same way in both tools.
 """
 
+import json
 import re
 from typing import Any, NoReturn
 
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
+
+FIND_TERM_CAP = 20
+FIND_TERM_LENGTH = 200
+FIND_HIT_CAP = 100
 
 
 class DescriptionSection(BaseModel):
@@ -23,24 +28,101 @@ def _raise_tool_error(message: str) -> NoReturn:
     raise ToolError(message)
 
 
-def validate_focus_options(
+def validate_focus_options(  # noqa: PLR0913 - focused reads share these independent options.
     section: str | list[str] | None,
     headings_only: bool,
     include_description: bool,
     description_limit: int,
+    *,
+    find: list[str] | None = None,
+    find_context: int = 0,
 ) -> bool:
-    """Reject bad `section` and `headings_only` combinations before any request, and return whether one is set."""
+    """Reject incompatible focused-read options before any request and return whether one is set."""
     if not isinstance(headings_only, bool):
         _raise_tool_error("headings_only must be a boolean.")
     section_selectors(section)
     if section is not None and headings_only:
         _raise_tool_error("section and headings_only cannot be used together.")
-    focused = section is not None or headings_only
-    if focused and not include_description:
+    section_focused = section is not None or headings_only
+    if section_focused and not include_description:
         _raise_tool_error("section and headings_only require include_description=true.")
-    if focused and description_limit == 0:
+    if section_focused and description_limit == 0:
         _raise_tool_error("section and headings_only require description_limit greater than 0.")
-    return focused
+    if find is None:
+        if find_context:
+            _raise_tool_error("find_context requires find.")
+        return section_focused
+    if section_focused:
+        _raise_tool_error("find cannot be combined with section or headings_only.")
+    if not include_description:
+        _raise_tool_error("find requires include_description=true.")
+    if description_limit == 0:
+        _raise_tool_error("find requires description_limit greater than 0.")
+    _validate_find_terms(find)
+    return True
+
+
+def _validate_find_terms(find: list[str]) -> None:
+    """Reject empty, excessive, multiline, or oversized literal terms."""
+    if not find or len(find) > FIND_TERM_CAP:
+        _raise_tool_error("find requires 1 to 20 terms.")
+    if any(not term or len(term) > FIND_TERM_LENGTH or "\n" in term or "\r" in term for term in find):
+        _raise_tool_error("find terms must be 1 to 200 characters and must not contain CR or LF.")
+
+
+def find_description_lines(description: str, terms: list[str], context: int, limit: int) -> tuple[str, list[str], bool]:
+    """Find literal terms in raw lines and return bounded TSV, missing terms, and truncation status."""
+    lines = description.split("\n")
+    offsets: list[int] = []
+    hits: dict[int, list[int]] = {}
+    found: set[int] = set()
+    offset = 0
+    for index, line in enumerate(lines):
+        offsets.append(offset)
+        offset += len(line) + 1
+        matches = [number for number, term in enumerate(terms, 1) if term in line]
+        if matches:
+            hits[index] = matches
+            found.update(matches)
+
+    missing = [term for number, term in enumerate(terms, 1) if number not in found]
+    rendered: dict[int, tuple[str, bool]] = {}
+    remaining = limit
+    truncated = len(hits) > FIND_HIT_CAP
+    for index in list(hits)[:FIND_HIT_CAP]:
+        if remaining == 0:
+            truncated = True
+            continue
+        text = lines[index][:remaining]
+        cut = len(text) < len(lines[index])
+        rendered[index] = (text, cut)
+        remaining -= len(text)
+        truncated |= cut
+
+    # 🧱 Context only surrounds rendered hits. Empty lines cost no budget, so context around
+    # hits cut by the cap would otherwise add unbounded blank rows.
+    context_lines = {
+        index
+        for hit in list(rendered)
+        for index in range(max(0, hit - context), min(len(lines), hit + context + 1))
+        if index not in hits
+    }
+    for index in sorted(context_lines):
+        text = lines[index]
+        if len(text) > remaining:
+            truncated = True
+            continue
+        rendered[index] = (text, False)
+        remaining -= len(text)
+
+    rows = ["line\toffset\tterms\tcut\ttext"]
+    for index, (text, cut) in sorted(rendered.items()):
+        term_indexes = ",".join(str(number) for number in hits.get(index, []))
+        rows.append(
+            f"{index + 1}\t{offsets[index]}\t{term_indexes}\t{'true' if cut else ''}\t"
+            f"{json.dumps(text, ensure_ascii=False)}"
+        )
+    return "\n".join(rows), missing, truncated
 
 
 def section_selectors(section: str | list[str] | None) -> list[str] | None:

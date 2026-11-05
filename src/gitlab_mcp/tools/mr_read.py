@@ -26,7 +26,12 @@ from gitlab_mcp.common import (
     lower_or_empty,
     page_text,
 )
-from gitlab_mcp.description_sections import DescriptionSection, focused_description, validate_focus_options
+from gitlab_mcp.description_sections import (
+    DescriptionSection,
+    find_description_lines,
+    focused_description,
+    validate_focus_options,
+)
 from gitlab_mcp.errors import ProjectNotFoundError
 from gitlab_mcp.mr_common import (
     ThreadIndex,
@@ -313,6 +318,9 @@ class MergeRequestDetail(BaseModel):
     description_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
     headings: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)  # headings_only=true
     sections: list[DescriptionSection] | None = Field(default=None, exclude_if=lambda value: value is None)
+    find_matches: str = Field(default="", exclude_if=lambda value: not value)
+    find_missing: list[str] | None = Field(default=None, exclude_if=lambda value: not value)
+    find_truncated: bool = Field(default=False, exclude_if=lambda value: not value)
     issue_keys: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
     issue_keys_truncated: bool | None = Field(
         default=None,
@@ -802,16 +810,23 @@ def _description_hash(description: str | None) -> str:
     return hashlib.sha256((description or "").encode("utf-8")).hexdigest()
 
 
-def _validate_focus(
+def _validate_focus(  # noqa: PLR0913 - focused reads share these independent options.
     section: str | list[str] | None,
     headings_only: bool,
     include_description: bool,
     description_limit: int,
     description_offset: int,
+    *,
+    find: list[str] | None,
+    find_context: int,
 ) -> bool:
     """Check the shared focused-read options, then reject them on a continuation page."""
-    focused = validate_focus_options(section, headings_only, include_description, description_limit)
+    focused = validate_focus_options(
+        section, headings_only, include_description, description_limit, find=find, find_context=find_context
+    )
     if focused and description_offset > 0:
+        if find is not None:
+            raise ToolError("find reads the whole description, so description_offset must be 0.")  # noqa: TRY003
         raise ToolError("section and headings_only read the whole description, so description_offset must be 0.")  # noqa: TRY003
     return focused
 
@@ -1327,7 +1342,7 @@ async def _add_activity(
     annotations={"readOnlyHint": True, "openWorldHint": True},
     output_schema=GET_MERGE_REQUEST_OUTPUT_SCHEMA,
 )
-async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details each need a branch or argument.
+async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional details need branches and arguments.
     ctx: Context,
     project: Project,
     iid: Iid,
@@ -1443,6 +1458,14 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
             ),
         ),
     ] = False,
+    find: Annotated[
+        list[str] | None,
+        Field(max_length=20, description="Find 1 to 20 case-sensitive literal terms in description lines."),
+    ] = None,
+    find_context: Annotated[
+        int,
+        Field(ge=0, le=3, description="Extra lines before and after each find hit; requires find when nonzero."),
+    ] = 0,
     include_commits: Annotated[
         bool,
         Field(description="Include subjects of the newest 50 commits, oldest first. Ignored on continuation pages."),
@@ -1454,38 +1477,39 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
 ) -> MergeRequestDetail | MergeRequestDescriptionPage | MergeRequestStatus:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
-    `merge_status` determines mergeability; open threads and failed CI do not always block merging. `approved` means
-    one approval on Free, all rules passed on Premium/Ultimate. `auto_merge_strategy` identifies checks or train waits.
-    Missing empty fields mean false or empty. `created_at` is YYYY-MM-DD.
+    `merge_status` determines mergeability; threads and CI do not always block merging. `approved` means one approval
+    on Free, all rules passed on Premium/Ultimate. `auto_merge_strategy` identifies checks or train waits.
+    Missing fields mean false or empty. `created_at` is YYYY-MM-DD.
 
-    `threads.open` IDs go to get_merge_request_threads; `index_complete=false` means the index is partial.
-    `include_threads=false` skips the index but keeps counts: open/resolved resolvable discussions and comment-only
-    threads (the latter omitted at zero). Skip thread reads when all three counts are zero. Use batch thread reads
-    for several MRs. `line` is a new-file line; `old_line` identifies a deleted line.
+    `threads.open` IDs go to get_merge_request_threads; `index_complete=false` means a partial index.
+    `include_threads=false` skips the index but keeps open, resolved, and comment-only counts. Skip thread reads when
+    all counts are zero. Batch thread reads for several MRs. `line` is a new-file line; `old_line` is a deleted line.
 
     Use `view=status` for compact rechecks. It ignores detail flags, focus, and description paging.
     After a push, confirm `head_sha` matches the pushed SHA before checking `pipeline_sha` and `pipeline_status`.
     A different pipeline SHA is expected for `pipeline_event_type=merged_result` or `merge_train`, which test merge
     commits; for absent or `detached` event types in the full view it means stale CI. Status omits the event type,
     so use the full view to classify a different pipeline SHA. Missing SHA means unknown, not passed.
-    `latest_pipeline_id` identifies the head pipeline even without jobs. `include_jobs` adds failed-job TSV;
-    `jobs_complete=false` means the scan hit its cap. No head pipeline means no job fetch.
+    `latest_pipeline_id` identifies the head pipeline. `include_jobs` adds failed-job TSV; `jobs_complete=false`
+    means the scan hit its cap. No head pipeline means no job fetch.
 
-    Descriptions are opt-in. With `include_description=true`, follow `next_description_offset` to continue, or set
-    `description_limit` up to 12000 to read a long description in one call.
-    Nonzero offsets return description-only pages and ignore detail flags. Pages allow a final tail up to 25% above
-    `description_limit`. Set `include_description_hash=true` on page one; compare the full raw UTF-8 SHA-256 hash
-    (`description_hash`, null treated as empty) on later pages and restart if changed.
+    Descriptions are opt-in. With `include_description=true`, follow `next_description_offset` or set
+    `description_limit` up to 12000. Nonzero offsets return description-only pages and ignore detail flags. Pages allow
+    a final tail up to 25% above the limit. Set `include_description_hash=true` on page one; compare the raw UTF-8
+    SHA-256 `description_hash` (null treated as empty) on later pages and restart if changed.
     `headings_only` lists ATX headings outside fences. `section` matches case-insensitive exact headings or unique
     leading words/IDs; a string returns description, a list returns sections. Unknown headings list available ones.
     Focused reads require a positive limit, reject offsets, and share one total content cap.
+    `find` returns matching lines with 1-based line numbers, code-point offsets usable as `description_offset`, and
+    JSON-encoded text to decode and copy into edit `old_text`; `find_missing` and `find_truncated` report omissions.
+    It includes `description_hash` for `edit_merge_request_description(expected_hash=...)`.
 
     `issue_keys` contains up to 100 unique title/raw-description keys. Default extraction skips partial advisory IDs
-    such as CVE-2024-1 or RHSA-2026:1234. Literal `issue_key_prefixes` keep such partials; `issue_key_pattern` replaces
-    extraction, preserves full matches/case, and cannot be combined with prefixes. `issue_keys_truncated` flags limits.
-    `include_labels` adds up to 100 labels with `labels_truncated` when needed. `blocked_by` lists blocking IIDs;
-    `hidden_blockers` flags invisible blockers. Optional `commits_behind` is open-MR only and omitted if unavailable.
-    `include_commits` returns the newest 50 commits in oldest-first order as nine-character SHAs and subjects;
+    such as CVE-2024-1 or RHSA-2026:1234. `issue_key_prefixes` keep partials; `issue_key_pattern` replaces extraction,
+    preserves full matches/case, and cannot be combined with prefixes. `issue_keys_truncated` flags limits.
+    `include_labels` adds up to 100 labels; `labels_truncated` flags omissions. `blocked_by` lists blocking IIDs;
+    `hidden_blockers` flags invisible blockers. `commits_behind` is open-MR only and omitted if unavailable.
+    `include_commits` returns the newest 50 commits oldest-first as nine-character SHAs and subjects;
     `commits_truncated` means older commits were omitted. Use `api_get(resource='mr_commits')` for full messages
     and trailers.
     """
@@ -1493,7 +1517,15 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
         node = await fetch_merge_request(get_client(ctx), MERGE_REQUEST_STATUS_QUERY, project, iid)
         return _to_status(node)
     _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
-    focused = _validate_focus(section, headings_only, include_description, description_limit, description_offset)
+    focused = _validate_focus(
+        section,
+        headings_only,
+        include_description,
+        description_limit,
+        description_offset,
+        find=find,
+        find_context=find_context,
+    )
     include_description = include_description and description_limit > 0
     custom_issue_key_pattern = _compile_issue_key_pattern(issue_key_pattern, issue_key_prefixes)
     client = get_client(ctx)
@@ -1536,7 +1568,15 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
         # GitLab returns the newest commits first; reverse only the selected page, not the full history.
         detail.commits = [f"{commit['sha'][:9]} {commit['title']}" for commit in reversed(commits[:50])]
         detail.commits_truncated = connection["pageInfo"]["hasNextPage"] or len(commits) > 50  # noqa: PLR2004
-    if focused:
+    if find is not None:
+        detail.find_matches, detail.find_missing, detail.find_truncated = find_description_lines(
+            node.get("description") or "", find, find_context, description_limit
+        )
+        detail.description = ""
+        detail.description_truncated = False
+        detail.next_description_offset = None
+        detail.description_hash = _description_hash(node.get("description"))
+    elif focused:
         _focus_description(detail, node.get("description") or "", section, headings_only, description_limit)
     if include_description_hash:
         detail.description_hash = _description_hash(node.get("description"))
