@@ -1386,7 +1386,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
             description=(
                 "Unique zero-based cached batch indices (same as input indices) to post, in posting order. "
                 "Requires batch_id. Omit to post every note in the batch, which needs body_overrides for every "
-                "position-only entry. Not allowed when re-previewing a batch."
+                "position-only entry. In a re-preview, picks the cached notes the new batch keeps, in this order."
             ),
         ),
     ] = None,
@@ -1405,7 +1405,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
             max_length=REVIEW_NOTE_CALL_CAP,
             description=(
                 "Approved notes to post after the cached batch notes, without resending the batch. Requires batch_id. "
-                "Result rows number them after the full cached batch."
+                "Result rows number them after the full cached batch. In a re-preview, they join the new batch "
+                "after the selected notes."
             ),
         ),
     ] = None,
@@ -1423,7 +1424,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
             description=(
                 "Run checks without posting. If all pass, cache every note at its input index; bodyless notes are "
                 "cached as position-only entries. "
-                "With batch_id, requires preview_path and re-previews the full batch."
+                "With batch_id, requires preview_path and re-previews the selected notes plus extras as a new batch."
             )
         ),
     ] = False,
@@ -1483,12 +1484,12 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
     `old_line`; mix them with bodied notes in one batch. Selected position-only entries require approved overrides.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
     With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
-    snapshots and outcomes. A filename is not approval. To preview overrides, send `batch_id`, `validate_only=true`,
-    and a new `preview_path`, optionally with `body_overrides`. This re-previews the full batch, so omit `indices`
-    and `extra_notes`, and supply a body for every cached entry. It consumes the old handle after claim, even when
-    validation fails; early argument and preview path errors do not consume it. Success returns a new handle with
-    frozen bodies. Get fresh explicit APPROVE for the final content, then post the new handle without validate_only.
-    Later overrides or extras need their own final-text approval.
+    snapshots and outcomes. A filename is not approval. To re-preview, send `batch_id`, `validate_only=true`, a new
+    `preview_path`, and optional `body_overrides`, `indices`, or `extra_notes`. The new batch holds selected notes,
+    then extras; reply indices use that order. Every selected cached entry needs a body. It consumes the old handle
+    after claim, even when validation fails; early argument and preview path errors do not. Success returns a new
+    handle with frozen bodies. Get fresh explicit APPROVE for the final content, then post the new handle without
+    validate_only. Later overrides or extras need their own final-text approval.
     A handle is not approval. It expires after 30 minutes, eviction, or restart; a posting attempt consumes it,
     including failed preflight or invalid indices. A missing override for a selected position-only entry is the
     exception: nothing is attempted and the handle stays valid.
@@ -1528,11 +1529,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
         raise ToolError("head_sha is required with notes or body_dir.")  # noqa: TRY003
     if batch_id is not None and not batch_id.strip():
         raise ToolError("batch_id must not be blank.")  # noqa: TRY003
-    if validate_only and batch_id is not None:
-        if preview_path is None:
-            raise ToolError("validate_only with batch_id requires preview_path.")  # noqa: TRY003
-        if indices is not None or extra_notes is not None:
-            raise ToolError("Batch re-preview does not allow indices or extra_notes.")  # noqa: TRY003
+    if validate_only and batch_id is not None and preview_path is None:
+        raise ToolError("validate_only with batch_id requires preview_path.")  # noqa: TRY003
     if body_overrides is not None and batch_id is None:
         raise ToolError("body_overrides can only be used with batch_id.")  # noqa: TRY003
     if indices is not None and batch_id is None:
@@ -1567,6 +1565,9 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
             notes, selected_indices = _select_review_notes(cached_notes, indices)
             _require_selected_overrides(ctx, batch_id, cached_batch, notes, selected_indices)
             notes, selected_indices = _append_extra_notes(notes, selected_indices, len(cached_notes), extra_notes)
+            if validate_only:
+                # A re-preview freezes a new batch in this order, so every reply index refers to that batch. 🔢
+                selected_indices = list(range(len(notes)))
         # Unreachable after the checks above; this narrows both types for the checker.
         if notes is None or head_sha is None:
             raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
