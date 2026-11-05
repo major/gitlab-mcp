@@ -84,8 +84,9 @@ mcp = FastMCP(
         "include_commits=true for commit order and subjects). "
         'Use get_merge_request(view="status") for rechecks; it omits the pipeline event type, so use the full view '
         "to classify a different pipeline SHA as merged-result, train, or stale CI. "
-        "For long descriptions, pass the returned next offset as description_offset with include_description=true; "
-        "restart if the merge request is edited. To read part of a long description, list its headings with "
+        "For long descriptions, set description_limit up to 12000 to read them in one call, or pass the returned "
+        "next offset as description_offset with include_description=true; restart if the merge request is edited. "
+        "To read part of a long description, list its headings with "
         "headings_only=true, then read only the parts you need with section. "
         "Use get_merge_request_diff without paths for the file list, then with paths=[...] for patches. "
         "For CI triage, use list_pipelines to find a pipeline, get_pipeline to inspect its jobs, then get_job_log "

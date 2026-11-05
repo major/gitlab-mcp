@@ -181,6 +181,8 @@ BLOCKED_STATUS = "blocked_status"
 
 # Long descriptions are cut to keep one tool result small. The flag tells the agent it was cut.
 DESCRIPTION_CAP = 4000
+# 📑 get_merge_request callers may ask for a bigger page, so a long templated description fits in one call.
+DESCRIPTION_PAGE_MAX = 12000
 # Default issue-key parsing uses fixed stdlib patterns; custom patterns have separate limits below.
 ISSUE_KEY_CAP = 100
 ISSUE_KEY_PREFIX_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,31}")
@@ -1384,10 +1386,11 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
         int,
         Field(
             ge=0,
-            le=DESCRIPTION_CAP,
+            le=DESCRIPTION_PAGE_MAX,
             description=(
-                "Maximum description page length in characters, from 0 to 4000. The limit is soft: a final tail "
-                "up to a quarter of it is included to save a call."
+                "Maximum description page length in characters, from 0 to 12000; defaults to 4000. Raise it to "
+                "read a long description in one call. The limit is soft: a final tail up to a quarter of it is "
+                "included to save a call."
             ),
         ),
     ] = DESCRIPTION_CAP,
@@ -1468,7 +1471,8 @@ async def get_merge_request(  # noqa: C901, PLR0913, PLR0917 - optional details 
     `latest_pipeline_id` identifies the head pipeline even without jobs. `include_jobs` adds failed-job TSV;
     `jobs_complete=false` means the scan hit its cap. No head pipeline means no job fetch.
 
-    Descriptions are opt-in. With `include_description=true`, follow `next_description_offset` to continue.
+    Descriptions are opt-in. With `include_description=true`, follow `next_description_offset` to continue, or set
+    `description_limit` up to 12000 to read a long description in one call.
     Nonzero offsets return description-only pages and ignore detail flags. Pages allow a final tail up to 25% above
     `description_limit`. Set `include_description_hash=true` on page one; compare the full raw UTF-8 SHA-256 hash
     (`description_hash`, null treated as empty) on later pages and restart if changed.

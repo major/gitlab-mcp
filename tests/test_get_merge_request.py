@@ -16,7 +16,7 @@ from fastmcp.exceptions import ToolError
 from gitlab_mcp import mcp
 from gitlab_mcp.common import MAX_PAGES
 from gitlab_mcp.tools import mr_read
-from gitlab_mcp.tools.mr_read import DESCRIPTION_CAP, ISSUE_KEY_SCAN_CAP, THREAD_INDEX_CAP
+from gitlab_mcp.tools.mr_read import DESCRIPTION_CAP, DESCRIPTION_PAGE_MAX, ISSUE_KEY_SCAN_CAP, THREAD_INDEX_CAP
 from mcp_helpers import call_tool as call_mcp_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -987,6 +987,9 @@ async def test_auto_merge_strategy_is_returned_raw(gitlab_env, strategy):
         (DESCRIPTION_CAP, DESCRIPTION_CAP, (DESCRIPTION_CAP, False, None)),
         (DESCRIPTION_CAP, DESCRIPTION_CAP + 1000, (DESCRIPTION_CAP + 1000, False, None)),
         (DESCRIPTION_CAP, DESCRIPTION_CAP + 1001, (DESCRIPTION_CAP, True, DESCRIPTION_CAP)),
+        # 📑 A raised limit reads a long templated description in one call, and still pages past its tail.
+        (DESCRIPTION_PAGE_MAX, 8000, (8000, False, None)),
+        (DESCRIPTION_PAGE_MAX, DESCRIPTION_PAGE_MAX * 5 // 4 + 1, (DESCRIPTION_PAGE_MAX, True, DESCRIPTION_PAGE_MAX)),
     ],
 )
 @respx.mock
@@ -1760,15 +1763,21 @@ async def test_issue_keys_are_capped_at_one_hundred(gitlab_env):
     assert data["issue_keys_truncated"] is True
 
 
-@pytest.mark.parametrize("description_limit", [-1, DESCRIPTION_CAP + 1])
+@pytest.mark.parametrize(
+    ("description_limit", "message"),
+    [
+        (-1, "greater than or equal to 0"),
+        (DESCRIPTION_PAGE_MAX + 1, f"less than or equal to {DESCRIPTION_PAGE_MAX}"),
+    ],
+)
 @respx.mock
-async def test_description_limit_must_be_between_zero_and_cap(gitlab_env, description_limit):
-    """The requested description limit cannot exceed the supported range."""
+async def test_description_limit_must_be_between_zero_and_page_max(gitlab_env, description_limit, message):
+    """The requested description limit cannot exceed the supported range, and the error names the bound."""
     # Arrange
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
 
     # Act / Assert
-    with pytest.raises(ToolError):
+    with pytest.raises(ToolError, match=message):
         await call_tool(description_limit=description_limit)
     assert route.call_count == 0
 

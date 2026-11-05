@@ -1491,7 +1491,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
 
     Send `notes`, `batch_id`, or only `body_dir`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching every note at its input index. `notes_summary` groups bodied-note rows by file, and
+    caching each note at its input index. `notes_summary` groups bodied-note rows by file, and
     `position_only_indices` lists the position-only entries. For position checks, omit body sources and supply
     `file` and optional `line` or `old_line`; mix them with bodied notes in one batch. Selected position-only
     entries require approved overrides.
@@ -1510,7 +1510,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
     With batch_id, `indices` selects zero-based cache indices in posting order; omit it for the whole batch.
     `body_overrides` uses the same indices; selected position-only entries require overrides, others keep snapshots.
     Indices must be unique/in range.
-    Show changed final text and get explicit APPROVE again. `extra_notes` appends approved new notes without resending
+    Show changed final text and get fresh APPROVE. `extra_notes` appends approved new notes without resending
     cached ones. Selected notes plus extras must total at most 20. Extras cannot be selected/overridden; their result
     indices start at the full cached batch length. Posting result indices refer to the cached batch and extras.
 
