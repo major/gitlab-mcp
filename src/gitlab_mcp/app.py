@@ -71,7 +71,8 @@ mcp = FastMCP(
         "use reply_to_threads for batched replies and post-write approval and auto-merge summaries; "
         "use resolve_open_threads to close every open thread, and "
         "use edit_merge_request_description to update the description; prefer edits=[...] for several changes "
-        "instead of a loop. "
+        "instead of a loop. Preview with validate_only=true, show the user, and after APPROVE send the same edits "
+        "with expected_hash set to the returned base_hash. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
         'With state="all", resolved threads default to headings; set resolved_view="full" for full notes. '
         "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "
@@ -130,7 +131,7 @@ mcp = FastMCP(
         "get_merge_request_note(project, iid, note_id, body_offset, body_limit); "
         "edit_merge_request_note(project, iid, thread_id, note_id, expected_hash, body, old_text, new_text); "
         "edit_merge_request_description(project, iid, old_text, new_text, edits=[{old_text, new_text}], "
-        "return_diff); "
+        "return_diff, validate_only, expected_hash); "
         "post_review_notes(project, iid, head_sha (optional with batch_id), notes=[{file, line or old_line "
         "(neither for a file-level note), body or body_path}] or batch_id or body_dir alone (one .md note file "
         "each, front matter file/line/old_line), indices, "

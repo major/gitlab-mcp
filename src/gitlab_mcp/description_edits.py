@@ -4,6 +4,7 @@ Each helper reads the full description, applies exact replacements, and writes t
 whole description back once. Nothing is written unless every match is unique.
 GitLab has no compare-and-swap for descriptions, so a concurrent edit can still
 be overwritten. Writes are never retried.
+An expected hash detects a stale read but cannot stop a change between this tool's GET and PUT.
 """
 
 import difflib
@@ -53,16 +54,27 @@ class DescriptionEditResult(BaseModel):
     """The outcome of one exact-text edit, kept small for the agent.
 
     `changed_lines` is a zero-context unified diff of the whole description, so
-    its `@@` headers carry real line numbers. It is only filled when the write was
-    applied. `truncated` is true when the diff was cut to its requested character
-    limit. `description_hash` is the SHA-256 hash of the submitted description.
+    its `@@` headers carry real line numbers. It is filled for applied writes and
+    previews. `truncated` is true when the diff was cut to its requested character
+    limit. `description_hash` is the SHA-256 hash of the resulting description.
+    Previews also include the base hash and each edit's match line.
     """
 
-    status: Literal["applied", "failed", "unknown"]
+    status: Literal["applied", "failed", "unknown", "validated"]
     changed_lines: str = Field(default="", exclude_if=lambda value: not value)
     truncated: bool = False
     warning: str = Field(default="", exclude_if=lambda value: not value)
     description_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    base_hash: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="SHA-256 of the description the edits were checked against; pass it as expected_hash on the write",
+    )
+    edit_lines: list[int] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="1-based line where each replacement matched, in input order",
+    )
 
 
 def _raise_edit_error(message: str) -> NoReturn:
@@ -81,8 +93,8 @@ def _validate_edit(old_text: str, new_text: str) -> None:
         _raise_edit_error("old_text and new_text are identical, so there is nothing to change. No write was made.")
 
 
-def _replace_exactly_once(description: str, old_text: str, new_text: str) -> str:
-    """Return `description` with its only match of `old_text` replaced.
+def _replace_exactly_once(description: str, old_text: str, new_text: str) -> tuple[str, int]:
+    """Return the replaced description and the start offset of its only match.
 
     The second search starts one character after the first match. That way
     overlapping matches, such as two "aa" in "aaa", count as two matches.
@@ -95,7 +107,7 @@ def _replace_exactly_once(description: str, old_text: str, new_text: str) -> str
         _raise_edit_error("old_text was not found in the description. No write was made.")
     if description.find(old_text, first + 1) != -1:
         _raise_edit_error("old_text matches more than once. Add nearby text so it matches once. No write was made.")
-    return description[:first] + new_text + description[first + len(old_text) :]
+    return description[:first] + new_text + description[first + len(old_text) :], first
 
 
 def _validated_description_replacements(
@@ -128,10 +140,21 @@ def _validated_description_replacements(
     return replacements
 
 
-def _validate_work_item_options(expected_hash: str | None, diff_limit: int) -> None:
-    """Validate the optional hash guard and diff bounds before fetching the description."""
+def _validate_expected_hash(expected_hash: str | None) -> None:
+    """Validate the optional hash guard before fetching the description."""
     if expected_hash is not None and re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
         _raise_edit_error("expected_hash must be a lowercase 64-character SHA-256 hash.")
+
+
+def _check_expected_hash(before: str, expected_hash: str | None) -> None:
+    """Reject a stale description before making any write."""
+    if expected_hash is not None and hashlib.sha256(before.encode("utf-8")).hexdigest() != expected_hash:
+        _raise_edit_error("expected_hash does not match the current description. No write was made.")
+
+
+def _validate_work_item_options(expected_hash: str | None, diff_limit: int) -> None:
+    """Validate the optional hash guard and diff bounds before fetching the description."""
+    _validate_expected_hash(expected_hash)
     if not 0 <= diff_limit <= DIFF_CAP:
         _raise_edit_error(f"diff_limit must be between 0 and {DIFF_CAP}.")
 
@@ -207,34 +230,55 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     new_text: str | None = None,
     return_diff: bool = True,
     edits: list[DescriptionReplacement] | None = None,
+    expected_hash: str | None = None,
+    validate_only: bool = False,
 ) -> DescriptionEditResult:
     """Apply one or more exact replacements to a merge request's description.
 
     The full description is read first, so nothing is cut before the write. A null
     description counts as empty. Set `return_diff` to false to omit changed lines.
+    With `validate_only`, every replacement is checked and a `validated` preview is
+    returned with `base_hash` and `edit_lines`, but nothing is written. Pass
+    `expected_hash` (for example a preview's `base_hash`) to refuse a stale read.
 
     Raises:
         ToolError: Before any write, when `old_text` is empty, equals `new_text`,
-            or does not match exactly once. Also when the read fails.
+            or does not match exactly once, when `expected_hash` is malformed or
+            does not match the current description, or when the read fails.
     """
     if edits is None and (old_text is None or new_text is None):
         _raise_edit_error("Provide both old_text and new_text, or edits.")
     replacements = cast(
         "list[DescriptionReplacement]", _validated_description_replacements(old_text, new_text, edits, table_cell=None)
     )
+    _validate_expected_hash(expected_hash)
     path = f"/projects/{quote(project, safe='')}/merge_requests/{iid}"
     merge_request = await client.get(path)
     before = merge_request.get("description") or ""
+    _check_expected_hash(before, expected_hash)
     after = before
+    edit_lines = []
     for index, replacement in enumerate(replacements, start=1):
         try:
-            after = _replace_exactly_once(after, replacement.old_text, replacement.new_text)
+            updated, match_start = _replace_exactly_once(after, replacement.old_text, replacement.new_text)
+            edit_lines.append(after.count("\n", 0, match_start) + 1)
+            after = updated
         except ToolError as exc:
             if edits is None:
                 raise
             _raise_edit_error(f"Edit {index} failed: {exc}")
     if after == before:
         _raise_edit_error("The replacements do not change the description. No write was made.")
+    if validate_only:
+        changed, truncated = _changed_lines(before, after) if return_diff else ("", False)
+        return DescriptionEditResult(
+            status="validated",
+            changed_lines=changed,
+            truncated=truncated,
+            description_hash=hashlib.sha256(after.encode("utf-8")).hexdigest(),
+            base_hash=hashlib.sha256(before.encode("utf-8")).hexdigest(),
+            edit_lines=edit_lines,
+        )
     return await _write_edit(client.request("PUT", path, json={"description": after}), before, after, return_diff)
 
 
@@ -271,14 +315,13 @@ async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument 
 
     source = await read_work_item_for_edit(client, project, iid, scope)
     before = source.description
-    if expected_hash is not None and hashlib.sha256(before.encode("utf-8")).hexdigest() != expected_hash:
-        _raise_edit_error("expected_hash does not match the current description. No write was made.")
+    _check_expected_hash(before, expected_hash)
 
     after = replace_table_cell(before, table_cell) if table_cell is not None else before
     if replacements is not None:
         for index, replacement in enumerate(replacements, start=1):
             try:
-                after = _replace_exactly_once(after, replacement.old_text, replacement.new_text)
+                after, _ = _replace_exactly_once(after, replacement.old_text, replacement.new_text)
             except ToolError as exc:
                 _raise_edit_error(f"Edit {index} failed: {exc}")
     if after == before:

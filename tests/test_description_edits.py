@@ -365,6 +365,191 @@ async def test_mr_batch_applies_sequentially_with_one_read_and_write(router, cou
     assert [call.request.method for call in router.calls] == ["GET", "PUT"]
 
 
+@pytest.mark.parametrize("return_diff", [True, False])
+async def test_mr_preview_reports_sequential_match_lines_and_hashes(router, return_diff):
+    """Preview reports each match in the text seen by that edit without writing."""
+    # Arrange
+    before = "first\ntarget"
+    after = "first\ninserted\nchanged"
+    put = serve_merge_request(router, before)
+    edits = [{"old_text": "first", "new_text": "first\ninserted"}, {"old_text": "target", "new_text": "changed"}]
+
+    # Act
+    result = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        edits=edits,
+        validate_only=True,
+        return_diff=return_diff,
+    )
+
+    # Assert
+    assert result["status"] == "validated"
+    assert result["description_hash"] == hashlib.sha256(after.encode()).hexdigest()
+    assert result["base_hash"] == hashlib.sha256(before.encode()).hexdigest()
+    assert result["edit_lines"] == [1, 3]
+    assert result["truncated"] is False
+    if return_diff:
+        assert result["changed_lines"] == "@@ -2 +2,2 @@\n-target\n+inserted\n+changed"
+    else:
+        assert "changed_lines" not in result
+    assert put.call_count == 0
+    assert [call.request.method for call in router.calls] == ["GET"]
+
+
+async def test_mr_preview_truncates_large_diff(router):
+    """A preview applies the same diff cap as a write."""
+    # Arrange
+    put = serve_merge_request(router, "old")
+
+    # Act
+    result = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="old",
+        new_text="x" * DIFF_CAP,
+        validate_only=True,
+    )
+
+    # Assert
+    assert result["truncated"] is True
+    assert len(result["changed_lines"]) == DIFF_CAP
+    assert put.call_count == 0
+
+
+async def test_mr_preview_later_bad_match_never_writes(router):
+    """A later failed preview edit stops the batch before any write."""
+    # Arrange
+    put = serve_merge_request(router, "first")
+    edits = [{"old_text": "first", "new_text": "second"}, {"old_text": "missing", "new_text": "third"}]
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="Edit 2 failed"):
+        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, edits=edits, validate_only=True)
+    assert put.call_count == 0
+    assert [call.request.method for call in router.calls] == ["GET"]
+
+
+@pytest.mark.parametrize("matches", [True, False])
+async def test_mr_expected_hash_guards_write(router, matches):
+    """A current hash permits a write and a stale hash stops it after the read."""
+    # Arrange
+    put = serve_merge_request(router, "one")
+    expected_hash = hashlib.sha256(b"one" if matches else b"stale").hexdigest()
+    arguments = {"project": PROJECT, "iid": IID, "old_text": "one", "new_text": "two", "expected_hash": expected_hash}
+
+    # Act / Assert
+    if matches:
+        result = await call_tool("edit_merge_request_description", **arguments)
+        assert result["status"] == "applied"
+        assert "base_hash" not in result
+        assert "edit_lines" not in result
+        assert [call.request.method for call in router.calls] == ["GET", "PUT"]
+        assert put.call_count == 1
+    else:
+        with pytest.raises(
+            ToolError, match=r"expected_hash does not match the current description\. No write was made"
+        ):
+            await call_tool("edit_merge_request_description", **arguments)
+        assert [call.request.method for call in router.calls] == ["GET"]
+        assert put.call_count == 0
+
+
+async def test_mr_null_description_accepts_empty_hash_before_matching(router):
+    """A null description has the empty-string hash, but cannot contain a nonempty match."""
+    # Arrange
+    put = serve_merge_request(router, None)
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="old_text was not found"):
+        await call_tool(
+            "edit_merge_request_description",
+            project=PROJECT,
+            iid=IID,
+            old_text="one",
+            new_text="two",
+            expected_hash=hashlib.sha256(b"").hexdigest(),
+        )
+    assert [call.request.method for call in router.calls] == ["GET"]
+    assert put.call_count == 0
+
+
+@pytest.mark.parametrize("expected_hash", ["A" * 64, "abc"])
+async def test_mr_invalid_hash_fails_before_read(router, expected_hash):
+    """Invalid hash formats are rejected before sending any request."""
+    # Arrange
+    serve_merge_request(router, "one")
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="expected_hash must be a lowercase 64-character SHA-256 hash"):
+        await call_tool(
+            "edit_merge_request_description",
+            project=PROJECT,
+            iid=IID,
+            old_text="one",
+            new_text="two",
+            expected_hash=expected_hash,
+        )
+    assert not router.calls
+
+
+async def test_mr_find_preview_and_guarded_write_flow(router):
+    """A find hash guards the preview and its base hash guards the identical write."""
+    # Arrange
+    before = "first\ntarget"
+    after = "first\ninserted\nchanged"
+    node = {
+        "iid": str(IID),
+        "description": before,
+        "title": "Title",
+        "state": "opened",
+        "draft": False,
+        "sourceBranch": "feature",
+        "targetBranch": "main",
+        "author": None,
+        "diffRefs": None,
+        "detailedMergeStatus": "MERGEABLE",
+        "shouldBeRebased": False,
+        "conflicts": False,
+        "approved": False,
+        "approvedBy": {"nodes": []},
+        "reviewers": {"nodes": []},
+        "headPipeline": None,
+        "autoMergeStrategy": None,
+        "diffStatsSummary": None,
+        "resolvableDiscussionsCount": 0,
+        "resolvedDiscussionsCount": 0,
+        "userDiscussionsCount": 0,
+        "discussions": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+    }
+    router.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": {"project": {"mergeRequest": node}}}))
+    put = serve_merge_request(router, before)
+    edits = [{"old_text": "first", "new_text": "first\ninserted"}, {"old_text": "target", "new_text": "changed"}]
+
+    # Act
+    found = await call_tool("get_merge_request", project=PROJECT, iid=IID, include_description=True, find=["target"])
+    preview = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        edits=edits,
+        validate_only=True,
+        expected_hash=found["description_hash"],
+    )
+    result = await call_tool(
+        "edit_merge_request_description", project=PROJECT, iid=IID, edits=edits, expected_hash=preview["base_hash"]
+    )
+
+    # Assert
+    assert found["description_hash"] == preview["base_hash"] == hashlib.sha256(before.encode()).hexdigest()
+    assert preview["description_hash"] == hashlib.sha256(after.encode()).hexdigest()
+    assert result["status"] == "applied"
+    assert json.loads(put.calls.last.request.content) == {"description": after}
+    assert [call.request.method for call in router.calls] == ["POST", "GET", "GET", "PUT"]
+
+
 @pytest.mark.parametrize(
     ("description", "old_text", "message"),
     [("first", "missing", "not found"), ("first xx xx", "xx", "more than once"), ("first aaa", "aa", "more than once")],

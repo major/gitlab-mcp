@@ -183,18 +183,28 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
         list[_description_edits.DescriptionReplacement] | None,
         Field(description="Ordered exact-text replacements. Use instead of old_text/new_text; provide 1 to 100."),
     ] = None,
+    expected_hash: Annotated[
+        str | None,
+        Field(description="Optional lowercase SHA-256 hash of the full current UTF-8 description."),
+    ] = None,
+    validate_only: Annotated[
+        bool,
+        Field(description="True checks every replacement and returns the preview with base_hash, without writing."),
+    ] = False,
 ) -> _description_edits.DescriptionEditResult:
     """Replace exact text, like a guarded `glab api --method PUT projects/:id/merge_requests/:iid`.
 
     Choose either the `old_text`/`new_text` pair or `edits`, not both. Replacements run in order in memory, so each
     match sees earlier results and must occur exactly once, including overlapping matches. All must succeed before
     the full description is written once; this is not server-side atomic. Replacement cannot be automatically undone.
-    GitLab has no compare-and-swap, so a concurrent edit may be
-    overwritten. Require explicit user `APPROVE` before writing. Writes are never retried. `status` is `applied`,
-    `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit changed lines.
+    Preview with `validate_only=true` and show the user changed lines, or the full edits if those lines are truncated
+    or omitted. After explicit user `APPROVE`, send identical edits with `expected_hash=base_hash`. GitLab has no
+    compare-and-swap, so a concurrent edit may still be overwritten. Writes are never retried. `status` is
+    `validated`, `applied`, `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit
+    changed lines.
     """
     return await _description_edits.edit_merge_request_description(
-        get_client(ctx), project, iid, old_text, new_text, return_diff, edits
+        get_client(ctx), project, iid, old_text, new_text, return_diff, edits, expected_hash, validate_only
     )
 
 
