@@ -120,10 +120,11 @@ class ReviewNotePostResult(BaseModel):
 
 
 class ReviewNoteSummary(BaseModel):
-    """A compact summary of one successfully cached review note.
+    """A compact summary of one successfully cached review note that has a body.
 
     Every row means the note validated, so the row carries no status field. Rows are grouped under their file, so
-    the row itself carries only the line coordinate. 🪙
+    the row itself carries only the line coordinate. Position-only entries get no row, because it would only echo
+    the caller's input; they are listed in `position_only_indices` instead. 🪙
     """
 
     index: int = Field(description="Zero-based cached batch index, the same as the input index.")
@@ -133,29 +134,31 @@ class ReviewNoteSummary(BaseModel):
     old_line: int | None = Field(
         default=None, description="Requested old-side line.", exclude_if=lambda value: value is None
     )
-    head: str = Field(
-        default="",
-        description=(
-            "First nonempty body line, trimmed and limited to 60 characters. Omitted for a position-only entry "
-            "that needs a body_overrides entry before posting."
-        ),
-        exclude_if=lambda value: not value,
-    )
+    head: str = Field(description="First nonempty body line, trimmed and limited to 60 characters.")
 
 
 def _review_notes_summary(notes: tuple[CachedReviewNote, ...]) -> dict[str, list[ReviewNoteSummary]]:
-    """Summarize cached notes grouped by file, so each path appears once.
+    """Summarize cached notes that have a body, grouped by file, so each path appears once.
 
-    Groups keep first-seen file order and rows keep input order. Notes without a file go under `general`. 🪙
+    Groups keep first-seen file order and rows keep input order. Notes without a file go under `general`.
+    Position-only entries (body is None) are skipped; `_position_only_indices` reports them. 🪙
     """
     summary: dict[str, list[ReviewNoteSummary]] = {}
     for index, note in enumerate(notes):
-        head = next((line.strip() for line in (note.body or "").splitlines() if line.strip()), "")
+        if note.body is None:
+            continue
+        # Preflight rejects blank bodies, so every cached body has a nonempty first line.
+        head = next(line.strip() for line in note.body.splitlines() if line.strip())
         row = ReviewNoteSummary(
             index=index, line=note.line, old_line=note.old_line, head=head[:REVIEW_NOTE_SUMMARY_HEAD_CAP]
         )
         summary.setdefault(note.file or "general", []).append(row)
     return summary
+
+
+def _position_only_indices(notes: tuple[CachedReviewNote, ...]) -> list[int]:
+    """Return the cached indices of position-only entries, which need body_overrides before posting."""
+    return [index for index, note in enumerate(notes) if note.body is None]
 
 
 @dataclass(frozen=True)
@@ -216,8 +219,16 @@ class PostReviewNotesResult(BaseModel):
     notes_summary: dict[str, list[ReviewNoteSummary]] = Field(
         default_factory=dict,
         description=(
-            "Only for successfully cached validate_only batches: one row per input note, grouped by file in "
-            "first-seen order (general for notes without a file), with rows in input order."
+            "Only for successfully cached validate_only batches: one row per input note with a body, grouped by "
+            "file in first-seen order (general for notes without a file), with rows in input order."
+        ),
+        exclude_if=lambda value: not value,
+    )
+    position_only_indices: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Only for successfully cached validate_only batches: cached indices of position-only entries, which "
+            "need approved body_overrides before posting."
         ),
         exclude_if=lambda value: not value,
     )
@@ -1325,6 +1336,7 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                     "batch_id": batch_id,
                     "ttl_seconds": cache.TTL_SECONDS,
                     "notes_summary": _review_notes_summary(cached_notes),
+                    "position_only_indices": _position_only_indices(cached_notes),
                 }
             )
         return finish(result, resolved)
@@ -1478,9 +1490,10 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
 
     Send `notes`, `batch_id`, or only `body_dir`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching every note at its input index. `notes_summary` groups cached-note rows by file; a row without `head`
-    marks a position-only entry. For position checks, omit body sources and supply `file` and optional `line` or
-    `old_line`; mix them with bodied notes in one batch. Selected position-only entries require approved overrides.
+    caching every note at its input index. `notes_summary` groups bodied-note rows by file, and
+    `position_only_indices` lists the position-only entries. For position checks, omit body sources and supply
+    `file` and optional `line` or `old_line`; mix them with bodied notes in one batch. Selected position-only
+    entries require approved overrides.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
     With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
     snapshots and outcomes. A filename is not approval. To preview overrides, send `batch_id`, `validate_only=true`,
