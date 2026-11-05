@@ -459,7 +459,9 @@ async def test_validate_only_caches_bodyless_positions(gitlab_env, tmp_path):
     assert data["batch_id"]
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
     assert "batch_indices" not in data
-    assert data["notes_summary"] == {"src.py": [{"index": 0, "line": 1}, {"index": 1, "old_line": 1}, {"index": 2}]}
+    # Position-only rows would only echo the input, so they collapse into one index list. 🪙
+    assert "notes_summary" not in data
+    assert data["position_only_indices"] == [0, 1, 2]
     text = preview.read_text(encoding="utf-8")
     for index in range(len(notes)):
         assert f"cached index {index}; position-only" in text
@@ -506,13 +508,11 @@ async def test_mixed_validation_caches_every_entry_at_input_indices(gitlab_env, 
     assert data["validated_count"] == THREE_POSTS
     assert "batch_indices" not in data
     assert data["notes_summary"] == {
-        "src.py": [
-            {"index": 0, "line": 1, "head": "first"},
-            {"index": 1, "line": 1},
-            {"index": 2, "line": 1, "head": "third"},
-        ]
+        "src.py": [{"index": 0, "line": 1, "head": "first"}, {"index": 2, "line": 1, "head": "third"}]
     }
+    assert data["position_only_indices"] == [1]
     assert "notes_summary" not in posted.structured_content
+    assert "position_only_indices" not in posted.structured_content
     assert posted.structured_content["posted_count"] == (THREE_POSTS if fail_extra else len(notes) + 1)
     if fail_extra:
         assert posted.structured_content["results"][0]["index"] == len(notes)
@@ -576,6 +576,7 @@ async def test_invalid_mixed_validation_never_caches(gitlab_env, monkeypatch):
     assert "batch_id" not in data
     assert "batch_indices" not in data
     assert "notes_summary" not in data
+    assert "position_only_indices" not in data
     cache_put.assert_not_called()
 
 
@@ -591,25 +592,33 @@ async def test_validation_summary_uses_trimmed_first_nonempty_line(gitlab_env):
 
     # Assert
     assert data["notes_summary"] == {"src.py": [{"index": 0, "line": 1, "head": "x" * 60}]}
+    assert "position_only_indices" not in data
 
 
 @respx.mock
 async def test_validation_summary_groups_rows_by_file(gitlab_env):
-    """Summary rows are grouped under each file once, in first-seen order, and keep their input indices."""
+    """Bodied rows are grouped under each file once, in first-seen order; positions keep their input indices."""
     # Arrange
     add_preflight([([diff_file("a.py"), diff_file("b.py")], None)])
-    notes = [review_note("a.py", 1, "first"), {"file": "b.py", "line": 1}, {"body": "general"}, {"file": "a.py"}]
+    notes = [
+        review_note("a.py", 1, "first"),
+        {"file": "b.py", "line": 1},
+        {"body": "general"},
+        {"file": "a.py"},
+        review_note("b.py", 1, "fifth"),
+    ]
 
     # Act
     data = await call_tool(notes=notes, validate_only=True)
 
     # Assert
-    assert list(data["notes_summary"]) == ["a.py", "b.py", "general"]
+    assert list(data["notes_summary"]) == ["a.py", "general", "b.py"]
     assert data["notes_summary"] == {
-        "a.py": [{"index": 0, "line": 1, "head": "first"}, {"index": 3}],
-        "b.py": [{"index": 1, "line": 1}],
+        "a.py": [{"index": 0, "line": 1, "head": "first"}],
         "general": [{"index": 2, "head": "general"}],
+        "b.py": [{"index": 4, "line": 1, "head": "fifth"}],
     }
+    assert data["position_only_indices"] == [1, 3]
 
 
 @pytest.mark.parametrize(
