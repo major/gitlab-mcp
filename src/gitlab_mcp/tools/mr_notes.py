@@ -63,7 +63,7 @@ async def create_merge_request_note(
     """Create a top-level MR comment, like `glab mr note`.
 
     Show the user the final text and require explicit APPROVE before posting. Use post_review_notes for inline
-    review notes and reply_to_thread for replies to existing threads. Exactly one body source is required.
+    review notes and reply_to_threads for replies to existing threads. Exactly one body source is required.
     Both body sources have the same 100000 UTF-8 byte limit. Truncation markers are rejected.
     Possible quick actions are rejected even inside code fences, so harmless examples may be rejected.
     An unknown outcome may have created a comment: inspect GitLab manually before retrying, never retry automatically.
