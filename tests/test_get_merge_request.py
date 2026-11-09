@@ -1443,6 +1443,37 @@ async def test_title_issue_keys_are_available_by_default(gitlab_env):
     assert "issue_keys_truncated" not in data
 
 
+@pytest.mark.xfail(strict=True, reason="Issue keys skip the description unless it is returned (#220).")
+@pytest.mark.parametrize(
+    ("args", "expected_keys"),
+    [
+        ({}, ["TITLE-1", "BODY-2"]),
+        ({"include_description": True, "description_limit": 0}, ["TITLE-1", "BODY-2"]),
+        ({"issue_key_prefixes": ["BODY"]}, ["BODY-2"]),
+        ({"issue_key_pattern": r"BODY-[0-9]+"}, ["BODY-2"]),
+    ],
+    ids=["default", "zero-limit", "prefixes", "custom-pattern"],
+)
+@respx.mock
+async def test_issue_keys_scan_description_without_returning_it(gitlab_env, args, expected_keys):
+    """Description keys come back even when the description text itself is left out to save tokens."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(title="TITLE-1", description="BODY-2")))
+
+    # Act
+    data = await call_tool(**args)
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert route.call_count == 1
+    # The mock always sends a description, so check that the query really asks GitLab for it. 🔎
+    assert "iid title description state" in request["query"]
+    assert "includeDescription" not in request["query"]
+    assert "includeDescription" not in request["variables"]
+    assert data["issue_keys"] == expected_keys
+    assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
+
+
 @respx.mock
 async def test_null_author_omits_author_id(gitlab_env):
     """A deleted or banned author is safely omitted along with its numeric ID."""
