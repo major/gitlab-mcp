@@ -137,7 +137,6 @@ async def test_maps_fields_and_sends_variables(gitlab_env):
     assert sent_variables(route) == {
         "fullPath": PROJECT,
         "iid": str(IID),
-        "includeDescription": True,
         "includeLabels": False,
         "includeThreads": True,
         "includeCommits": False,
@@ -1008,7 +1007,6 @@ async def test_description_obeys_requested_limit(gitlab_env, description_limit, 
     assert sent_variables(route) == {
         "fullPath": PROJECT,
         "iid": str(IID),
-        "includeDescription": True,
         "includeLabels": False,
         "includeThreads": True,
         "includeCommits": False,
@@ -1017,8 +1015,6 @@ async def test_description_obeys_requested_limit(gitlab_env, description_limit, 
     assert ("description_truncated" in data) is expected_truncated
     assert data.get("next_description_offset") == next_offset
     assert ("next_description_offset" in data) is (next_offset is not None)
-    request = json.loads(route.calls.last.request.content)
-    assert "description @include(if: $includeDescription)" in request["query"]
 
 
 @respx.mock
@@ -1045,7 +1041,6 @@ async def test_description_pages_reconstruct_unicode_text_without_gaps_or_overla
     assert pages == [description[0:3], description[3:6], description[6:9], description[9:12]]
     assert route.call_count == len(pages)
     variables = [json.loads(call.request.content)["variables"] for call in route.calls]
-    assert variables[0]["includeDescription"] is True
     assert all(item == {"fullPath": PROJECT, "iid": str(IID)} for item in variables[1:])
 
 
@@ -1335,15 +1330,14 @@ async def test_negative_description_offset_is_rejected_before_request(gitlab_env
 )
 @respx.mock
 async def test_description_is_omitted_by_default_and_included_on_opt_in(gitlab_env, args, expects_description):
-    """The description is only requested and returned when the caller opts in."""
+    """The description is only returned when the caller opts in."""
     # Arrange
-    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
 
     # Act
     data = await call_tool(**args)
 
     # Assert
-    assert sent_variables(route)["includeDescription"] is expects_description
     assert ("description" in data) is expects_description
     assert ("description_truncated" in data) is False
     assert "next_description_offset" not in data
@@ -1357,11 +1351,9 @@ async def test_description_is_omitted_by_default_and_included_on_opt_in(gitlab_e
 )
 @respx.mock
 async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
-    """Skipping the description also skips the GraphQL field and cut flag."""
+    """Skipping the description leaves out its text and cut flag, even though GraphQL still fetches it for keys."""
     # Arrange
-    node = make_mr()
-    del node["description"]
-    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description="d" * 5000)))
 
     # Act
     data = await call_tool(**skip_args)
@@ -1370,31 +1362,12 @@ async def test_skipping_description_omits_field_and_flag(gitlab_env, skip_args):
     assert sent_variables(route) == {
         "fullPath": PROJECT,
         "iid": str(IID),
-        "includeDescription": False,
         "includeLabels": False,
         "includeThreads": True,
         "includeCommits": False,
     }
     assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
     assert data["title"] == "Rebuild support"
-
-
-@respx.mock
-async def test_zero_description_limit_still_extracts_title_issue_keys(gitlab_env):
-    """A zero description limit skips its text but still returns issue keys from the title."""
-    # Arrange
-    node = make_mr(title="TITLE-3", description="BODY-4")
-    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
-
-    # Act
-    data = await call_tool(include_description=True, description_limit=0)
-
-    # Assert
-    assert route.call_count == 1
-    assert sent_variables(route)["includeDescription"] is False
-    assert data["issue_keys"] == ["TITLE-3"]
-    assert "BODY-4" not in data["issue_keys"]
-    assert {"description", "description_truncated"}.isdisjoint(data)
 
 
 @respx.mock
@@ -1422,11 +1395,10 @@ async def test_include_labels_returns_label_page_and_numeric_author_id(gitlab_en
 
 
 @respx.mock
-async def test_title_issue_keys_are_available_by_default(gitlab_env):
-    """The default result extracts title keys but does not expose the unfetched description."""
+async def test_labels_are_skipped_by_default(gitlab_env):
+    """The default result neither requests nor returns labels."""
     # Arrange
-    node = make_mr(title="TITLE-1", description="BODY-2")
-    route = respx.post(GRAPHQL).mock(return_value=graphql_response(node))
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
 
     # Act
     data = await call_tool()
@@ -1437,10 +1409,36 @@ async def test_title_issue_keys_are_available_by_default(gitlab_env):
     assert request["variables"]["includeLabels"] is False
     assert "labels(first: 100) @include(if: $includeLabels)" in request["query"]
     assert {"labels", "labels_truncated"}.isdisjoint(data)
-    assert data["issue_keys"] == ["TITLE-1"]
-    assert "BODY-2" not in data["issue_keys"]
-    assert "description" not in data
-    assert "issue_keys_truncated" not in data
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_keys"),
+    [
+        ({}, ["TITLE-1", "BODY-2"]),
+        ({"include_description": True, "description_limit": 0}, ["TITLE-1", "BODY-2"]),
+        ({"issue_key_prefixes": ["BODY"]}, ["BODY-2"]),
+        ({"issue_key_pattern": r"BODY-[0-9]+"}, ["BODY-2"]),
+    ],
+    ids=["default", "zero-limit", "prefixes", "custom-pattern"],
+)
+@respx.mock
+async def test_issue_keys_scan_description_without_returning_it(gitlab_env, args, expected_keys):
+    """Description keys come back even when the description text itself is left out to save tokens."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(title="TITLE-1", description="BODY-2")))
+
+    # Act
+    data = await call_tool(**args)
+
+    # Assert
+    request = json.loads(route.calls.last.request.content)
+    assert route.call_count == 1
+    # The mock always sends a description, so check that the query really asks GitLab for it. 🔎
+    assert "iid title description state" in request["query"]
+    assert "includeDescription" not in request["query"]
+    assert "includeDescription" not in request["variables"]
+    assert data["issue_keys"] == expected_keys
+    assert {"description", "description_truncated", "next_description_offset"}.isdisjoint(data)
 
 
 @respx.mock
@@ -1586,37 +1584,20 @@ async def test_custom_issue_key_pattern_returns_full_matches_in_source_order(git
     assert "issue_keys_truncated" not in data
 
 
-@pytest.mark.parametrize(
-    ("include_description", "expected_keys"),
-    [
-        (False, []),
-        (True, ["TASK-22"]),
-    ],
-    ids=["description-skipped", "raw-description-after-display-cap"],
-)
 @respx.mock
-async def test_custom_issue_key_pattern_scans_description_only_when_requested(
-    gitlab_env, include_description, expected_keys
-):
-    """Custom extraction follows description opt-in and scans raw text beyond the displayed description cap."""
+async def test_custom_issue_key_pattern_scans_raw_description_beyond_display_cap(gitlab_env):
+    """Custom extraction scans raw text beyond the displayed description cap."""
     # Arrange
-    route = respx.post(GRAPHQL).mock(
+    respx.post(GRAPHQL).mock(
         return_value=graphql_response(make_mr(title="no-key", description="padding TASK-22")),
     )
 
     # Act
-    data = await call_tool(
-        include_description=include_description,
-        description_limit=1,
-        issue_key_pattern=r"TASK-[0-9]+",
-    )
+    data = await call_tool(include_description=True, description_limit=1, issue_key_pattern=r"TASK-[0-9]+")
 
     # Assert
-    assert sent_variables(route)["includeDescription"] is include_description
-    assert data.get("issue_keys", []) == expected_keys
-    assert ("description" in data) is include_description
-    if include_description:
-        assert data["description"] == "p"
+    assert data["issue_keys"] == ["TASK-22"]
+    assert data["description"] == "p"
 
 
 @pytest.mark.parametrize("pattern", [r"(?=x)", r"(?=.)"], ids=["no-match", "empty-matches"])
