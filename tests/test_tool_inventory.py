@@ -45,6 +45,7 @@ READ_ONLY_TOOLS = {
 WRITE_TOOLS = {
     "create_issue",
     "create_merge_request",
+    "create_merge_request_note",
     "create_merge_request_pipeline",
     "create_pipeline",
     "create_snippet",
@@ -366,6 +367,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         ),
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
         ("get_work_item_note", {"project", "iid", "note_id"}, {"scope", "body_offset", "body_limit"}),
+        ("create_merge_request_note", {"project", "iid"}, {"body", "body_file"}),
         ("create_work_item_note", {"project", "iid"}, {"body", "body_file", "scope", "validate_only"}),
         (
             "edit_work_item_description",

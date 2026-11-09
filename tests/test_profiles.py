@@ -37,8 +37,9 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
     assert short["read_snippet"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731
     assert size(short["read_snippet"]) < sum(size(full[name]) for name in ("get_snippet", "get_snippet_file"))
-    assert len(full) == 44  # noqa: PLR2004
-    assert len(short) == 38  # noqa: PLR2004
+    assert len(full) == 45  # noqa: PLR2004
+    assert len(short) == 39  # noqa: PLR2004
+    assert "create_merge_request_note" in short
     start = short["start_pipeline"]
     assert start.annotations.read_only_hint is False
     assert start.annotations.destructive_hint is False
@@ -58,6 +59,7 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
     assert "resolve_open_threads" in short
     assert not re.search(r"\breply_to_thread\b", compact.instructions or "")
     assert not re.search(r"\breply_to_thread\b", batch.description)
+    assert not re.search(r"\breply_to_thread\b", short["create_merge_request_note"].description)
     assert "reply_to_threads" in (compact.instructions or "")
     assert "reply_to_thread(resolve=true)" in (gitlab_mcp.mcp.instructions or "")
     for text in ("one-item list", "APPROVE", "resolve=true", "resolve=false", "note_id", "repost"):

@@ -139,6 +139,32 @@ def read_server_local_utf8_file(
         raise_review_preflight_error(f"{path_field} is not valid UTF-8", cause=exc)
 
 
+def read_note_body(body: str | None, body_file: str | None) -> str:
+    """Validate and read exactly one note body source before any GitLab request."""
+    if (body is None) == (body_file is None):
+        raise ToolError("Provide exactly one of body or body_file.")  # noqa: TRY003
+    if body_file is not None:
+        try:
+            body = read_server_local_utf8_file(
+                body_file, path_field="body_file", size_field="body", byte_limit=REVIEW_NOTE_BODY_CAP
+            )
+        except OSError as exc:
+            raise ToolError("body_file could not be read as a server-local file.") from exc  # noqa: TRY003
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+    if body is None or not body.strip():
+        raise ToolError("body must not be blank.")  # noqa: TRY003
+    try:
+        size = len(body.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ToolError("body must be valid UTF-8.") from exc  # noqa: TRY003
+    if size > REVIEW_NOTE_BODY_CAP:
+        raise ToolError(f"body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes.")  # noqa: TRY003
+    if has_truncation_marker(body):
+        raise ToolError(f"{TRUNCATION_MARKER_ERROR} Use body_file for a full server-local file.")  # noqa: TRY003
+    return body
+
+
 async def validate_project_labels(
     client: GitLabClient,
     project: str,

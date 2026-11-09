@@ -1,11 +1,11 @@
-"""Paged reads and guarded edits of existing merge request notes 📝."""
+"""Create, read, and safely edit merge request notes 📝."""
 
 import hashlib
 import json
 import re
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
@@ -24,6 +24,7 @@ from gitlab_mcp.common import (
     has_truncation_marker,
     is_int_at_least,
     page_text,
+    read_note_body,
 )
 from gitlab_mcp.mr_common import mr_rest_path
 
@@ -33,6 +34,80 @@ _HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 # Matches the 4000-character note cap in get_merge_request_threads, so one page picks up where a cut note ends.
 NOTE_PAGE_CAP = 4000
 _NOT_FOUND_STATUS = 404
+_CLIENT_ERROR_STATUS = 400
+
+
+class MergeRequestNoteCreateResult(BaseModel):
+    """Compact outcome of creating one top-level note."""
+
+    status: Literal["created", "unknown"]
+    note_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    web_url: str | None = Field(default=None, exclude_if=lambda value: not value)
+    message: str | None = Field(default=None, exclude_if=lambda value: not value)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
+async def create_merge_request_note(
+    ctx: Context,
+    project: Project,
+    iid: Iid,
+    body: Annotated[
+        str | None,
+        Field(description="Nonblank note text, at most 100000 UTF-8 bytes, mutually exclusive with body_file."),
+    ] = None,
+    body_file: Annotated[
+        str | None,
+        Field(description="Absolute server-local UTF-8 file, at most 100000 bytes, mutually exclusive with body."),
+    ] = None,
+) -> MergeRequestNoteCreateResult:
+    """Create a top-level MR comment, like `glab mr note`.
+
+    Show the user the final text and require explicit APPROVE before posting. Use post_review_notes for inline
+    review notes and reply_to_threads for replies to existing threads. Exactly one body source is required.
+    Both body sources have the same 100000 UTF-8 byte limit. Truncation markers are rejected.
+    Possible quick actions are rejected even inside code fences, so harmless examples may be rejected.
+    An unknown outcome may have created a comment: inspect GitLab manually before retrying, never retry automatically.
+    """
+    if not project.strip():
+        raise ToolError("project must not be blank. No write was made.")  # noqa: TRY003
+    note_body = read_note_body(body, body_file)
+    if has_quick_action(note_body):
+        raise ToolError("The body may contain a GitLab quick action. No write was made.")  # noqa: TRY003
+    if not is_int_at_least(iid, 1):
+        raise ToolError("iid must be a positive integer. No write was made.")  # noqa: TRY003
+    path = mr_rest_path(project, iid)
+    client = get_client(ctx)
+    try:
+        mr = await client.get(path)
+        canonical = mr.get("web_url") if isinstance(mr, dict) else None
+        parsed = urlsplit(canonical) if isinstance(canonical, str) else None
+        if (
+            not isinstance(canonical, str)
+            or canonical != canonical.strip()
+            or parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or "#" in canonical
+        ):
+            raise ToolError("GitLab returned an invalid merge request web_url. No write was made.")  # noqa: TRY003
+    except (ValueError, RecursionError) as exc:
+        raise ToolError("GitLab returned an invalid merge request response. No write was made.") from exc  # noqa: TRY003
+
+    unknown = MergeRequestNoteCreateResult(
+        status="unknown", message="Creation may have completed. Check GitLab before retrying."
+    )
+    try:
+        response = await client.request("POST", f"{path}/notes", json={"body": note_body}, expected_status=201)
+    except GitLabAPIError as exc:
+        if _CLIENT_ERROR_STATUS <= exc.status < HTTP_SERVER_ERROR and exc.status != HTTP_REQUEST_TIMEOUT:
+            raise ToolError(f"GitLab rejected the note with HTTP {exc.status}.") from exc  # noqa: TRY003
+        return unknown
+    except GitLabConnectionError, ValueError, RecursionError:
+        return unknown
+    note_id = response.get("id") if isinstance(response, dict) else None
+    if not is_int_at_least(note_id, 1):
+        return unknown
+    return MergeRequestNoteCreateResult(status="created", note_id=note_id, web_url=f"{canonical}#note_{note_id}")
 
 
 class MergeRequestNotePage(BaseModel):
