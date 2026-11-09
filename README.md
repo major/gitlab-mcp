@@ -151,6 +151,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `create_merge_request_pipeline` | Start a merge request pipeline after checking the MR head SHA, for example after a retarget. |
 | `create_pipeline` | Create a pipeline for a ref after checking its expected commit SHA. |
 | `create_snippet` | Create a personal or project snippet with bounded files. |
+| `create_merge_request_note` | Add a top-level merge request comment from inline text or a server-local file. |
 | `create_work_item_note` | Add a project or group work item comment from inline text or a server-local file. |
 | `delete_snippet` | Delete a personal or project snippet. |
 | `edit_merge_request_description` | Preview and apply exact-text replacements with a hash guard for merge request descriptions. |

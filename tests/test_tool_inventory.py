@@ -48,6 +48,7 @@ WRITE_TOOLS = {
     "create_merge_request_pipeline",
     "create_pipeline",
     "create_snippet",
+    "create_merge_request_note",
     "create_work_item_note",
     "delete_snippet",
     "edit_merge_request_description",
@@ -366,6 +367,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
         ),
         ("list_work_item_notes", {"project", "iid"}, {"scope", "cursor", "max_body_chars"}),
         ("get_work_item_note", {"project", "iid", "note_id"}, {"scope", "body_offset", "body_limit"}),
+        ("create_merge_request_note", {"project", "iid"}, {"body", "body_file"}),
         ("create_work_item_note", {"project", "iid"}, {"body", "body_file", "scope", "validate_only"}),
         (
             "edit_work_item_description",

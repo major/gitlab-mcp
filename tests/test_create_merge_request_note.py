@@ -14,8 +14,6 @@ from gitlab_mcp import mcp
 from gitlab_mcp.common import REVIEW_NOTE_BODY_CAP
 from mcp_helpers import call_tool
 
-pytestmark = pytest.mark.xfail(strict=True, reason="Issue #214: top-level MR note tool is not implemented yet.")
-
 API = "https://gitlab.example.com/api/v4"
 MR_PATH = "/projects/group%2Fproject/merge_requests/42"
 MR_URL = "https://gitlab.example.com/group/project/-/merge_requests/42"
@@ -150,7 +148,7 @@ async def test_invalid_local_file_makes_no_request(gitlab_env, tmp_path, kind):
         file.write_text(" \n", encoding="utf-8")
 
     # Act / Assert
-    with pytest.raises(ToolError, match="body|regular file|UTF-8|server-local"):
+    with pytest.raises(ToolError, match=r"body|regular file|UTF-8|server-local"):
         await create_note(body_file=path)
     assert not respx.calls
 

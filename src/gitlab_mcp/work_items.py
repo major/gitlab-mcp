@@ -15,11 +15,8 @@ from gitlab_mcp.client import GitLabAPIError, GitLabConnectionError, GitLabGraph
 from gitlab_mcp.common import (
     HTTP_REQUEST_TIMEOUT,
     HTTP_SERVER_ERROR,
-    REVIEW_NOTE_BODY_CAP,
-    TRUNCATION_MARKER_ERROR,
-    has_truncation_marker,
     page_text,
-    read_server_local_utf8_file,
+    read_note_body,
 )
 from gitlab_mcp.description_sections import DescriptionSection, focused_description, validate_focus_options
 lazy from gitlab_mcp.client import GitLabClient
@@ -789,32 +786,6 @@ async def read_work_item_for_edit(
     return WorkItemEditSource(id=_required_string(item, "id"), description=description)
 
 
-def _note_body(body: str | None, body_file: str | None) -> str:
-    """Validate and read exactly one note body source before any GitLab request."""
-    if (body is None) == (body_file is None):
-        _raise_tool_error("Provide exactly one of body or body_file.")
-    if body_file is not None:
-        try:
-            body = read_server_local_utf8_file(
-                body_file, path_field="body_file", size_field="body", byte_limit=REVIEW_NOTE_BODY_CAP
-            )
-        except OSError:
-            _raise_tool_error("body_file could not be read as a server-local file.")
-        except ValueError as exc:
-            _raise_tool_error(str(exc))
-    if body is None or not body.strip():
-        _raise_tool_error("body must not be blank.")
-    try:
-        size = len(body.encode("utf-8"))
-    except UnicodeEncodeError:
-        _raise_tool_error("body must be valid UTF-8.")
-    if size > REVIEW_NOTE_BODY_CAP:
-        _raise_tool_error(f"body exceeds {REVIEW_NOTE_BODY_CAP} UTF-8 bytes.")
-    if has_truncation_marker(body):
-        _raise_tool_error(f"{TRUNCATION_MARKER_ERROR} Use body_file for a full server-local file.")
-    return body
-
-
 def _valid_global_id(value: Any, typename: str) -> bool:
     """Check that an ID is a positive numeric GitLab GID of the expected type."""
     return isinstance(value, str) and re.fullmatch(rf"gid://gitlab/{typename}/[1-9][0-9]*", value) is not None
@@ -943,7 +914,7 @@ async def post_work_item_note(  # noqa: PLR0913, PLR0917 - signature mirrors the
 ) -> WorkItemNoteCreateResult:
     """Validate the input and scoped target, then create one note without retrying."""
     _validate_arguments(project, iid)
-    note_body = _note_body(body, body_file)
+    note_body = read_note_body(body, body_file)
     _, item = await _resolved_item(client, (_NOTE_TARGET_QUERY, {}), scope, project, iid)
     resolved_iid = item.get("iid")
     if type(resolved_iid) not in (str, int) or _positive_graphql_iid(resolved_iid) != iid:
