@@ -51,7 +51,10 @@ async def create_merge_request_note(
     ctx: Context,
     project: Project,
     iid: Iid,
-    body: Annotated[str | None, Field(description="Complete note text, mutually exclusive with body_file.")] = None,
+    body: Annotated[
+        str | None,
+        Field(description="Nonblank note text, at most 100000 UTF-8 bytes, mutually exclusive with body_file."),
+    ] = None,
     body_file: Annotated[
         str | None,
         Field(description="Absolute server-local UTF-8 file, at most 100000 bytes, mutually exclusive with body."),
@@ -61,9 +64,12 @@ async def create_merge_request_note(
 
     Show the user the final text and require explicit APPROVE before posting. Use post_review_notes for inline
     review notes and reply_to_thread for replies to existing threads. Exactly one body source is required.
+    Both body sources have the same 100000 UTF-8 byte limit. Truncation markers are rejected.
     Possible quick actions are rejected even inside code fences, so harmless examples may be rejected.
     An unknown outcome may have created a comment: inspect GitLab manually before retrying, never retry automatically.
     """
+    if not project.strip():
+        raise ToolError("project must not be blank. No write was made.")  # noqa: TRY003
     note_body = read_note_body(body, body_file)
     if has_quick_action(note_body):
         raise ToolError("The body may contain a GitLab quick action. No write was made.")  # noqa: TRY003

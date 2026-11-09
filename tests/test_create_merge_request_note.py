@@ -69,17 +69,20 @@ async def test_creates_one_top_level_note_with_exact_body(  # noqa: PLR0913, PLR
         ({"body": "", "body_file": "/unused"}, "exactly one"),
         ({"body": ""}, "blank"),
         ({"body": " \n\t"}, "blank"),
-        ({"body": "x", "project": " "}, "project"),
+        ({"body": "x", "project": " "}, "project must not be blank"),
         ({"body": "x", "iid": 0}, "iid"),
     ],
 )
 @respx.mock
 async def test_invalid_input_makes_no_request(gitlab_env, arguments, message):
     """Missing, conflicting, blank, and invalid target inputs fail before HTTP."""
+    # Arrange
+    lookup = respx.get().respond(200, json={"web_url": MR_URL})
+
     # Act / Assert
     with pytest.raises(ToolError, match=message):
         await create_note(**arguments)
-    assert not respx.calls
+    assert lookup.call_count == 0
 
 
 @pytest.mark.parametrize("source", ["body", "body_file"])
