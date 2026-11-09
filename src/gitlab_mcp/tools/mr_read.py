@@ -83,12 +83,12 @@ query(
 # One merge request with its status facts and the first page of discussions.
 MERGE_REQUEST_QUERY = """
 query(
-  $fullPath: ID!, $iid: String!, $includeDescription: Boolean!, $includeLabels: Boolean!, $includeThreads: Boolean!,
-  $includeCommits: Boolean!
+  $fullPath: ID!, $iid: String!, $includeLabels: Boolean!, $includeThreads: Boolean!, $includeCommits: Boolean!
 ) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
-      iid title description @include(if: $includeDescription) state draft sourceBranch targetBranch createdAt
+      # Always fetched so issue keys can scan it; the text is only returned on opt-in. 🔑
+      iid title description state draft sourceBranch targetBranch createdAt
       labels(first: 100) @include(if: $includeLabels) {
         nodes { title }
         pageInfo { hasNextPage }
@@ -1077,7 +1077,7 @@ def _to_detail(  # noqa: PLR0913 - each detail option controls a distinct option
     label_connection = node.get("labels") if include_labels else None
     issue_keys, issue_keys_truncated = _extract_issue_keys(
         node["title"],
-        node.get("description") if include_description else None,
+        node.get("description"),
         issue_key_prefixes,
         custom_issue_key_pattern,
     )
@@ -1357,7 +1357,9 @@ async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional
     ] = False,
     include_description: Annotated[
         bool,
-        Field(description="True includes the description. Defaults to false to save tokens."),
+        Field(
+            description="True includes the description. Defaults to false to save tokens; issue_keys scan it anyway."
+        ),
     ] = False,
     include_labels: Annotated[
         bool,
@@ -1547,7 +1549,6 @@ async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional
         MERGE_REQUEST_QUERY,
         project,
         iid,
-        includeDescription=include_description,
         includeLabels=include_labels,
         includeThreads=include_threads,
         includeCommits=include_commits,
