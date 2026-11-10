@@ -295,6 +295,12 @@ def _review_preview_file(path: str | None) -> Generator[TextIO | None]:
         if created:
             with suppress(OSError):
                 Path(path).unlink()
+        if isinstance(exc, FileExistsError):
+            # O_EXCL refuses to overwrite or follow a symlink, so give the caller a next step. 🧭
+            stem = Path(path).with_suffix("")
+            raise ToolError(  # noqa: TRY003
+                f"preview_path already exists and previews are never overwritten. Pass a new path such as {stem}-2.md."
+            ) from exc
         if isinstance(exc, (OSError, UnicodeError)):
             raise ToolError(f"preview_path could not be written: {exc}") from exc  # noqa: TRY003
         raise
@@ -1617,7 +1623,10 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
     ] = None,
     preview_path: Annotated[
         str | None,
-        Field(description="New absolute server-local Markdown preview path, only with validate_only."),
+        Field(
+            description="New absolute server-local Markdown preview path, only with validate_only. "
+            "It must not exist yet; existing files are never overwritten."
+        ),
     ] = None,
 ) -> PostReviewNotesResult:
     """Validate or post inline comments and general review notes in a sequential, bounded batch.
