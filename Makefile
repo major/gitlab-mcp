@@ -23,7 +23,7 @@ build:
 	uv build
 
 coverage:
-	uv run --locked pytest --durations=10 --cov=gitlab_mcp --cov-branch --cov-report=term-missing:skip-covered --cov-report=xml:coverage.xml --cov-fail-under=95
+	uv run --locked pytest -n 4 --durations=10 --cov=gitlab_mcp --cov-branch --cov-report=term-missing:skip-covered --cov-report=xml:coverage.xml --cov-fail-under=95
 	$(MAKE) branch-coverage
 
 branch-coverage:
