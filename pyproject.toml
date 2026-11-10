@@ -48,6 +48,11 @@ error-on-warning = true
 addopts = "--cov-context=test --disable-socket --allow-unix-socket"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Remove when https://github.com/strawgate/py-key-value/issues/398 is fixed; still open in pinned 0.4.6.
+filterwarnings = [
+    """ignore:^<class 'key_value[.]aio[.]protocols[.]key_value[.]AsyncKeyValue'> isn't explicitly \
+    decorated with @runtime_checkable:DeprecationWarning:beartype[.]_util[.]cls[.]pep[.]clspep3119$""",
+]
 testpaths = ["tests"]
 pythonpath = ["src"]
 
