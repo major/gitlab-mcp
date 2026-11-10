@@ -82,13 +82,21 @@ class ReviewBatchCache:
         self._store(batch_id, batch)
         return batch_id
 
-    def restore(self, batch_id: str, batch: CachedReviewBatch) -> None:
-        """Put back a claimed batch after a rejection that attempted nothing, keeping its id and expiry.
+    def restore(self, batch_id: str, batch: CachedReviewBatch) -> int | None:
+        """Put back a claimed batch after a call that sent no write request, keeping its id and expiry.
 
-        Call this only before any await or GitLab request, so no other attempt can have used the handle. An
-        expired batch needs no special case: the next `claim` purges it. ♻️
+        `claim` pops the batch, so no other call can use the handle while this call holds it, even across awaits.
+        Only GitLab reads may have happened, so nothing can post twice. ♻️
+
+        Returns:
+            The whole seconds left before the batch expires, or `None` when it expired first and was dropped.
         """
+        self._purge_expired()
+        remaining = batch.expires_at - time.monotonic()
+        if remaining <= 0:
+            return None
         self._store(batch_id, batch)
+        return max(1, int(remaining))
 
     def _store(self, batch_id: str, batch: CachedReviewBatch) -> None:
         """Insert a batch, evicting the oldest ones first when count or byte limits would be exceeded."""

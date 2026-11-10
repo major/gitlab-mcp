@@ -514,7 +514,6 @@ async def test_unavailable_batch_repreview_returns_warning_preview(review_client
     assert all(call.request.method == "GET" for call in respx.calls)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="A failed re-preview still consumes the batch (#223).")
 @respx.mock
 async def test_repreview_failed_validation_keeps_old_batch(review_client: Client, tmp_path: Path) -> None:
     """A failed re-preview writes its errors and keeps the old handle, because validation never writes ♻️."""
@@ -769,7 +768,6 @@ async def test_invalid_body_overrides_have_no_gitlab_writes(
     assert (len(mr_route.calls), len(diff_route.calls), len(post_route.calls)) == prior
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="A stale post still consumes the batch (#223).")
 @respx.mock
 async def test_stale_batch_is_kept_and_repreviewed_on_the_new_head(review_client: Client, tmp_path: Path) -> None:
     """A stale post writes nothing and keeps the batch, so it can be re-checked on the new head without bodies 🔁."""
@@ -821,7 +819,6 @@ async def test_stale_batch_is_kept_and_repreviewed_on_the_new_head(review_client
     assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)), head=new_head)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="A head mismatch still consumes the batch (#223).")
 @pytest.mark.parametrize("other_head", ["d" * 40, "invalid"], ids=["newer-head", "invalid-head"])
 @respx.mock
 async def test_posting_batch_with_another_head_keeps_batch(review_client: Client, other_head: str) -> None:
@@ -1102,6 +1099,41 @@ async def test_batch_remains_claimable_just_before_expiration(
     assert not posted.is_error
     assert posted.structured_content["posted_count"] == 1
     assert len(post_route.calls) == 1
+
+
+@respx.mock
+async def test_batch_that_expires_during_a_stale_call_is_not_kept(
+    review_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch that expires while a call that wrote nothing is running is dropped, not put back ⏰."""
+    # Arrange
+    clock = {"now": 100.0}
+    monkeypatch.setattr(review_batches, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    new_head = "d" * 40
+    add_preflight()
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"file": "src.py", "line": 1, "body": "review"}], validate_only=True),
+    )
+    clock["now"] += prepared.structured_content["ttl_seconds"] - 0.01
+
+    def slow_stale_read(_: httpx.Request) -> httpx.Response:
+        """Return a newer head after the batch's lifetime runs out."""
+        clock["now"] += 1
+        return response(merge_request(sha=new_head, head_sha=new_head))
+
+    respx.get(MR_URL).mock(side_effect=slow_stale_read)
+
+    # Act
+    stale = await call_review(review_client, **note_args(batch_id=prepared.structured_content["batch_id"]))
+
+    # Assert
+    data = stale.structured_content
+    assert data["unattempted"] == [0]
+    assert "batch_retained" not in data
+    assert "ttl_seconds" not in data
+    replay = await call_review(review_client, **note_args(batch_id=prepared.structured_content["batch_id"]))
+    assert_unavailable(replay, head=new_head)
 
 
 @respx.mock

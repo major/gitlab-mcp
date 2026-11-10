@@ -1194,7 +1194,6 @@ async def test_stale_head_sha_reports_source_sha_when_diff_head_differs(gitlab_e
     assert not post_route.called
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="Stale heads do not summarize changes yet (#223).")
 @pytest.mark.parametrize(
     ("merge_base", "head_change"),
     [(HEAD, "fast_forward"), (BASE_SHA, "rewritten")],
@@ -1235,7 +1234,6 @@ async def test_stale_head_summarizes_changes_since_reviewed_head(gitlab_env, mer
             "timeout",
             {"head_change": "fast_forward"},
             id="compare-timeout",
-            marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason="No head summary yet (#223)."),
         ),
         # Characterization: only diff_refs lag behind the supplied head, so there is nothing to compare.
         pytest.param("diff-refs-lag", {}, id="diff-refs-lag"),
