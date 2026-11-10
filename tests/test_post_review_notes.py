@@ -307,6 +307,26 @@ async def test_preview_write_failure_removes_incomplete_file(gitlab_env, tmp_pat
     assert not respx.calls
 
 
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="raw Errno 17 text has no next step")
+@respx.mock
+async def test_preview_existing_path_explains_next_step(gitlab_env: Any, tmp_path: Any) -> None:
+    """An existing preview file is never overwritten and the error says how to continue."""
+    # Arrange
+    existing = tmp_path / "preview.md"
+    existing.write_text("keep", encoding="utf-8")
+    # Act
+    result = await call_tool_result(notes=[{"body": "draft"}], validate_only=True, preview_path=str(existing))
+    # Assert
+    assert result.is_error
+    message = result.content[0].text
+    assert "already exists" in message
+    assert "never overwritten" in message
+    assert "preview-2.md" in message
+    assert "Errno" not in message
+    assert existing.read_text(encoding="utf-8") == "keep"
+    assert not respx.calls
+
+
 @pytest.mark.parametrize("path_kind", ["relative", "nul", "existing", "missing_parent"])
 @respx.mock
 async def test_preview_rejects_bad_paths_without_network(gitlab_env: Any, tmp_path: Any, path_kind: str) -> None:
