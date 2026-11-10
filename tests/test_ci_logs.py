@@ -44,6 +44,15 @@ RUNNER_TRAILER_LINES = (
     "Cleaning up project directory and file based variables\n"
     "\n"
 )
+# A job that failed before writing its artifacts also gets runner upload errors, which must not hide the job output.
+UPLOAD_ERROR_TRAILER_LINES = (
+    "\n"
+    "Uploading artifacts for failed job\n"
+    "WARNING: data/reports/smoke.json: no matching files. Ensure that the artifact path is relative\n"
+    "ERROR: No files to upload\n"
+    "Cleaning up project directory and file based variables\n"
+    "\n"
+)
 RUNNER_FOOTER = "ERROR: Job failed: exit status 1\n"
 
 
@@ -504,7 +513,6 @@ async def test_advanced_options_are_validated_before_any_request(arguments):
     assert len(respx.calls) == 0
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#226: the error does not name pattern")
 @respx.mock
 async def test_search_without_pattern_names_the_pattern_argument():
     """A search with no pattern says which argument is missing, so the caller can fix it in one retry."""
@@ -1082,14 +1090,8 @@ async def test_failures_view_selects_early_make_failure_instead_of_long_successf
         "ERROR: could not resolve dependency",
         "Traceback (most recent call last):",
         "Error 17.",
-        pytest.param(
-            "FAIL: expected one container run",
-            marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason="#226: FAIL: is not a marker yet"),
-        ),
-        pytest.param(
-            "--- FAIL: TestParse (0.00s)",
-            marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason="#226: FAIL: is not a marker yet"),
-        ),
+        "FAIL: expected one container run",
+        "--- FAIL: TestParse (0.00s)",
     ],
     ids=["make", "recursive-make", "pytest", "error-colon", "traceback", "numeric-error", "fail-colon", "go-fail"],
 )
@@ -1109,19 +1111,26 @@ async def test_failures_view_recognizes_fixed_failure_markers(marker):
     assert data["complete"] is True
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#226: only the runner footer is returned")
+@pytest.mark.parametrize(
+    ("trailer", "runner_errors"),
+    [
+        (RUNNER_TRAILER_LINES, ""),
+        (UPLOAD_ERROR_TRAILER_LINES, "ERROR: No files to upload\n"),
+    ],
+    ids=["artifacts-uploaded", "artifact-upload-error"],
+)
 @respx.mock
-async def test_failures_view_shows_job_output_above_a_generic_runner_footer():
-    """A lone runner footer also returns the job's last output lines, skipping runner trailer lines."""
+async def test_failures_view_shows_job_output_above_a_generic_runner_footer(trailer, runner_errors):
+    """A runner footer also returns the job's last output lines, even when the artifact upload also failed."""
     # Arrange
     mock_job()
-    mock_head("setup\n" + JOB_OUTPUT_LINES + RUNNER_TRAILER_LINES + RUNNER_FOOTER)
+    mock_head("setup\n" + JOB_OUTPUT_LINES + trailer + RUNNER_FOOTER)
 
     # Act
     data = await call_log(view="failures", context=0)
 
     # Assert
-    assert data["text"] == JOB_OUTPUT_LINES + RUNNER_FOOTER
+    assert data["text"] == JOB_OUTPUT_LINES + runner_errors + RUNNER_FOOTER
     assert data["found"] is True
 
 
@@ -1141,12 +1150,17 @@ async def test_failures_view_merges_overlapping_context_windows_in_chronological
     assert data["found"] is True
 
 
+@pytest.mark.parametrize(
+    "body",
+    ["build started\nall checks passed\n", "PASS: 12\nFAIL: 0\n"],
+    ids=["plain-output", "zero-fail-tally"],
+)
 @respx.mock
-async def test_failures_view_returns_empty_text_when_no_marker_matches():
-    """Ordinary log output is not returned when the bounded scan has no failure marker."""
+async def test_failures_view_returns_empty_text_when_no_marker_matches(body):
+    """Ordinary log output, including a `FAIL: 0` tally, is not returned when the scan has no failure marker."""
     # Arrange
     mock_job()
-    mock_head("build started\nall checks passed\n")
+    mock_head(body)
 
     # Act
     data = await call_log(view="failures")
@@ -1378,7 +1392,6 @@ async def test_summary_hints_when_only_make_or_runner_failure_is_visible(body):
     assert len(respx.calls) == ONE_CALL
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#226: only the runner footer is returned")
 @respx.mock
 async def test_summary_shows_job_output_above_a_generic_runner_footer():
     """Summary adds the job's last output lines when the runner footer is the only evidence."""

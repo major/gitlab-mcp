@@ -2,6 +2,7 @@
 
 import re
 from html.parser import HTMLParser
+from itertools import islice
 from typing import Literal
 from urllib.parse import quote
 
@@ -66,7 +67,19 @@ _FAILURE_PATTERNS = (
     re.compile(r"(?i:error:)"),
     re.compile(r"Traceback \(most recent call last\):"),
     re.compile(r"(?i)\bError\s*:?\s*\d+\b"),
+    # unittest, Go (`--- FAIL:`), and many smoke scripts print their own `FAIL:` line 🧪. A `FAIL: 0` tally is a pass.
+    re.compile(r"^[ \t]*(?:--- )?FAIL:(?!\s*0\s*$)"),
 )
+# Lines GitLab Runner prints after the job script: artifact upload, cache, and cleanup. They never explain why the
+# job script failed, even the upload `ERROR:` and `WARNING:` lines.
+_RUNNER_TRAILER_PATTERN = re.compile(
+    r"^\s*(?:Uploading artifacts\b|Runtime platform\b|Cleaning up (?:project directory|file based variables)\b"
+    r"|Saving cache\b|Creating cache\b|Archive is up to date\b|Created cache\b|Running after[_ ]?script\b"
+    r"|\S[^\n]*: found \d+ matching artifact files and directories\b|ERROR: No files to upload\b"
+    r"|WARNING: [^\n]*: no matching files\b)"
+)
+# Job output lines kept above a runner footer, because the footer alone never says what went wrong.
+RUNNER_OUTPUT_LINES = 5
 _PYTEST_SUMMARY_HEADER_PATTERN = re.compile(r"(?i)^={3,}.*\bshort test summary info\b.*={3,}\s*$")
 _PYTEST_SUMMARY_FOOTER_PATTERN = re.compile(r"^={3,}")
 _PYTEST_COUNTS_PATTERN = re.compile(
@@ -330,14 +343,39 @@ def _context_selection(lines: list[str], matching: list[int], context: int) -> s
     return "".join(selected)
 
 
+def _job_output_above_runner_footer(lines: list[str], selected: set[int]) -> set[int]:
+    """Return the last job output lines above each selected runner footer that has no cause near it.
+
+    A log that ends with only `ERROR: Job failed` usually printed its real problem just before GitLab Runner's
+    artifact and cleanup lines. Those runner lines and blank lines are skipped, so the job's own words come back 🏃.
+    When one of those job lines is already a recognized cause, it is selected anyway, so nothing more is added.
+    Output from `after_script` commands is job output too, so it can use up some of these lines.
+    """
+    added: set[int] = set()
+    for footer in (index for index in selected if _RUNNER_FAILURE_PATTERN.search(lines[index])):
+        output = (
+            index
+            for index in range(footer - 1, -1, -1)
+            if lines[index].strip() and not _RUNNER_TRAILER_PATTERN.match(lines[index])
+        )
+        nearby = list(islice(output, RUNNER_OUTPUT_LINES))
+        if not any(actionable_failure_line(lines[index]) for index in nearby):
+            added.update(nearby)
+    return added
+
+
 def _failure_selection(text: str, context: int) -> tuple[str, bool]:
     """Select cleaned lines matching a conservative built-in failure marker and nearby context."""
     text = _SECTION_MARKER_PATTERN.sub("", text)
     lines = text.splitlines(keepends=True)
-    matching = [index for index, line in enumerate(lines) if any(pattern.search(line) for pattern in _FAILURE_PATTERNS)]
+    matching = {index for index, line in enumerate(lines) if any(pattern.search(line) for pattern in _FAILURE_PATTERNS)}
     if not matching:
         return "", False
-    return _context_selection(lines, matching, context), True
+    selected = {
+        near for index in matching for near in range(max(0, index - context), min(len(lines), index + context + 1))
+    }
+    selected |= _job_output_above_runner_footer(lines, matching)
+    return "".join(lines[index] for index in sorted(selected)), True
 
 
 def _summary_selection(text: str) -> tuple[str, bool]:
@@ -365,6 +403,7 @@ def _summary_selection(text: str) -> tuple[str, bool]:
 
     if not selected:
         return "".join(lines[-SUMMARY_FALLBACK_LINES:]), False
+    selected |= _job_output_above_runner_footer(lines, selected)
     return "".join(lines[index] for index in sorted(selected)), True
 
 
@@ -414,17 +453,24 @@ def _section_selection(text: str, section: str) -> tuple[str, bool, bool]:
 def _validate_search_patterns(pattern: str | list[str] | None) -> None:
     """Validate one search literal or a bounded list of literals."""
     if pattern is None:
-        raise_tool_error(f"Pass a nonempty, single-line search pattern of at most {MAX_PATTERN_CHARS} characters.")
+        raise_tool_error(
+            f"view='search' needs the pattern argument: one nonempty, single-line literal of at most "
+            f"{MAX_PATTERN_CHARS} characters, or a list of 1 to {MAX_SEARCH_PATTERNS}."
+        )
 
     if isinstance(pattern, str):
         if not pattern or len(pattern) > MAX_PATTERN_CHARS or "\n" in pattern or "\r" in pattern:
-            raise_tool_error(f"Pass a nonempty, single-line search pattern of at most {MAX_PATTERN_CHARS} characters.")
+            raise_tool_error(
+                f"Pass pattern as a nonempty, single-line literal of at most {MAX_PATTERN_CHARS} characters."
+            )
         return
 
     if not 1 <= len(pattern) <= MAX_SEARCH_PATTERNS:
-        raise_tool_error(f"Pass from 1 to {MAX_SEARCH_PATTERNS} search patterns.")
+        raise_tool_error(f"Pass pattern as a list of 1 to {MAX_SEARCH_PATTERNS} literals.")
     if any(not item or len(item) > MAX_PATTERN_CHARS or "\n" in item or "\r" in item for item in pattern):
-        raise_tool_error(f"Pass nonempty, single-line search patterns of at most {MAX_PATTERN_CHARS} characters.")
+        raise_tool_error(
+            f"Pass each pattern literal as nonempty and single-line, with at most {MAX_PATTERN_CHARS} characters."
+        )
 
 
 def _validate_advanced_options(  # noqa: C901, PLR0913 - validate the related view options together.
@@ -492,9 +538,11 @@ async def get_job_log(  # noqa: C901, PLR0912, PLR0913 - each argument and branc
     succeeded; summary then returns the last 20 lines with `found=false` and a hint. `head` reads only the first 32 KiB
     of the raw trace. `search` finds cleaned lines containing a case-insensitive literal pattern, or any pattern in a
     list of 1 to 10 literals. List matches are prefixed with their 1-based pattern indices. `failures` finds common make
-    errors, pytest `FAILED` lines, `error:` text, Python traceback headers, or `Error` lines followed by a numeric code.
-    This is a conservative heuristic, not a complete failure detector. Search and failures include nearby context,
-    defaulting to two lines before and after, with `context` from 0 to 5. `section` returns the first exact runner
+    errors, pytest `FAILED` lines, `FAIL:` lines, `error:` text, Python traceback headers, or `Error` lines followed by
+    a numeric code. This is a conservative heuristic, not a complete failure detector. For a runner footer with no
+    recognized cause just above it, `failures` and `summary` also keep the last job output lines above that footer.
+    Search and failures include nearby context, defaulting to two lines before and after, with `context` from 0 to 5.
+    `section` returns the first exact runner
     section. Search, failures, and section scan at most `scan_bytes` (default 256 KiB, maximum 1 MiB); section reads a
     prefix, while search and failures can start at `byte_offset` (default 0). A cut search or failures scan returns
     `next_offset` after its last complete raw line. This is raw scan progress, not pagination of `max_chars`-truncated
