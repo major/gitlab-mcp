@@ -8,8 +8,10 @@ from typing import Any, Literal
 import httpx
 import pytest
 import respx
+from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from gitlab_mcp import mcp
 from gitlab_mcp.client import GitLabClient
 from gitlab_mcp.config import Settings
 from gitlab_mcp.work_items import NOTE_BODY_BUDGET, read_work_item
@@ -117,9 +119,9 @@ def request_variables(route: respx.Route) -> list[dict[str, Any]]:
     return [json.loads(call.request.content)["variables"] for call in route.calls]
 
 
-async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+async def call_tool(name: str, arguments: dict[str, Any], *, client: Client | None = None) -> dict[str, Any]:
     """Call one registered production tool and return its structured result."""
-    return await call_mcp_tool(name, arguments)
+    return await call_mcp_tool(name, arguments, client=client)
 
 
 @pytest.mark.parametrize(
@@ -332,9 +334,14 @@ async def test_description_pages_reconstruct_full_text_and_keep_full_hash(gitlab
     arguments = {"project": PROJECT, "iid": IID}
 
     # Act
-    first = await call_tool("get_work_item", arguments)
-    second = await call_tool("get_work_item", arguments | {"description_offset": first["next_description_offset"]})
-    third = await call_tool("get_work_item", arguments | {"description_offset": second["next_description_offset"]})
+    async with Client(mcp) as client:
+        first = await call_tool("get_work_item", arguments, client=client)
+        second = await call_tool(
+            "get_work_item", arguments | {"description_offset": first["next_description_offset"]}, client=client
+        )
+        third = await call_tool(
+            "get_work_item", arguments | {"description_offset": second["next_description_offset"]}, client=client
+        )
 
     # Assert
     assert first["description"] + second["description"] + third["description"] == description

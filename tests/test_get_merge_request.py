@@ -104,9 +104,9 @@ def sent_variables(route: respx.Route) -> dict[str, Any]:
     return json.loads(route.calls.last.request.content)["variables"]
 
 
-async def call_tool(**extra: Any) -> dict:
+async def call_tool(*, client: Client | None = None, **extra: Any) -> dict:
     """Call get_merge_request with the default project and IID and return its data."""
-    return await call_mcp_tool("get_merge_request", {"project": PROJECT, "iid": IID, **extra})
+    return await call_mcp_tool("get_merge_request", {"project": PROJECT, "iid": IID, **extra}, client=client)
 
 
 @respx.mock
@@ -1027,14 +1027,17 @@ async def test_description_pages_reconstruct_unicode_text_without_gaps_or_overla
     offset = 0
 
     # Act
-    while True:
-        data = await call_tool(include_description=True, description_limit=3, description_offset=offset)
-        pages.append(data["description"])
-        next_offset = data.get("next_description_offset")
-        if next_offset is None:
-            break
-        assert next_offset == offset + len(data["description"])
-        offset = next_offset
+    async with Client(mcp) as client:
+        while True:
+            data = await call_tool(
+                include_description=True, description_limit=3, description_offset=offset, client=client
+            )
+            pages.append(data["description"])
+            next_offset = data.get("next_description_offset")
+            if next_offset is None:
+                break
+            assert next_offset == offset + len(data["description"])
+            offset = next_offset
 
     # Assert
     assert "".join(pages) == description
@@ -1053,9 +1056,14 @@ async def test_default_description_cap_pages_reconstruct_long_text(gitlab_env):
     route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(description=description)))
 
     # Act
-    first = await call_tool(include_description=True)
-    second = await call_tool(include_description=True, description_offset=first["next_description_offset"])
-    third = await call_tool(include_description=True, description_offset=second["next_description_offset"])
+    async with Client(mcp) as client:
+        first = await call_tool(include_description=True, client=client)
+        second = await call_tool(
+            include_description=True, description_offset=first["next_description_offset"], client=client
+        )
+        third = await call_tool(
+            include_description=True, description_offset=second["next_description_offset"], client=client
+        )
     pages = [first["description"], second["description"], third["description"]]
 
     # Assert
@@ -1131,9 +1139,12 @@ async def test_description_hash_compares_full_raw_text_across_pages_and_edits(gi
     )
 
     # Act
-    first = await call_tool(include_description=True, include_description_hash=True, description_limit=3)
-    second = await call_tool(include_description=True, description_offset=3, description_limit=3)
-    edited = await call_tool(include_description=True, description_offset=3, description_limit=3)
+    async with Client(mcp) as client:
+        first = await call_tool(
+            include_description=True, include_description_hash=True, description_limit=3, client=client
+        )
+        second = await call_tool(include_description=True, description_offset=3, description_limit=3, client=client)
+        edited = await call_tool(include_description=True, description_offset=3, description_limit=3, client=client)
 
     # Assert
     assert route.call_count == len([first, second, edited])
