@@ -51,9 +51,9 @@ def response(body: Any, *, status: int = 200) -> httpx.Response:
     return httpx.Response(status, json=body)
 
 
-def merge_request(*, sha: str = HEAD) -> dict[str, Any]:
+def merge_request(*, sha: str = HEAD, head_sha: str = HEAD) -> dict[str, Any]:
     """Return the merge-request SHA fields used by review-note preflight."""
-    return {"sha": sha, "diff_refs": {"base_sha": BASE_SHA, "start_sha": START_SHA, "head_sha": HEAD}}
+    return {"sha": sha, "diff_refs": {"base_sha": BASE_SHA, "start_sha": START_SHA, "head_sha": head_sha}}
 
 
 def diff_file(path: str = "src.py", patch: str = "@@ -1,3 +1,3 @@\n one\n two\n three") -> dict[str, Any]:
@@ -68,8 +68,19 @@ def diff_file(path: str = "src.py", patch: str = "@@ -1,3 +1,3 @@\n one\n two\n 
     }
 
 
+def add_head_change(paths: tuple[str, ...] = ()) -> None:
+    """Register the merge-base and compare reads for a stale head, as a fast-forward that changed `paths`."""
+    repository = f"{BASE}/projects/{ENCODED_PROJECT}/repository"
+    respx.get(f"{repository}/merge_base").mock(
+        side_effect=lambda request: response({"id": request.url.params.get_list("refs[]")[0]})
+    )
+    compare = {"diffs": [{"old_path": path, "new_path": path} for path in paths], "compare_timeout": False}
+    respx.get(f"{repository}/compare").mock(return_value=response(compare))
+
+
 def add_preflight(*, mr_reply: Any = None) -> tuple[respx.Route, respx.Route]:
     """Register reusable MR and diff responses for validation and posting preflight."""
+    add_head_change()
     mr_route = respx.get(MR_URL).mock(return_value=response(mr_reply or merge_request()))
     diff_route = respx.get(DIFF_URL).mock(return_value=response([diff_file()]))
     return mr_route, diff_route
@@ -498,14 +509,14 @@ async def test_unavailable_batch_repreview_returns_warning_preview(review_client
     assert data["batch_error"] == "unavailable"
     assert "batch_id" not in data
     text = preview.read_text(encoding="utf-8")
-    assert "No postable batch is available" in text
+    assert "No new batch was created" in text
     assert data["warning"] in text
     assert all(call.request.method == "GET" for call in respx.calls)
 
 
 @respx.mock
-async def test_repreview_failed_validation_consumes_old_batch(review_client: Client, tmp_path: Path) -> None:
-    """A failed re-preview writes its errors but returns no replacement handle."""
+async def test_repreview_failed_validation_keeps_old_batch(review_client: Client, tmp_path: Path) -> None:
+    """A failed re-preview writes its errors and keeps the old handle, because validation never writes ♻️."""
     # Arrange
     add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -529,8 +540,11 @@ async def test_repreview_failed_validation_consumes_old_batch(review_client: Cli
     assert "batch_id" not in result.structured_content
     assert result.structured_content["results"][0]["status"] == "failed"
     assert "Reason:" in preview.read_text(encoding="utf-8")
-    assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)))
+    assert result.structured_content.get("batch_retained") is True
     assert not post_route.called
+    posted = await call_review(review_client, **note_args(batch_id=batch_id))
+    assert posted.structured_content["posted_count"] == 1
+    assert json.loads(post_route.calls.last.request.content)["body"] == "draft"
 
 
 @respx.mock
@@ -690,6 +704,7 @@ async def test_stale_head_with_body_override_has_no_writes(review_client: Client
 
     mr_route = respx.get(MR_URL).mock(side_effect=current_mr)
     diff_route = respx.get(DIFF_URL).mock(return_value=response([diff_file()]))
+    add_head_change()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     prepared = await call_review(
         review_client,
@@ -754,45 +769,85 @@ async def test_invalid_body_overrides_have_no_gitlab_writes(
 
 
 @respx.mock
-async def test_stale_live_head_consumes_token_without_writes(review_client: Client) -> None:
-    """Posting without head_sha still reruns preflight and refuses a token if the live head changed."""
+async def test_stale_batch_is_kept_and_repreviewed_on_the_new_head(review_client: Client, tmp_path: Path) -> None:
+    """A stale post writes nothing and keeps the batch, so it can be re-checked on the new head without bodies 🔁."""
     # Arrange
+    new_head = "d" * 40
     live_sha = HEAD
 
     def current_mr(_: httpx.Request) -> httpx.Response:
         """Return the current merge-request SHA when each preflight check runs."""
-        return response(merge_request(sha=live_sha))
+        return response(merge_request(sha=live_sha, head_sha=live_sha))
 
-    mr_route = respx.get(MR_URL).mock(side_effect=current_mr)
+    respx.get(MR_URL).mock(side_effect=current_mr)
     diff_route = respx.get(DIFF_URL).mock(return_value=response([diff_file()]))
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"file": "src.py", "line": 1, "body": "inline review"}, {"body": "general review"}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
+    batch_id = prepared.structured_content["batch_id"]
+    live_sha = new_head
+    add_head_change(paths=("src.py",))
+    prior_diff_calls = len(diff_route.calls)
+
+    # Act: a reordered stale post, then a re-preview of only the general note on the new head.
+    stale = await call_review(review_client, **note_args(batch_id=batch_id, head_sha=None, indices=[1, 0]))
+    repreview = await call_review(
+        review_client,
+        **note_args(
+            batch_id=batch_id,
+            head_sha=new_head,
+            indices=[1],
+            validate_only=True,
+            preview_path=str(tmp_path / "repreview.md"),
+        ),
+    )
+
+    # Assert
+    data = stale.structured_content
+    # Indices are cached batch indices, so the inline note stays 0 although it was sent second. 🔢
+    assert data["unattempted"] == [1, 0]
+    assert data["current_head_sha"] == new_head
+    assert data.get("batch_retained") is True
+    assert 0 < data["ttl_seconds"] <= review_batches.ReviewBatchCache.TTL_SECONDS
+    assert data["affected_note_indices"] == [0]
+    assert len(diff_route.calls) == prior_diff_calls
+    assert not post_route.called
+    new_batch = repreview.structured_content["batch_id"]
+    assert repreview.structured_content["validated_count"] == 1
+    posted = await call_review(review_client, **note_args(batch_id=new_batch, head_sha=new_head))
+    assert posted.structured_content["posted_count"] == 1
+    assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["general review"]
+    assert_unavailable(await call_review(review_client, **note_args(batch_id=batch_id)), head=new_head)
+
+
+@pytest.mark.parametrize("other_head", ["d" * 40, "invalid"], ids=["newer-head", "invalid-head"])
+@respx.mock
+async def test_posting_batch_with_another_head_keeps_batch(review_client: Client, other_head: str) -> None:
+    """Posting with a head the batch was not validated on is refused before any request and keeps the batch."""
+    # Arrange
+    add_preflight()
+    respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
     prepared = await call_review(
         review_client,
         **note_args(notes=[{"file": "src.py", "line": 1, "body": "review"}], validate_only=True),
     )
     batch_id = prepared.structured_content["batch_id"]
-    live_sha = "d" * 40
-    prior_mr_calls = len(mr_route.calls)
-    prior_diff_calls = len(diff_route.calls)
+    calls_before = len(respx.calls)
 
     # Act
-    stale = await call_review(review_client, **note_args(batch_id=batch_id, head_sha=None))
+    mismatch = await call_review(review_client, **note_args(batch_id=batch_id, head_sha=other_head))
 
     # Assert
-    assert not stale.is_error
-    assert stale.structured_content["unattempted"] == [0]
-    assert "stale" in stale.structured_content["warning"].lower()
-    assert len(mr_route.calls) == prior_mr_calls + 1
-    assert len(diff_route.calls) == prior_diff_calls
-    assert not post_route.called
-    replay = await call_review(review_client, **note_args(batch_id=batch_id))
-    assert_unavailable(replay, head=live_sha)
+    assert "still valid" in assert_rejected(mismatch).lower()
+    assert len(respx.calls) == calls_before
+    posted = await call_review(review_client, **note_args(batch_id=batch_id))
+    assert posted.structured_content["posted_count"] == 1
 
 
 @pytest.mark.parametrize(
     ("changed_field", "changed_value"),
-    [("project", "group/other"), ("iid", IID + 1), ("head_sha", "d" * 40), ("head_sha", "invalid")],
-    ids=["project", "iid", "head-sha", "invalid-head-sha"],
+    [("project", "group/other"), ("iid", IID + 1)],
+    ids=["project", "iid"],
 )
 @respx.mock
 async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
@@ -800,7 +855,7 @@ async def test_changed_batch_binding_is_rejected_without_gitlab_requests(
     changed_field: str,
     changed_value: Any,
 ) -> None:
-    """A token is bound to its project, IID, and SHA, and a mismatch consumes it before I/O."""
+    """A token is bound to its project and IID, and a mismatch consumes it before I/O."""
     # Arrange
     mr_route, diff_route = add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -1045,6 +1100,41 @@ async def test_batch_remains_claimable_just_before_expiration(
     assert not posted.is_error
     assert posted.structured_content["posted_count"] == 1
     assert len(post_route.calls) == 1
+
+
+@respx.mock
+async def test_batch_that_expires_during_a_stale_call_is_not_kept(
+    review_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch that expires while a call that wrote nothing is running is dropped, not put back ⏰."""
+    # Arrange
+    clock = {"now": 100.0}
+    monkeypatch.setattr(review_batches, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+    new_head = "d" * 40
+    add_preflight()
+    prepared = await call_review(
+        review_client,
+        **note_args(notes=[{"file": "src.py", "line": 1, "body": "review"}], validate_only=True),
+    )
+    clock["now"] += prepared.structured_content["ttl_seconds"] - 0.01
+
+    def slow_stale_read(_: httpx.Request) -> httpx.Response:
+        """Return a newer head after the batch's lifetime runs out."""
+        clock["now"] += 1
+        return response(merge_request(sha=new_head, head_sha=new_head))
+
+    respx.get(MR_URL).mock(side_effect=slow_stale_read)
+
+    # Act
+    stale = await call_review(review_client, **note_args(batch_id=prepared.structured_content["batch_id"]))
+
+    # Assert
+    data = stale.structured_content
+    assert data["unattempted"] == [0]
+    assert "batch_retained" not in data
+    assert "ttl_seconds" not in data
+    replay = await call_review(review_client, **note_args(batch_id=prepared.structured_content["batch_id"]))
+    assert_unavailable(replay, head=new_head)
 
 
 @respx.mock

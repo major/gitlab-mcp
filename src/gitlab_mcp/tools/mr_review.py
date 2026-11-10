@@ -42,6 +42,12 @@ REVIEW_NOTE_CALL_CAP = 20
 # Keys a body_dir note file may set in its front matter. 🧭
 FRONT_MATTER_KEYS = frozenset({"file", "line", "old_line"})
 PEOPLE_SKIPPED_WARNING = "Reviewers and assignees were not changed because not every note posted."
+CHANGED_FILE_CAP = 20
+BATCH_RETAINED_WARNING = (
+    "This call wrote nothing, so batch_id stays valid for ttl_seconds with its original bodies. Re-preview it with "
+    "validate_only, preview_path, head_sha (current_head_sha if the head moved), and any overrides, indices, or "
+    "extras again, then get fresh APPROVE before posting."
+)
 
 
 class ReviewNote(BaseModel):
@@ -209,6 +215,34 @@ class PostReviewNotesResult(BaseModel):
     note_ids: list[int] = Field(default_factory=list, exclude_if=lambda value: not value)
     warning: str = Field(default="", exclude_if=lambda value: not value)
     current_head_sha: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    head_change: Literal["fast_forward", "rewritten"] | None = Field(
+        default=None,
+        description="Only for a stale head: fast_forward when head_sha is an ancestor of the current head.",
+        exclude_if=lambda value: value is None,
+    )
+    changed_files: list[str] = Field(
+        default_factory=list,
+        description=f"Only for a stale head: the first {CHANGED_FILE_CAP} paths changed since head_sha.",
+        exclude_if=lambda value: not value,
+    )
+    changed_file_count: int | None = Field(
+        default=None,
+        description="Only for a stale head: how many paths changed since head_sha.",
+        exclude_if=lambda value: value is None,
+    )
+    affected_note_indices: list[int] | None = Field(
+        default=None,
+        description=(
+            "Only for a stale head: note indices whose file changed since head_sha. Empty means no note "
+            "file changed; absent means GitLab could not list the changes completely."
+        ),
+        exclude_if=lambda value: value is None,
+    )
+    batch_retained: bool = Field(
+        default=False,
+        description="True when this batch_id call wrote nothing and the same batch_id is still valid.",
+        exclude_if=lambda value: not value,
+    )
     people: PeopleResult | None = Field(default=None, exclude_if=lambda value: value is None)
     batch_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     body_files: list[str] = Field(
@@ -274,7 +308,7 @@ def _write_review_preview(
     if result.warning:
         stream.write(f"Warning: {result.warning}\n\n")
     if not result.batch_id:
-        stream.write("No postable batch is available.\n\n")
+        stream.write("No new batch was created.\n\n")
     for index, note in enumerate(notes):
         row = result.results[index]
         location = "general" if note.file is None else f"file {note.file}"
@@ -321,13 +355,13 @@ def _lean_review_result(result: PostReviewNotesResult, *, validate_only: bool) -
     )
 
 
-def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int, head_sha: str | None) -> CachedReviewBatch:
-    """Claim synchronously, treating an unconfigured cache as unavailable."""
+def _claim_review_batch(ctx: Context, batch_id: str, project: str, iid: int) -> CachedReviewBatch:
+    """Claim synchronously, treating an unconfigured cache as unavailable. `_batch_head_sha` checks the head."""
     try:
         cache = get_review_batch_cache(ctx)
     except ToolError as exc:
         raise ReviewBatchUnavailableError from exc
-    return cache.claim(batch_id, project, iid, head_sha)
+    return cache.claim(batch_id, project, iid)
 
 
 async def _live_head_sha(ctx: Context, project: str, iid: int) -> str | None:
@@ -370,6 +404,57 @@ async def _unavailable_review_batch(
     return PostReviewNotesResult(
         results=[], batch_error="unavailable", warning=warning, current_head_sha=current_head_sha
     )
+
+
+def _restore_review_batch(ctx: Context, batch_id: str, batch: CachedReviewBatch) -> int | None:
+    """Put a claimed batch back after a call that wrote nothing, and return its remaining seconds.
+
+    A cache that went away (for example, a new server lifespan) or an expired batch returns `None`, so the caller
+    reports the result it already has instead of a restore error.
+    """
+    try:
+        return get_review_batch_cache(ctx).restore(batch_id, batch)
+    except ToolError:
+        return None
+
+
+async def _head_change_summary(
+    client: GitLabClient, project: str, reviewed: str, current: str, notes: list[ReviewNote]
+) -> dict[str, Any]:
+    """Describe how the head moved since review, leaving out any part GitLab could not answer completely 🧭.
+
+    Both reads are best effort. A fork merge request, a garbage-collected SHA, or an API error drops only that
+    part. `straight=true` compares the two heads directly, so a rewrite still shows changes on the old side.
+    """
+    repository = f"/projects/{quote(project, safe='')}/repository"
+    summary: dict[str, Any] = {}
+    errors = (ToolError, OSError, ValueError, KeyError, TypeError, RecursionError)
+    with suppress(*errors):
+        merge_base = await client.get(f"{repository}/merge_base", **{"refs[]": [reviewed, current]})
+        base_sha = merge_base.get("id") if isinstance(merge_base, dict) else None
+        if full_sha(base_sha):
+            summary["head_change"] = "fast_forward" if str(base_sha).lower() == reviewed else "rewritten"
+    with suppress(*errors):
+        compare = await client.get(f"{repository}/compare", **{"from": reviewed, "to": current, "straight": "true"})
+        diffs = compare.get("diffs") if isinstance(compare, dict) and not compare.get("compare_timeout") else None
+        if isinstance(diffs, list):
+            # dict.fromkeys keeps GitLab's order while dropping the repeated path of an unrenamed file.
+            paths = list(
+                dict.fromkeys(
+                    path
+                    for diff in diffs
+                    if isinstance(diff, dict)
+                    for path in (diff.get("old_path"), diff.get("new_path"))
+                    if isinstance(path, str)
+                )
+            )
+            changed = set(paths)
+            summary |= {
+                "changed_files": paths[:CHANGED_FILE_CAP],
+                "changed_file_count": len(paths),
+                "affected_note_indices": [index for index, note in enumerate(notes) if note.file in changed],
+            }
+    return summary
 
 
 def _unattempted_review_notes(
@@ -1215,6 +1300,45 @@ def _require_selected_overrides(
     )
 
 
+def _batch_head_sha(
+    ctx: Context, batch_id: str, batch: CachedReviewBatch, head_sha: str | None, *, validate_only: bool
+) -> str:
+    """Pick the head a claimed batch runs against, refusing a post on a head it was not validated on.
+
+    A re-preview may move the batch to a newer head: it never writes and returns a new handle that needs fresh
+    approval. A post on another head, or a malformed head, is refused before any request, and the batch goes back
+    into the cache, so a typo or an early retry does not cost the caller the batch. ♻️
+    """
+    if head_sha is None or head_sha.lower() == batch.head_sha.lower():
+        return batch.head_sha
+    if validate_only and full_sha(head_sha):
+        return head_sha
+    get_review_batch_cache(ctx).restore(batch_id, batch)
+    if not full_sha(head_sha):
+        problem = "head_sha must be a full 40-character hexadecimal SHA."
+    else:
+        problem = f"This batch was validated on head {batch.head_sha}, not {head_sha}."
+    raise ToolError(  # noqa: TRY003
+        f"{problem} Nothing was attempted and the batch_id is still valid. To check it on a new head, re-preview it "
+        "with validate_only=true, preview_path, and that head_sha, then get fresh APPROVE before posting."
+    )
+
+
+def _retain_unwritten_batch(
+    ctx: Context, batch_id: str, batch: CachedReviewBatch, result: PostReviewNotesResult
+) -> PostReviewNotesResult:
+    """Keep a claimed batch when the call wrote nothing and issued no new handle, such as a stale head 🔁.
+
+    This covers a stale or changed head, a failed preflight, and a failed re-preview. Only reads happened, so
+    the caller can fix the problem and re-preview the same batch_id instead of resending every note.
+    """
+    ttl_seconds = _restore_review_batch(ctx, batch_id, batch)
+    if ttl_seconds is None:
+        return result
+    warning = " ".join(filter(None, (result.warning, BATCH_RETAINED_WARNING)))
+    return result.model_copy(update={"batch_retained": True, "ttl_seconds": ttl_seconds, "warning": warning[:500]})
+
+
 def _cached_review_notes_with_overrides(
     cached_notes: tuple[CachedReviewNote, ...],
     body_overrides: list[ReviewNoteBodyOverride] | None,
@@ -1284,14 +1408,20 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     validate_only: bool,
     body_dir: str | None,
     preview_file: TextIO | None = None,
-) -> PostReviewNotesResult:
-    """Run preflight, then validate or post the notes. The public tool adds people changes after this returns."""
+) -> tuple[PostReviewNotesResult, bool]:
+    """Run preflight, then validate or post the notes. The public tool adds people changes after this returns.
 
-    def finish(result: PostReviewNotesResult, resolved: list[_CheckedNote] | None = None) -> PostReviewNotesResult:
-        """Write a preview using the already resolved bodies before returning."""
+    Returns:
+        The result, and whether any write request was sent. Only the final posting step sends writes. 🔒
+    """
+
+    def finish(
+        result: PostReviewNotesResult, resolved: list[_CheckedNote] | None = None
+    ) -> tuple[PostReviewNotesResult, bool]:
+        """Write a preview using the already resolved bodies before returning a result that wrote nothing."""
         if preview_file is not None:
             _write_review_preview(preview_file, notes, resolved, result)
-        return result
+        return result, False
 
     if not full_sha(head_sha):
         return finish(
@@ -1313,7 +1443,12 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
     checks, refs, warning = await _prepare_review_notes(client, project, iid, head_sha, notes, checks)
     if warning:
         current_head_sha = refs.get("sha") if warning.startswith("The supplied head_sha is stale.") else None
-        return finish(_unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha), resolved)
+        result = _unattempted_review_notes(len(notes), warning, current_head_sha=current_head_sha)
+        # When only diff_refs lag behind the supplied head, the source SHA did not move and there is nothing to compare.
+        if current_head_sha is not None and current_head_sha != head_sha.lower():
+            summary = await _head_change_summary(client, project, head_sha.lower(), current_head_sha, notes)
+            result = result.model_copy(update=summary)
+        return finish(result, resolved)
     has_failed_checks = any(check.reason for check in checks)
     if validate_only or has_failed_checks:
         result = _review_preflight_result(checks)
@@ -1340,7 +1475,7 @@ async def _post_review_notes(  # noqa: PLR0913, PLR0917 - each argument is part 
                 }
             )
         return finish(result, resolved)
-    return await _post_review_note_batch(client, project, iid, checks, refs)
+    return await _post_review_note_batch(client, project, iid, checks, refs), True
 
 
 async def _add_people_after_posts(  # noqa: PLR0913, PLR0917 - each argument is one part of the people request.
@@ -1387,7 +1522,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
         Field(
             description=(
                 "Full 40-character head SHA from get_merge_request or get_merge_request_diff. Required with notes. "
-                "Optional with batch_id, which reuses the validated SHA; if set, it must match."
+                "Optional with batch_id, which reuses the validated SHA. A re-preview may pass a newer head to "
+                "re-check the cached notes there; a post on another head is refused and keeps the batch."
             ),
         ),
     ] = None,
@@ -1448,8 +1584,8 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
             description=(
                 "Single-use handle from a successful validate_only call. Provide this instead of notes. Without "
                 "indices, it posts every cached note. It is claimed before body_overrides indices are checked, so "
-                "an invalid index consumes the handle; a missing override for a selected position-only entry does "
-                "not. Re-preview also consumes it and returns a new handle on success."
+                "an invalid index consumes the handle. A call that writes nothing and returns no new handle keeps it "
+                "(batch_retained). A successful re-preview consumes it and returns a new handle."
             ),
         ),
     ] = None,
@@ -1499,13 +1635,13 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
     With validation notes, `preview_path` creates a new private server-local Markdown file containing the resolved
     snapshots and outcomes. A filename is not approval. To re-preview, send `batch_id`, `validate_only=true`, a new
     `preview_path`, and optional `body_overrides`, `indices`, or `extra_notes`. The new batch holds selected notes,
-    then extras; reply indices use that order. Every selected cached entry needs a body. It consumes the old handle
-    after claim, even when validation fails; early argument and preview path errors do not. Success returns a new
-    handle with frozen bodies. Get fresh explicit APPROVE for the final content, then post the new handle without
-    validate_only. Later overrides or extras need their own final-text approval.
-    A handle is not approval. It expires after 30 minutes, eviction, or restart; a posting attempt consumes it,
-    including failed preflight or invalid indices. A missing override for a selected position-only entry is the
-    exception: nothing is attempted and the handle stays valid.
+    then extras; reply indices use that order. Every selected cached entry needs a body. It may pass a newer
+    `head_sha`. Success consumes the old handle and returns a new one with frozen bodies. Get fresh explicit APPROVE
+    for the final content, then post the new handle without validate_only. Later overrides or extras need their own
+    final-text approval.
+    A handle is not approval. It expires after 30 minutes, eviction, or restart. Writes and most argument errors
+    consume it (an error that keeps it says so); a result that wrote nothing and has no new handle keeps it
+    (`batch_retained`, remaining `ttl_seconds`).
 
     With batch_id, `indices` selects zero-based cache indices in posting order; omit it for the whole batch.
     `body_overrides` uses the same indices; selected position-only entries require overrides, others keep snapshots.
@@ -1522,6 +1658,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
     `batch_error="unavailable"` means this call wrote nothing, not that prior attempts did. Check prior results and
     GitLab and wait for in-flight attempts. Recheck head/positions and get APPROVE for changed text. Warnings report
     current/stale/unknown head, not cached content; `current_head_sha` gives the live head when available.
+    A stale head adds `head_change`, `changed_files`, and `affected_note_indices`.
 
     `body_path` names a server-local file. With absolute `body_dir`, relative paths must stay inside that directory.
     Posting requires one body source per note. Preflight failure prevents posting: `results` gives failed-note reasons,
@@ -1563,9 +1700,10 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
 
     with _review_preview_file(preview_path) as preview_file:
         selected_indices = list(range(len(notes or [])))
+        cached_batch = None
         if batch_id is not None:
             try:
-                cached_batch = _claim_review_batch(ctx, batch_id, project, iid, head_sha)
+                cached_batch = _claim_review_batch(ctx, batch_id, project, iid)
             except ReviewBatchUnavailableError:
                 result = await _unavailable_review_batch(ctx, project, iid, head_sha)
                 if preview_file is not None:
@@ -1573,7 +1711,7 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
                 return _lean_review_result(
                     result.model_copy(update={"preview_path": preview_path}), validate_only=validate_only
                 )
-            head_sha = cached_batch.head_sha
+            head_sha = _batch_head_sha(ctx, batch_id, cached_batch, head_sha, validate_only=validate_only)
             cached_notes = _cached_review_notes_with_overrides(cached_batch.notes, body_overrides)
             notes, selected_indices = _select_review_notes(cached_notes, indices)
             _require_selected_overrides(ctx, batch_id, cached_batch, notes, selected_indices)
@@ -1584,13 +1722,19 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
         # Unreachable after the checks above; this narrows both types for the checker.
         if notes is None or head_sha is None:
             raise ToolError("Provide exactly one of notes or batch_id.")  # noqa: TRY003
-        result = await _post_review_notes(ctx, project, iid, head_sha, notes, validate_only, body_dir, preview_file)
+        result, wrote = await _post_review_notes(
+            ctx, project, iid, head_sha, notes, validate_only, body_dir, preview_file
+        )
+    if batch_id is not None and cached_batch is not None and not wrote and result.batch_id is None:
+        result = _retain_unwritten_batch(ctx, batch_id, cached_batch, result)
     if preview_path is not None:
         result = result.model_copy(update={"preview_path": preview_path})
+    affected = result.affected_note_indices
     result = result.model_copy(
         update={
             "body_files": body_files,
             "results": [row.model_copy(update={"index": selected_indices[row.index]}) for row in result.results],
+            "affected_note_indices": None if affected is None else [selected_indices[index] for index in affected],
         }
     )
     if not validate_only:

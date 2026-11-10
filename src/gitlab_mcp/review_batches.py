@@ -17,12 +17,12 @@ class ReviewBatchUnavailableError(ToolError):
 
 
 class ReviewBatchMismatchError(ToolError):
-    """A claimed batch does not match the supplied project, MR, or head SHA."""
+    """A claimed batch does not match the supplied project or MR."""
 
     def __init__(self) -> None:
         """Explain that the mismatched batch was consumed without a GitLab request."""
         super().__init__(
-            "Review note batch does not match the supplied project, merge request, or head SHA. "
+            "Review note batch does not match the supplied project or merge request. "
             "The batch was consumed; no GitLab requests were made by this call."
         )
 
@@ -82,13 +82,21 @@ class ReviewBatchCache:
         self._store(batch_id, batch)
         return batch_id
 
-    def restore(self, batch_id: str, batch: CachedReviewBatch) -> None:
-        """Put back a claimed batch after a rejection that attempted nothing, keeping its id and expiry.
+    def restore(self, batch_id: str, batch: CachedReviewBatch) -> int | None:
+        """Put back a claimed batch after a call that sent no write request, keeping its id and expiry.
 
-        Call this only before any await or GitLab request, so no other attempt can have used the handle. An
-        expired batch needs no special case: the next `claim` purges it. ♻️
+        `claim` pops the batch, so no other call can use the handle while this call holds it, even across awaits.
+        Only GitLab reads may have happened, so nothing can post twice. ♻️
+
+        Returns:
+            The whole seconds left before the batch expires, or `None` when it expired first and was dropped.
         """
+        self._purge_expired()
+        remaining = batch.expires_at - time.monotonic()
+        if remaining <= 0:
+            return None
         self._store(batch_id, batch)
+        return max(1, int(remaining))
 
     def _store(self, batch_id: str, batch: CachedReviewBatch) -> None:
         """Insert a batch, evicting the oldest ones first when count or byte limits would be exceeded."""
@@ -99,11 +107,11 @@ class ReviewBatchCache:
         self._batches[batch_id] = batch
         self._cache_bytes += batch.size_bytes
 
-    def claim(self, batch_id: str, project: str, iid: int, head_sha: str | None) -> CachedReviewBatch:
-        """Consume a batch, even if its project, merge request, or head SHA does not match.
+    def claim(self, batch_id: str, project: str, iid: int) -> CachedReviewBatch:
+        """Consume a batch, even if its project or merge request does not match.
 
-        A `None` head SHA skips the SHA match and keeps the SHA stored at validation. The live head check
-        before posting still catches a push made after validation. 🔒
+        The head SHA is not matched here. The caller compares it, so a head mismatch can put the batch back, and
+        the live head check before posting still catches a push made after validation. 🔒
         """
         self._purge_expired()
         batch = self._batches.pop(batch_id, None)
@@ -111,8 +119,7 @@ class ReviewBatchCache:
             raise ReviewBatchUnavailableError
         self._cache_bytes -= batch.size_bytes
 
-        head_mismatch = head_sha is not None and batch.head_sha.lower() != head_sha.lower()
-        if batch.project != project or batch.iid != iid or head_mismatch:
+        if batch.project != project or batch.iid != iid:
             raise ReviewBatchMismatchError
         return batch
 
