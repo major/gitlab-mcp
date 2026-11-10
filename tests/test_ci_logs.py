@@ -1249,9 +1249,10 @@ async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
     """The default failure scan ignores failures beyond 256 KiB of raw trace bytes."""
     # Arrange
     default_scan_bytes = 256 * 1024
-    line = b"line\n"
+    # Check the byte cap, not dense line scanning; the last newline lies past the cap.
+    line = b"x" * 1024 + b"\n"
     complete_lines = default_scan_bytes // len(line)
-    body = line * (complete_lines + 100) + b"error: outside scan window\n"
+    body = line * (complete_lines + 1) + b"error: outside scan window\n"
     job_route = mock_job()
     trace_route = mock_head(body)
 
