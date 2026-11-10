@@ -1246,14 +1246,15 @@ async def test_failures_view_drops_a_cut_raw_line_then_continues_from_its_byte_o
 
 @respx.mock
 async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
-    """The default failure scan reads at most 256 KiB of raw trace bytes."""
+    """The default failure scan ignores failures beyond 256 KiB of raw trace bytes."""
     # Arrange
     default_scan_bytes = 256 * 1024
-    line = b"line\n"
+    # Check the byte cap, not dense line scanning; the last newline lies past the cap.
+    line = b"x" * 1024 + b"\n"
     complete_lines = default_scan_bytes // len(line)
-    body = line * (complete_lines + 100)
-    mock_job()
-    mock_head(body)
+    body = line * (complete_lines + 1) + b"error: outside scan window\n"
+    job_route = mock_job()
+    trace_route = mock_head(body)
 
     # Act
     data = await call_log(view="failures")
@@ -1263,6 +1264,9 @@ async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
     assert data["scan_truncated"] is True
     assert data["next_offset"] == complete_lines * len(line)
     assert data["found"] is False
+    assert data["text"] == ""
+    assert data["complete"] is False
+    assert job_route.call_count == trace_route.call_count == 1
 
 
 # ---------- summary selection ----------
