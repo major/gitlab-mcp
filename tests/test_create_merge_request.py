@@ -22,6 +22,7 @@ CREATE = f"{PROJECT_API}/merge_requests"
 CREATED_IID = 42
 BLOCKER_ONE = 5
 BLOCKER_TWO = 6
+BLOCKER_THREE = 7
 BLOCKER_GLOBAL_ID = 5005
 DEPENDENCY_COUNT = 2
 CREATED_MR = f"{PROJECT_API}/merge_requests/{CREATED_IID}"
@@ -542,13 +543,23 @@ async def test_server_error_during_creation_is_unknown_and_stops_dependencies(gi
     assert "iid" not in data
 
 
-async def test_uncertain_dependency_stops_later_dependency_writes(gitlab_env, router):
-    """An unknown dependency outcome stops later dependencies and retains the created MR details."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("connection reset"),
+        httpx.Response(408, json={"message": "Request timeout"}),
+        httpx.Response(503, json={"message": "Service unavailable"}),
+    ],
+    ids=["connection", "timeout", "server-error"],
+)
+async def test_uncertain_dependency_stops_later_dependency_writes(gitlab_env, router, error):
+    """An uncertain dependency preserves earlier successes and stops all later writes."""
     # Arrange
     mock_blocker(router, BLOCKER_ONE)
     mock_blocker(router, BLOCKER_TWO)
+    mock_blocker(router, BLOCKER_THREE)
     router.post(CREATE).mock(return_value=create_response())
-    dependencies = router.post(CREATED_BLOCKS).mock(side_effect=httpx.ConnectError("connection reset"))
+    dependencies = router.post(CREATED_BLOCKS).mock(side_effect=[httpx.Response(201, json={}), error])
 
     # Act
     data = await call_tool(
@@ -556,14 +567,51 @@ async def test_uncertain_dependency_stops_later_dependency_writes(gitlab_env, ro
         target_branch="main",
         title="New MR",
         description="Details",
-        blocked_by=[BLOCKER_ONE, BLOCKER_TWO],
+        blocked_by=[BLOCKER_ONE, BLOCKER_TWO, BLOCKER_THREE],
     )
 
     # Assert
-    assert dependencies.call_count == 1
+    assert dependencies.call_count == DEPENDENCY_COUNT
     assert data["iid"] == CREATED_IID
-    assert data["unknown"] == [f"blocked_by:{BLOCKER_ONE}"]
-    assert data["failed"][f"blocked_by:{BLOCKER_TWO}"] == "not attempted after an unknown dependency outcome"
+    assert data["url"] == CREATED_URL
+    assert data["applied"] == ["create", f"blocked_by:{BLOCKER_ONE}"]
+    assert data["unknown"] == [f"blocked_by:{BLOCKER_TWO}"]
+    assert data["failed"] == {f"blocked_by:{BLOCKER_THREE}": "not attempted after an unknown dependency outcome"}
+    assert [call.request.url.params["blocking_merge_request_id"] for call in dependencies.calls] == [
+        str(BLOCKER_ONE * 100),
+        str(BLOCKER_TWO * 100),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "identifiers"),
+    [
+        ([], {}),
+        ({"iid": True, "web_url": CREATED_URL}, {"url": CREATED_URL}),
+        ({"iid": CREATED_IID, "web_url": None}, {"iid": CREATED_IID}),
+    ],
+    ids=["not-an-object", "boolean-iid", "missing-url"],
+)
+async def test_malformed_create_response_is_unknown_and_stops_dependencies(gitlab_env, router, response, identifiers):
+    """An unusable success response is unknown and never triggers another write."""
+    # Arrange
+    mock_blocker(router, BLOCKER_ONE)
+    create = router.post(CREATE).mock(return_value=httpx.Response(201, json=response))
+    dependencies = router.post(CREATED_BLOCKS).mock(return_value=httpx.Response(201, json={}))
+
+    # Act
+    data = await call_tool(
+        source_branch="feature",
+        target_branch="main",
+        title="New MR",
+        description="Details",
+        blocked_by=[BLOCKER_ONE],
+    )
+
+    # Assert
+    assert data == {"unknown": ["create"], **identifiers}
+    assert create.call_count == 1
+    assert dependencies.call_count == 0
 
 
 async def test_create_tool_is_a_non_idempotent_write(gitlab_env):
