@@ -44,7 +44,10 @@ GRAPHQL = "https://gitlab.example.com/api/graphql"
 KNOWN_USERS = ("alice", "bob")
 # GraphQL operations that change people, plus the username lookup. write_order() looks for these names.
 PEOPLE_OPERATIONS = ("users(", "mergeRequestSetReviewers", "mergeRequestSetAssignees")
-RAW_FILES_URL = f"{BASE}/projects/{ENCODED_PROJECT}/repository/files"
+REPOSITORY_URL = f"{BASE}/projects/{ENCODED_PROJECT}/repository"
+RAW_FILES_URL = f"{REPOSITORY_URL}/files"
+NEW_HEAD = "d" * 40
+CHANGED_FILE_CAP = 20
 
 
 def response(body: Any, *, status: int = 200, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -86,7 +89,8 @@ def add_preflight(
     *,
     merge_requests: list[dict[str, Any]] | None = None,
 ) -> tuple[respx.Route, respx.Route]:
-    """Register fake merge-request and paged diff responses."""
+    """Register fake merge-request and paged diff responses, plus a quiet head-change summary for stale heads."""
+    add_head_change()
     mr_responses = merge_requests or [merge_request(), merge_request()]
     mr_route = respx.get(MR_URL).mock(side_effect=[response(item) for item in mr_responses])
     page_responses = [
@@ -95,6 +99,33 @@ def add_preflight(
     ]
     diff_route = respx.get(DIFF_URL).mock(side_effect=page_responses)
     return mr_route, diff_route
+
+
+def add_head_change(
+    *,
+    merge_base: str | None = None,
+    paths: tuple[str, ...] = (),
+    status: int = 200,
+    compare_timeout: bool = False,
+) -> tuple[respx.Route, respx.Route]:
+    """Register the merge-base and compare reads made for a stale head.
+
+    With no `merge_base`, the reviewed head (the first `refs[]` value) is the merge base, so the push is a
+    fast-forward. Each path becomes one compare diff entry.
+    """
+
+    def merge_base_reply(request: httpx.Request) -> httpx.Response:
+        """Return the requested merge base, defaulting to the reviewed head."""
+        return response({"id": merge_base or request.url.params.get_list("refs[]")[0]}, status=status)
+
+    compare = {
+        "diffs": [{"old_path": path, "new_path": path} for path in paths],
+        "compare_timeout": compare_timeout,
+    }
+    return (
+        respx.get(f"{REPOSITORY_URL}/merge_base").mock(side_effect=merge_base_reply),
+        respx.get(f"{REPOSITORY_URL}/compare").mock(return_value=response(compare, status=status)),
+    )
 
 
 def add_blobs(*files: tuple[str, str, bytes], status: int = 200) -> list[respx.Route]:
@@ -1160,6 +1191,79 @@ async def test_stale_head_sha_reports_source_sha_when_diff_head_differs(gitlab_e
     assert data["current_head_sha"] == source_sha
     assert len(mr_route.calls) == 1
     assert not diff_route.called
+    assert not post_route.called
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="Stale heads do not summarize changes yet (#223).")
+@pytest.mark.parametrize(
+    ("merge_base", "head_change"),
+    [(HEAD, "fast_forward"), (BASE_SHA, "rewritten")],
+    ids=["fast-forward", "rewritten"],
+)
+@respx.mock
+async def test_stale_head_summarizes_changes_since_reviewed_head(gitlab_env, merge_base, head_change):
+    """A stale head reports how it moved, the changed paths, and which notes point at a changed file 🧭."""
+    # Arrange
+    add_preflight([([diff_file("src.py")], None)], merge_requests=[merge_request(sha=NEW_HEAD, head_sha=NEW_HEAD)])
+    unrelated = tuple(f"docs/page{number}.md" for number in range(CHANGED_FILE_CAP + 1))
+    _, compare_route = add_head_change(merge_base=merge_base, paths=(*unrelated, "src.py"))
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+    notes = [{"body": "General comment."}, review_note("app.py", 1), review_note("src.py", 1)]
+
+    # Act
+    data = await call_tool(notes=notes)
+
+    # Assert: the noted file is past the path cap, so affected notes come from the full change list.
+    assert data["unattempted"] == [0, 1, 2]
+    assert data["current_head_sha"] == NEW_HEAD
+    assert data.get("head_change") == head_change
+    assert data.get("changed_file_count") == len(unrelated) + 1
+    assert data.get("changed_files") == list(unrelated[:CHANGED_FILE_CAP])
+    assert data.get("affected_note_indices") == [2]
+    params = compare_route.calls.last.request.url.params
+    assert (params["from"], params["to"], params["straight"]) == (HEAD, NEW_HEAD, "true")
+    assert not post_route.called
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        # Characterization: failed summary reads leave every summary field out.
+        pytest.param("unavailable", {}, id="reads-fail"),
+        # A timed-out compare has an incomplete path list, so only the merge-base answer is kept.
+        pytest.param(
+            "timeout",
+            {"head_change": "fast_forward"},
+            id="compare-timeout",
+            marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason="No head summary yet (#223)."),
+        ),
+        # Characterization: only diff_refs lag behind the supplied head, so there is nothing to compare.
+        pytest.param("diff-refs-lag", {}, id="diff-refs-lag"),
+    ],
+)
+@respx.mock
+async def test_stale_head_summary_omits_fields_it_cannot_prove(gitlab_env, case, expected):
+    """Summary fields appear only when GitLab answered completely, and stale results never write."""
+    # Arrange
+    live = merge_request(sha=HEAD, head_sha=NEW_HEAD) if case == "diff-refs-lag" else merge_request(sha=NEW_HEAD)
+    add_preflight([([diff_file("src.py")], None)], merge_requests=[live])
+    base_route, compare_route = add_head_change(
+        paths=("src.py",),
+        status=404 if case == "unavailable" else 200,
+        compare_timeout=case == "timeout",
+    )
+    post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
+
+    # Act
+    data = await call_tool(notes=[review_note("src.py", 1)])
+
+    # Assert
+    assert data["unattempted"] == [0]
+    summary_keys = ("head_change", "changed_files", "changed_file_count", "affected_note_indices")
+    assert {key: data[key] for key in summary_keys if key in data} == expected
+    if case == "diff-refs-lag":
+        assert not base_route.called
+        assert not compare_route.called
     assert not post_route.called
 
 
