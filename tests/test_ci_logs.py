@@ -24,6 +24,36 @@ SIXTEEN_KIB = 16 * 1024
 REDACTED_TOKEN_CHARS = len("token=[REDACTED]")
 SEARCH_OUTPUT_CAP = 8
 ESCAPE = "\x1b[1m"  # 4 bytes of terminal styling that becomes nothing once cleaned.
+# The job's own output says what went wrong, but no line has a failure marker. GitLab Runner then adds its
+# artifact and cleanup lines before the generic `ERROR: Job failed` footer 🏃. Five lines fill the output cap,
+# so a `setup` line above them shows that older output is left out.
+JOB_OUTPUT_LINES = (
+    "Running smoke checks\n"
+    "$ python scripts/smoke.py\n"
+    "WARNING: empty cgroup path for container demo\n"
+    "expected one container run, got 0\n"
+    "Smoke result: failed\n"
+)
+RUNNER_TRAILER_LINES = (
+    "\n"
+    "Uploading artifacts for failed job\n"
+    "Uploading artifacts...\n"
+    "Runtime platform                                    arch=amd64 os=linux pid=1\n"
+    "data/reports/smoke.json: found 1 matching artifact files and directories \n"
+    'Uploading artifacts as "archive" to coordinator... 201 Created  id=1\n'
+    "Cleaning up project directory and file based variables\n"
+    "\n"
+)
+# A job that failed before writing its artifacts also gets runner upload errors, which must not hide the job output.
+UPLOAD_ERROR_TRAILER_LINES = (
+    "\n"
+    "Uploading artifacts for failed job\n"
+    "WARNING: data/reports/smoke.json: no matching files. Ensure that the artifact path is relative\n"
+    "ERROR: No files to upload\n"
+    "Cleaning up project directory and file based variables\n"
+    "\n"
+)
+RUNNER_FOOTER = "ERROR: Job failed: exit status 1\n"
 
 
 async def call_log(**arguments: Any) -> dict[str, Any]:
@@ -480,6 +510,18 @@ async def test_advanced_options_are_validated_before_any_request(arguments):
     assert job_route.call_count == 0
     assert trace_route.call_count == 0
     assert tail_route.call_count == 0
+    assert len(respx.calls) == 0
+
+
+@respx.mock
+async def test_search_without_pattern_names_the_pattern_argument():
+    """A search with no pattern says which argument is missing, so the caller can fix it in one retry."""
+    # Arrange
+    mock_job()
+
+    # Act / Assert
+    with pytest.raises(ToolError, match=r"view='search' needs the pattern argument"):
+        await call_log(view="search")
     assert len(respx.calls) == 0
 
 
@@ -1048,8 +1090,10 @@ async def test_failures_view_selects_early_make_failure_instead_of_long_successf
         "ERROR: could not resolve dependency",
         "Traceback (most recent call last):",
         "Error 17.",
+        "FAIL: expected one container run",
+        "--- FAIL: TestParse (0.00s)",
     ],
-    ids=["make", "recursive-make", "pytest", "error-colon", "traceback", "numeric-error"],
+    ids=["make", "recursive-make", "pytest", "error-colon", "traceback", "numeric-error", "fail-colon", "go-fail"],
 )
 @respx.mock
 async def test_failures_view_recognizes_fixed_failure_markers(marker):
@@ -1065,6 +1109,29 @@ async def test_failures_view_recognizes_fixed_failure_markers(marker):
     assert data["text"] == f"{marker}\n"
     assert data["found"] is True
     assert data["complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("trailer", "runner_errors"),
+    [
+        (RUNNER_TRAILER_LINES, ""),
+        (UPLOAD_ERROR_TRAILER_LINES, "ERROR: No files to upload\n"),
+    ],
+    ids=["artifacts-uploaded", "artifact-upload-error"],
+)
+@respx.mock
+async def test_failures_view_shows_job_output_above_a_generic_runner_footer(trailer, runner_errors):
+    """A runner footer also returns the job's last output lines, even when the artifact upload also failed."""
+    # Arrange
+    mock_job()
+    mock_head("setup\n" + JOB_OUTPUT_LINES + trailer + RUNNER_FOOTER)
+
+    # Act
+    data = await call_log(view="failures", context=0)
+
+    # Assert
+    assert data["text"] == JOB_OUTPUT_LINES + runner_errors + RUNNER_FOOTER
+    assert data["found"] is True
 
 
 @respx.mock
@@ -1083,12 +1150,17 @@ async def test_failures_view_merges_overlapping_context_windows_in_chronological
     assert data["found"] is True
 
 
+@pytest.mark.parametrize(
+    "body",
+    ["build started\nall checks passed\n", "PASS: 12\nFAIL: 0\n"],
+    ids=["plain-output", "zero-fail-tally"],
+)
 @respx.mock
-async def test_failures_view_returns_empty_text_when_no_marker_matches():
-    """Ordinary log output is not returned when the bounded scan has no failure marker."""
+async def test_failures_view_returns_empty_text_when_no_marker_matches(body):
+    """Ordinary log output, including a `FAIL: 0` tally, is not returned when the scan has no failure marker."""
     # Arrange
     mock_job()
-    mock_head("build started\nall checks passed\n")
+    mock_head(body)
 
     # Act
     data = await call_log(view="failures")
@@ -1317,6 +1389,21 @@ async def test_summary_hints_when_only_make_or_runner_failure_is_visible(body):
     # Assert
     assert data["hint"] == ("Earlier diagnostics may be outside this 100-line window; try view=failures or search")
     assert "pytest" not in data["hint"].lower()
+    assert len(respx.calls) == ONE_CALL
+
+
+@respx.mock
+async def test_summary_shows_job_output_above_a_generic_runner_footer():
+    """Summary adds the job's last output lines when the runner footer is the only evidence."""
+    # Arrange
+    mock_tail("setup\n" + JOB_OUTPUT_LINES + RUNNER_TRAILER_LINES + RUNNER_FOOTER)
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    assert data["text"] == JOB_OUTPUT_LINES + RUNNER_FOOTER
+    assert data["found"] is True
     assert len(respx.calls) == ONE_CALL
 
 

@@ -524,8 +524,11 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     the job check. `head` reads the first 32 KiB of the raw trace. `search` uses one case-insensitive literal pattern
     or a list of 1 to 10. Each matching line in list mode includes all matching 1-based pattern indices. `failures`
     matches common
-    make errors, pytest `FAILED` lines, `error:` text, Python traceback headers, and `Error` followed by a numeric
-    code. This conservative heuristic can miss other failure formats and can match error text that is not a failure.
+    make errors, pytest `FAILED` lines, `FAIL:` and Go `--- FAIL:` lines, `error:` text, Python traceback headers,
+    and `Error` followed by a numeric code. This conservative heuristic can miss other failure formats and can match
+    error text that is not a failure. For a generic `ERROR: Job failed` footer, `failures` and `summary` also return
+    the last 5 job output lines above it, skipping GitLab Runner's artifact, cache, and cleanup lines, unless one of
+    those lines is already a recognized cause.
     Both search views keep two context lines by default; pass `context` from 0 to 5 to change it. `section` selects
     the first exact runner section. Search, failures, and section scan at most `scan_bytes` (default 256 KiB,
     maximum 1 MiB). Search and failures can resume with `byte_offset`; when a scan is cut, `next_offset` gives raw
