@@ -57,7 +57,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 - Use Arrange-Act-Assert comments, `pytest.mark.parametrize`, and fixtures. `asyncio_mode = "auto"`, so async tests need no marker.
 - `pytest-randomly` shuffles order; tests must not depend on each other.
 - Rule of Three for test helpers: shared fixtures like `gitlab_env` live in `tests/conftest.py`. Keep other helpers in their test file until a third file needs them, then move them there.
-- Known noise: one `SocketBlockedError` UserWarning and one beartype `DeprecationWarning` show up on a passing run.
+- Dependency startup noise is handled during the guarded urllib3 import and with a targeted beartype warning filter. Socket warnings are not globally suppressed. Remove the beartype filter when https://github.com/strawgate/py-key-value/issues/398 is fixed.
 
 ## Local MCP config
 
