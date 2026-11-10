@@ -115,6 +115,58 @@ async def test_rejects_stale_sha_before_retry(gitlab_env, kind):
     assert write.call_count == 0
 
 
+@pytest.mark.parametrize("kind", ["job", "pipeline"])
+@pytest.mark.parametrize("sha", [None, "not-a-sha"], ids=["missing", "malformed"])
+@respx.mock
+async def test_retry_without_a_verifiable_sha_never_posts(gitlab_env, kind, sha):
+    """Neither a job nor a pipeline can be retried without a full SHA from GitLab."""
+    # Arrange
+    resource_path = "jobs/42" if kind == "job" else "pipelines/901"
+    resource = ci_resource(kind, sha=sha)
+    if kind == "job":
+        resource["pipeline"] = {"sha": sha}
+    preflight = respx.get(f"{API}/projects/{ENCODED_PROJECT}/{resource_path}").mock(
+        return_value=httpx.Response(200, json=resource)
+    )
+    write = respx.post(f"{API}/projects/{ENCODED_PROJECT}/{resource_path}/retry").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="full commit SHA"):
+        await call_tool("retry_ci", retry_args(kind))
+    assert preflight.call_count == 1
+    assert write.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("commit", "expected_sha"),
+    [(None, SHA), ({"id": "not-a-sha"}, NEW_SHA)],
+    ids=["missing-commit-matches", "malformed-commit-mismatches"],
+)
+@respx.mock
+async def test_job_pipeline_sha_fallback_still_checks_expected_sha(gitlab_env, commit, expected_sha):
+    """A job's pipeline SHA can verify a retry, but cannot bypass the expected SHA check."""
+    # Arrange
+    preflight = respx.get(f"{API}/projects/{ENCODED_PROJECT}/jobs/42").mock(
+        return_value=httpx.Response(200, json={"status": "failed", "commit": commit, "pipeline": {"sha": SHA}})
+    )
+    write = respx.post(f"{API}/projects/{ENCODED_PROJECT}/jobs/42/retry").mock(
+        return_value=httpx.Response(200, json={"id": 43, "pipeline": {"sha": SHA}})
+    )
+
+    # Act / Assert
+    if expected_sha == SHA:
+        result = await call_tool("retry_ci", retry_args("job", expected_sha=expected_sha))
+        assert result == {"status": "started", "kind": "job", "id": 43, "sha": SHA}
+        assert write.call_count == 1
+    else:
+        with pytest.raises(ToolError, match="does not match expected_sha"):
+            await call_tool("retry_ci", retry_args("job", expected_sha=expected_sha))
+        assert write.call_count == 0
+    assert preflight.call_count == 1
+
+
 @pytest.mark.parametrize("status", ["running", "success", "skipped", None])
 @respx.mock
 async def test_rejects_ineligible_or_unknown_status(gitlab_env, status):
@@ -239,6 +291,25 @@ async def test_create_rejects_stale_ref_sha_before_post(gitlab_env):
     # Act / Assert
     with pytest.raises(ToolError, match="does not match expected_sha"):
         await call_tool("create_pipeline", {"ref": "main", "expected_sha": SHA})
+    assert write.call_count == 0
+
+
+@pytest.mark.parametrize("response", [{}, {"id": "not-a-sha"}], ids=["missing", "malformed"])
+@respx.mock
+async def test_create_without_a_verifiable_ref_sha_never_posts(gitlab_env, response):
+    """A ref without a full SHA cannot start a pipeline."""
+    # Arrange
+    preflight = respx.get(f"{API}/projects/{ENCODED_PROJECT}/repository/commits/main").mock(
+        return_value=httpx.Response(200, json=response)
+    )
+    write = respx.post(f"{API}/projects/{ENCODED_PROJECT}/pipeline").mock(
+        return_value=httpx.Response(201, json={"id": 902, "sha": SHA})
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="full commit SHA"):
+        await call_tool("create_pipeline", {"ref": "main", "expected_sha": SHA})
+    assert preflight.call_count == 1
     assert write.call_count == 0
 
 
@@ -395,6 +466,26 @@ async def test_malformed_success_response_is_unverified(gitlab_env, response):
     # Act / Assert
     with pytest.raises(ToolError, match="outcome is unverified"):
         await call_tool("retry_ci", retry_args("pipeline"))
+    assert write.call_count == 1
+
+
+@respx.mock
+async def test_invalid_json_after_create_is_unverified_and_not_retried(gitlab_env):
+    """Invalid JSON after a successful POST must not invite a retry or expose response contents."""
+    # Arrange
+    variable_value = "do-not-echo-this-secret"
+    respx.get(f"{API}/projects/{ENCODED_PROJECT}/repository/commits/main").mock(
+        return_value=httpx.Response(200, json={"id": SHA})
+    )
+    write = respx.post(f"{API}/projects/{ENCODED_PROJECT}/pipeline").mock(
+        return_value=httpx.Response(201, content=f"invalid JSON containing {variable_value}")
+    )
+
+    # Act / Assert
+    with pytest.raises(ToolError, match="outcome is unverified") as error:
+        await call_tool("create_pipeline", {"ref": "main", "expected_sha": SHA, "variables": {"TOKEN": variable_value}})
+    assert "Check GitLab before retrying" in str(error.value)
+    assert variable_value not in str(error.value)
     assert write.call_count == 1
 
 
