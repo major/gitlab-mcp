@@ -36,7 +36,6 @@ def test_network_operations_still_warn_and_fail(operation: str, args: tuple[int 
     assert str(caught[0].message) == f"A test tried to use socket.{operation}."
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="The async fixture loop scope is not pinned yet.")
 def test_async_fixture_loop_scope_is_explicit(pytestconfig: pytest.Config) -> None:
     """Async fixtures use an explicit function-scoped event loop."""
     # Arrange / Act

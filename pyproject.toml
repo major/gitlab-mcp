@@ -47,6 +47,7 @@ error-on-warning = true
 # Loopback tests can opt in with pytest.mark.allow_hosts(["127.0.0.1", "::1"]).
 addopts = "--cov-context=test --disable-socket --allow-unix-socket"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
