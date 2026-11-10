@@ -7,8 +7,10 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from gitlab_mcp import mcp
 from mcp_helpers import call_tool
 
 GRAPHQL = "https://gitlab.example.com/api/graphql"
@@ -93,9 +95,14 @@ async def test_note_pages_reconstruct_full_body_and_repeat_full_hash(gitlab_env)
     arguments = {"project": PROJECT, "iid": IID, "note_id": NOTE_ID}
 
     # Act
-    first = await call_tool("get_work_item_note", arguments)
-    second = await call_tool("get_work_item_note", arguments | {"body_offset": first["next_body_offset"]})
-    third = await call_tool("get_work_item_note", arguments | {"body_offset": second["next_body_offset"]})
+    async with Client(mcp) as client:
+        first = await call_tool("get_work_item_note", arguments, client=client)
+        second = await call_tool(
+            "get_work_item_note", arguments | {"body_offset": first["next_body_offset"]}, client=client
+        )
+        third = await call_tool(
+            "get_work_item_note", arguments | {"body_offset": second["next_body_offset"]}, client=client
+        )
 
     # Assert
     assert first["body"] + second["body"] + third["body"] == body

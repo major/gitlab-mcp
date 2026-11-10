@@ -1,13 +1,14 @@
 """Tests for the list_merge_requests tool, run through a real in-memory MCP client 🧪."""
 
 import json
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 import respx
 from fastmcp.exceptions import ToolError
-lazy from mcp.types import CallToolResult, TextContent
+lazy from fastmcp.client.client import CallToolResult
+lazy from mcp.types import TextContent
 
 from gitlab_mcp.common import MAX_PAGES
 from gitlab_mcp.tools.mr_read import TSV_COLUMNS
@@ -58,14 +59,15 @@ def sent_variables(route: respx.Route, index: int = -1) -> dict[str, Any]:
 
 
 async def call_tool_result(arguments: dict[str, Any] | None = None) -> CallToolResult:
-    """Call list_merge_requests with the default project and return the raw result."""
+    """Call list_merge_requests with the default project and return the FastMCP call result."""
     return await call_mcp_tool_result("list_merge_requests", {"project": PROJECT} | (arguments or {}))
 
 
 async def call_tool(arguments: dict[str, Any] | None = None) -> dict:
     """Call list_merge_requests with the default project and return its data."""
     result = await call_tool_result(arguments)
-    return result.structured_content
+    # This tool returns object content.
+    return cast("dict[str, Any]", result.structured_content)
 
 
 def rows(data: dict) -> list[dict[str, str]]:

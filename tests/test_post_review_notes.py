@@ -163,15 +163,27 @@ def review_note(file: str, line: int, body: str = "Please check this.", **extra:
 
 
 async def call_tool(
-    *, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False, **arguments: Any
+    *,
+    notes: list[dict[str, Any]],
+    head_sha: str = HEAD,
+    validate_only: bool = False,
+    client: Client | None = None,
+    **arguments: Any,
 ) -> dict[str, Any]:
     """Call post_review_notes through the real in-memory MCP client. Extra arguments are passed through."""
-    result = await call_tool_result(notes=notes, head_sha=head_sha, validate_only=validate_only, **arguments)
+    result = await call_tool_result(
+        notes=notes, head_sha=head_sha, validate_only=validate_only, client=client, **arguments
+    )
     return result.structured_content
 
 
 async def call_tool_result(
-    *, notes: list[dict[str, Any]], head_sha: str = HEAD, validate_only: bool = False, **arguments: Any
+    *,
+    notes: list[dict[str, Any]],
+    head_sha: str = HEAD,
+    validate_only: bool = False,
+    client: Client | None = None,
+    **arguments: Any,
 ) -> Any:
     """Call the tool and return its protocol result, including input validation errors."""
     return await call_mcp_tool_result(
@@ -185,6 +197,7 @@ async def call_tool_result(
             **arguments,
         },
         raise_on_error=False,
+        client=client,
     )
 
 
@@ -2905,38 +2918,39 @@ async def test_nearest_hint_selection_ranges_and_reason_cap(gitlab_env):
     add_preflight([([raw], None)])
 
     # Act nearest hint
-    nearest = await call_tool(notes=[review_note("src.py", 8)], validate_only=True)
+    async with Client(mcp) as client:
+        nearest = await call_tool(notes=[review_note("src.py", 8)], validate_only=True, client=client)
 
-    # Assert nearest hint
-    assert "Nearest new-side diff lines: 3, 6, 10-12." in nearest["results"][0]["reason"]
-    assert len(nearest["results"][0]["reason"]) <= REASON_CAP
+        # Assert nearest hint
+        assert "Nearest new-side diff lines: 3, 6, 10-12." in nearest["results"][0]["reason"]
+        assert len(nearest["results"][0]["reason"]) <= REASON_CAP
 
-    # Arrange capped hint
-    long_file = "x" * 180 + ".py"
-    long_raw = diff_file(long_file, patch="@@ -1,5 +1,5 @@\n a\n b\n c\n d\n e", new_file=True)
-    add_preflight([([long_raw], None)])
+        # Arrange capped hint
+        long_file = "x" * 180 + ".py"
+        long_raw = diff_file(long_file, patch="@@ -1,5 +1,5 @@\n a\n b\n c\n d\n e", new_file=True)
+        add_preflight([([long_raw], None)])
 
-    # Act capped hint
-    capped = await call_tool(notes=[review_note(long_file, 99)], validate_only=True)
+        # Act capped hint
+        capped = await call_tool(notes=[review_note(long_file, 99)], validate_only=True, client=client)
 
-    # Assert capped hint
-    reason = capped["results"][0]["reason"]
-    assert len(reason) == REASON_CAP
-    assert reason.endswith("Nearest new-side diff lines: 1-5.")
+        # Assert capped hint
+        reason = capped["results"][0]["reason"]
+        assert len(reason) == REASON_CAP
+        assert reason.endswith("Nearest new-side diff lines: 1-5.")
 
-    # Arrange oversized coordinates
-    huge_line = 10**200
-    huge_patch = f"@@ -{huge_line} +{huge_line} @@\n unchanged"
-    huge_raw = diff_file("src.py", patch=huge_patch, new_file=True)
-    add_preflight([([huge_raw], None)])
+        # Arrange oversized coordinates
+        huge_line = 10**200
+        huge_patch = f"@@ -{huge_line} +{huge_line} @@\n unchanged"
+        huge_raw = diff_file("src.py", patch=huge_patch, new_file=True)
+        add_preflight([([huge_raw], None)])
 
-    # Act oversized coordinates
-    huge_hint = await call_tool(notes=[review_note("src.py", 1)], validate_only=True)
+        # Act oversized coordinates
+        huge_hint = await call_tool(notes=[review_note("src.py", 1)], validate_only=True, client=client)
 
-    # Assert oversized coordinates
-    huge_reason = huge_hint["results"][0]["reason"]
-    assert len(huge_reason) <= REASON_CAP
-    assert "Nearest line hints are unavailable" in huge_reason
+        # Assert oversized coordinates
+        huge_reason = huge_hint["results"][0]["reason"]
+        assert len(huge_reason) <= REASON_CAP
+        assert "Nearest line hints are unavailable" in huge_reason
 
 
 @pytest.mark.parametrize(

@@ -152,12 +152,12 @@ def thread_ids(data: dict[str, Any]) -> list[str]:
     return [thread["id"] for thread in data["threads"]]
 
 
-async def call_tool(**arguments: Any) -> dict[str, Any]:
+async def call_tool(*, client: Client | None = None, **arguments: Any) -> dict[str, Any]:
     """Call get_merge_request_threads with the default project and IID and return its data."""
     tool_arguments = {"project": PROJECT, **arguments}
     if "iid" not in arguments and "iids" not in arguments:
         tool_arguments["iid"] = IID
-    return await call_mcp_tool("get_merge_request_threads", tool_arguments)
+    return await call_mcp_tool("get_merge_request_threads", tool_arguments, client=client)
 
 
 @pytest.mark.parametrize("state", ["all", ["open", "all"]])
@@ -504,13 +504,14 @@ async def test_note_ids_and_raw_hashes_cover_root_and_reply(gitlab_env, root_typ
     route = respx.post(GRAPHQL).mock(return_value=respond(page(make_discussion("t1", root, reply))))
 
     # Act
-    results = [
-        await call_tool(view="full", include_hashes=True),
-        await call_tool(view="finding", include_hashes=True),
-        await call_tool(view="full", max_body_chars=3, include_hashes=True),
-        await call_tool(view="finding", max_body_chars=0, include_hashes=True),
-    ]
-    headings = await call_tool(view="headings")
+    async with Client(mcp) as client:
+        results = [
+            await call_tool(view="full", include_hashes=True, client=client),
+            await call_tool(view="finding", include_hashes=True, client=client),
+            await call_tool(view="full", max_body_chars=3, include_hashes=True, client=client),
+            await call_tool(view="finding", max_body_chars=0, include_hashes=True, client=client),
+        ]
+        headings = await call_tool(view="headings", client=client)
 
     # Assert
     expected_hashes = [hashlib.sha256(body.encode("utf-8")).hexdigest() for body in (root_body, reply_body)]
