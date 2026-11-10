@@ -17,12 +17,12 @@ class ReviewBatchUnavailableError(ToolError):
 
 
 class ReviewBatchMismatchError(ToolError):
-    """A claimed batch does not match the supplied project, MR, or head SHA."""
+    """A claimed batch does not match the supplied project or MR."""
 
     def __init__(self) -> None:
         """Explain that the mismatched batch was consumed without a GitLab request."""
         super().__init__(
-            "Review note batch does not match the supplied project, merge request, or head SHA. "
+            "Review note batch does not match the supplied project or merge request. "
             "The batch was consumed; no GitLab requests were made by this call."
         )
 
@@ -107,11 +107,11 @@ class ReviewBatchCache:
         self._batches[batch_id] = batch
         self._cache_bytes += batch.size_bytes
 
-    def claim(self, batch_id: str, project: str, iid: int, head_sha: str | None) -> CachedReviewBatch:
-        """Consume a batch, even if its project, merge request, or head SHA does not match.
+    def claim(self, batch_id: str, project: str, iid: int) -> CachedReviewBatch:
+        """Consume a batch, even if its project or merge request does not match.
 
-        A `None` head SHA skips the SHA match and keeps the SHA stored at validation. The live head check
-        before posting still catches a push made after validation. 🔒
+        The head SHA is not matched here. The caller compares it, so a head mismatch can put the batch back, and
+        the live head check before posting still catches a push made after validation. 🔒
         """
         self._purge_expired()
         batch = self._batches.pop(batch_id, None)
@@ -119,8 +119,7 @@ class ReviewBatchCache:
             raise ReviewBatchUnavailableError
         self._cache_bytes -= batch.size_bytes
 
-        head_mismatch = head_sha is not None and batch.head_sha.lower() != head_sha.lower()
-        if batch.project != project or batch.iid != iid or head_mismatch:
+        if batch.project != project or batch.iid != iid:
             raise ReviewBatchMismatchError
         return batch
 

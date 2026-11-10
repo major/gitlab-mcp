@@ -354,7 +354,7 @@ async def test_preview_failure_and_posting_flag(gitlab_env: Any, tmp_path: Any) 
     invalid = await call_tool_result(notes=[{"body": "draft"}], preview_path=str(tmp_path / "invalid.md"))
     # Assert
     text = preview.read_text(encoding="utf-8")
-    assert "No postable batch" in text
+    assert "No new batch was created" in text
     assert "Input 1" in text
     assert "failed" in text
     assert "batch_id" not in result

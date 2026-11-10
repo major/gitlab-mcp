@@ -509,7 +509,7 @@ async def test_unavailable_batch_repreview_returns_warning_preview(review_client
     assert data["batch_error"] == "unavailable"
     assert "batch_id" not in data
     text = preview.read_text(encoding="utf-8")
-    assert "No postable batch is available" in text
+    assert "No new batch was created" in text
     assert data["warning"] in text
     assert all(call.request.method == "GET" for call in respx.calls)
 
@@ -789,8 +789,8 @@ async def test_stale_batch_is_kept_and_repreviewed_on_the_new_head(review_client
     add_head_change(paths=("src.py",))
     prior_diff_calls = len(diff_route.calls)
 
-    # Act: the stale post, then a re-preview of only the general note on the new head.
-    stale = await call_review(review_client, **note_args(batch_id=batch_id, head_sha=None))
+    # Act: a reordered stale post, then a re-preview of only the general note on the new head.
+    stale = await call_review(review_client, **note_args(batch_id=batch_id, head_sha=None, indices=[1, 0]))
     repreview = await call_review(
         review_client,
         **note_args(
@@ -804,7 +804,8 @@ async def test_stale_batch_is_kept_and_repreviewed_on_the_new_head(review_client
 
     # Assert
     data = stale.structured_content
-    assert data["unattempted"] == [0, 1]
+    # Indices are cached batch indices, so the inline note stays 0 although it was sent second. 🔢
+    assert data["unattempted"] == [1, 0]
     assert data["current_head_sha"] == new_head
     assert data.get("batch_retained") is True
     assert 0 < data["ttl_seconds"] <= review_batches.ReviewBatchCache.TTL_SECONDS
