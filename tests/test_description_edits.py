@@ -167,6 +167,7 @@ async def test_mr_edit_writes_full_description_and_returns_changed_lines(  # noq
     assert result["status"] == "applied"
     assert result["changed_lines"] == expected_lines
     assert result["truncated"] is False
+    assert result["description_hash"] == hashlib.sha256(expected_description.encode("utf-8")).hexdigest()
     assert json.loads(put.calls.last.request.content) == {"description": expected_description}
 
 
@@ -280,6 +281,48 @@ async def test_mr_edit_without_return_diff_keeps_existing_default(router):
     # Assert
     assert result["changed_lines"] == "@@ -1 +1 @@\n-Plan: ship\n+Plan: launch"
     assert result["truncated"] is False
+
+
+@pytest.mark.parametrize("return_diff", [True, False])
+async def test_mr_applied_hash_guards_follow_up_edit(router, return_diff):
+    """The applied UTF-8 hash guards a follow-up edit without a separate caller read, even with no diff."""
+    # Arrange
+    before = "Plan 🦊\r\nKeep café\r\nship"
+    after = "Plan 🦊\r\nKeep café\r\nlaunch"
+    final = "Plan 🦊\r\nKeep café\r\ndone ✅"
+    router.get(MR).mock(side_effect=[httpx.Response(200, json={"description": text}) for text in (before, after)])
+    put = router.put(MR).mock(return_value=httpx.Response(200, json={}))
+
+    # Act
+    first = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="ship",
+        new_text="launch",
+        return_diff=return_diff,
+    )
+    second = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="launch",
+        new_text="done ✅",
+        expected_hash=first["description_hash"],
+        return_diff=return_diff,
+    )
+
+    # Assert
+    assert first["status"] == second["status"] == "applied"
+    assert first["description_hash"] == hashlib.sha256(after.encode("utf-8")).hexdigest()
+    assert second["description_hash"] == hashlib.sha256(final.encode("utf-8")).hexdigest()
+    assert ("changed_lines" in first) is return_diff
+    assert ("changed_lines" in second) is return_diff
+    assert [json.loads(call.request.content) for call in put.calls] == [
+        {"description": after},
+        {"description": final},
+    ]
+    assert [call.request.method for call in router.calls] == ["GET", "PUT", "GET", "PUT"]
 
 
 async def test_large_description_is_written_whole_and_result_stays_small(router):
