@@ -490,6 +490,12 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
     # Assert
     assert data["validated_count"] == TWO_POSTS
     assert data["batch_id"]
+    assert data["notes_summary"] == {
+        "src.py": [
+            {"index": 0, "line": 6, "head": "Please check this."},
+            {"index": 1, "old_line": 5, "head": "Review the existing line."},
+        ]
+    }
     assert "batch_indices" not in data
     assert "preview_path" not in data
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
@@ -632,6 +638,7 @@ async def test_invalid_mixed_validation_never_caches(gitlab_env, monkeypatch):
 
     # Assert
     assert data["results"][0]["index"] == 1
+    assert data["validated_count"] == 1
     assert "batch_id" not in data
     assert "batch_indices" not in data
     assert "notes_summary" not in data
@@ -777,6 +784,7 @@ async def test_validate_only_stale_head_sha_remains_unattempted_without_posting(
 
     # Assert
     assert data["unattempted"] == [0]
+    assert data["validated_count"] == 0
     assert "stale" in data["warning"]
     assert "ttl_seconds" not in data
     assert "batch_id" not in data

@@ -516,11 +516,12 @@ async def test_unavailable_batch_repreview_returns_warning_preview(review_client
 
 @respx.mock
 async def test_repreview_failed_validation_keeps_old_batch(review_client: Client, tmp_path: Path) -> None:
-    """A failed re-preview writes its errors and keeps the old handle, because validation never writes ♻️."""
+    """A failed subset re-preview renumbers selected notes and extras but keeps the original batch ♻️."""
     # Arrange
     add_preflight()
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
-    prepared = await call_review(review_client, **note_args(notes=[{"body": "draft"}], validate_only=True))
+    notes = [{"body": "draft"}, {"body": "drop"}, {"file": "src.py", "line": 1, "body": "inline"}]
+    prepared = await call_review(review_client, **note_args(notes=notes, validate_only=True))
     batch_id = prepared.structured_content["batch_id"]
     preview = tmp_path / "failure.md"
 
@@ -531,20 +532,24 @@ async def test_repreview_failed_validation_keeps_old_batch(review_client: Client
             batch_id=batch_id,
             validate_only=True,
             preview_path=str(preview),
-            body_overrides=[{"index": 0, "body": "bad [truncated]"}],
+            indices=[2, 0],
+            body_overrides=[{"index": 2, "body": "bad [truncated]"}],
+            extra_notes=[{"file": "src.py", "line": 2, "body": "extra"}],
         ),
     )
 
     # Assert
     assert not result.is_error
     assert "batch_id" not in result.structured_content
+    assert result.structured_content["validated_count"] == TWO_POSTS
+    assert result.structured_content["results"][0]["index"] == 0
     assert result.structured_content["results"][0]["status"] == "failed"
     assert "Reason:" in preview.read_text(encoding="utf-8")
     assert result.structured_content.get("batch_retained") is True
     assert not post_route.called
     posted = await call_review(review_client, **note_args(batch_id=batch_id))
-    assert posted.structured_content["posted_count"] == 1
-    assert json.loads(post_route.calls.last.request.content)["body"] == "draft"
+    assert posted.structured_content["posted_count"] == THREE_NOTES
+    assert [json.loads(call.request.content)["body"] for call in post_route.calls] == ["draft", "drop", "inline"]
 
 
 @respx.mock
