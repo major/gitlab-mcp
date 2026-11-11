@@ -474,7 +474,7 @@ def write_order() -> list[str]:
 
 @respx.mock
 async def test_validate_only_prepares_new_and_old_side_notes_without_returning_positions(gitlab_env):
-    """Successful validation returns statuses and a batch token without exposing position blocks."""
+    """Successful validation confirms new and old positions by index without exposing position blocks."""
     # Arrange
     patch = "@@ -5 +5,2 @@\n context\n+added"
     mr_route, diff_route = add_preflight([([diff_file("src.py", patch=patch)], None)])
@@ -489,7 +489,14 @@ async def test_validate_only_prepares_new_and_old_side_notes_without_returning_p
 
     # Assert
     assert data["validated_count"] == TWO_POSTS
+    assert data["positions_ok"] == [0, 1]
     assert data["batch_id"]
+    assert data["notes_summary"] == {
+        "src.py": [
+            {"index": 0, "line": 6, "head": "Please check this."},
+            {"index": 1, "old_line": 5, "head": "Review the existing line."},
+        ]
+    }
     assert "batch_indices" not in data
     assert "preview_path" not in data
     assert data["ttl_seconds"] == REVIEW_BATCH_TTL
@@ -521,6 +528,7 @@ async def test_validate_only_caches_bodyless_positions(gitlab_env, tmp_path):
     # Position-only rows would only echo the input, so they collapse into one index list. 🪙
     assert "notes_summary" not in data
     assert data["position_only_indices"] == [0, 1, 2]
+    assert data["positions_ok"] == [0, 1, 2]
     text = preview.read_text(encoding="utf-8")
     for index in range(len(notes)):
         assert f"cached index {index}; position-only" in text
@@ -570,8 +578,10 @@ async def test_mixed_validation_caches_every_entry_at_input_indices(gitlab_env, 
         "src.py": [{"index": 0, "line": 1, "head": "first"}, {"index": 2, "line": 1, "head": "third"}]
     }
     assert data["position_only_indices"] == [1]
+    assert data["positions_ok"] == [0, 1, 2]
     assert "notes_summary" not in posted.structured_content
     assert "position_only_indices" not in posted.structured_content
+    assert "positions_ok" not in posted.structured_content
     assert posted.structured_content["posted_count"] == (THREE_POSTS if fail_extra else len(notes) + 1)
     if fail_extra:
         assert posted.structured_content["results"][0]["index"] == len(notes)
@@ -632,6 +642,8 @@ async def test_invalid_mixed_validation_never_caches(gitlab_env, monkeypatch):
 
     # Assert
     assert data["results"][0]["index"] == 1
+    assert data["validated_count"] == 1
+    assert data["positions_ok"] == [0]
     assert "batch_id" not in data
     assert "batch_indices" not in data
     assert "notes_summary" not in data
@@ -678,6 +690,7 @@ async def test_validation_summary_groups_rows_by_file(gitlab_env):
         "b.py": [{"index": 4, "line": 1, "head": "fifth"}],
     }
     assert data["position_only_indices"] == [1, 3]
+    assert data["positions_ok"] == [0, 1, 3, 4]
 
 
 @pytest.mark.parametrize(
@@ -777,6 +790,8 @@ async def test_validate_only_stale_head_sha_remains_unattempted_without_posting(
 
     # Assert
     assert data["unattempted"] == [0]
+    assert data["validated_count"] == 0
+    assert "positions_ok" not in data
     assert "stale" in data["warning"]
     assert "ttl_seconds" not in data
     assert "batch_id" not in data
@@ -823,13 +838,18 @@ async def test_every_bad_note_is_reported_and_no_note_is_posted(gitlab_env, vali
     ]
     assert data["validated_count"] == 1
     assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
+    if validate_only:
+        assert data["positions_ok"] == [0]
+    else:
+        assert "positions_ok" not in data
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
     assert not post_route.called
 
 
+@pytest.mark.parametrize("validate_only", [True, False], ids=["validate-only", "post-mode"])
 @respx.mock
-async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
+async def test_body_failure_and_bad_line_are_both_reported(gitlab_env, validate_only):
     """A bad body does not hide a bad diff line on another note, and each failed row explains itself."""
     # Arrange
     mr_route, diff_route = add_preflight([([diff_file("src.py")], None)])
@@ -842,7 +862,7 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
     ]
 
     # Act
-    data = await call_tool(notes=notes)
+    data = await call_tool(notes=notes, validate_only=validate_only)
 
     # Assert
     assert data["results"] == [
@@ -862,7 +882,12 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
         },
     ]
     assert data["validated_count"] == 1
-    assert data["posted_count"] == 0
+    if validate_only:
+        assert data["positions_ok"] == [2]
+        assert "posted_count" not in data
+    else:
+        assert "positions_ok" not in data
+        assert data["posted_count"] == 0
     assert data["warning"] == "2 of 3 notes failed preflight. No notes were posted."
     assert len(mr_route.calls) == TWO_POSTS
     assert len(diff_route.calls) == 1
@@ -871,7 +896,7 @@ async def test_body_failure_and_bad_line_are_both_reported(gitlab_env):
 
 @respx.mock
 async def test_file_level_note_is_validated_from_its_path_alone(gitlab_env):
-    """Successful file-level validation returns a batch token without a position block."""
+    """Successful file-level validation confirms the position by index without a position block."""
     # Arrange
     _, diff_route = add_preflight([([diff_file("src.py", patch="")], None)])
     post_route = respx.post(DISCUSSIONS_URL).mock(side_effect=create_response)
@@ -884,6 +909,7 @@ async def test_file_level_note_is_validated_from_its_path_alone(gitlab_env):
 
     # Assert
     assert data["validated_count"] == 1
+    assert data["positions_ok"] == [0]
     assert data["batch_id"]
     assert "warning" not in data
     assert len(diff_route.calls) == 1
@@ -2186,6 +2212,7 @@ async def test_general_note_validation_skips_diff_scan(gitlab_env):
 
     # Assert
     assert data["validated_count"] == 1
+    assert "positions_ok" not in data
     assert len(mr_route.calls) == TWO_POSTS
     assert not diff_route.called
     assert not post_route.called

@@ -211,6 +211,15 @@ class PostReviewNotesResult(BaseModel):
     results: list[ReviewNotePostResult] = Field(default_factory=list, exclude_if=lambda value: not value)
     unattempted: list[int] = Field(default_factory=list, exclude_if=lambda value: not value)
     validated_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    positions_ok: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Only for validate_only: response indices of file/inline entries that passed preflight, omitted when "
+            "none passed. Re-previews use selected-then-extra order, even on failure. This does not imply approval, "
+            "posting, or a new cached batch."
+        ),
+        exclude_if=lambda value: not value,
+    )
     posted_count: int | None = Field(default=None, exclude_if=lambda value: value is None)
     note_ids: list[int] = Field(default_factory=list, exclude_if=lambda value: not value)
     warning: str = Field(default="", exclude_if=lambda value: not value)
@@ -355,6 +364,9 @@ def _lean_review_result(result: PostReviewNotesResult, *, validate_only: bool) -
             "results": [row for row in result.results if row.status in ("failed", "unknown", "unverified")],
             "unattempted": [row.index for row in result.results if row.status == "unattempted"],
             "validated_count": validated_count if validate_only or validated_count else None,
+            "positions_ok": [
+                row.index for row in result.results if validate_only and row.status == "validated" and row.position
+            ],
             "posted_count": None if validate_only else len(posted_rows),
             "note_ids": [row.note_id for row in posted_rows if row.note_id is not None],
         }
@@ -1629,15 +1641,15 @@ async def post_review_notes(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917 -
         ),
     ] = None,
 ) -> PostReviewNotesResult:
-    """Validate or post inline comments and general review notes in a sequential, bounded batch.
+    """Validate or post inline comments and general review notes.
 
     Like `glab mr note create`. Omit file for general notes; set file for file-level notes, or file and one
     line coordinate for inline notes. Bodies containing truncation markers are rejected.
 
     Send `notes`, `batch_id`, or only `body_dir`. First use `notes`, full `head_sha`, and `validate_only=true` to
     check bodies, paths, lines, and SHA without writing. Success returns a single-use `batch_id` and `ttl_seconds`,
-    caching each note at its input index. `notes_summary` groups bodied-note rows by file, and
-    `position_only_indices` lists the position-only entries. For position checks, omit body sources and supply
+    caching each note at its input index. `notes_summary` groups bodies by file; `positions_ok` lists valid file/inline
+    indices; `position_only_indices` lists bodyless notes. For position checks, omit body sources and supply
     `file` and optional `line` or `old_line`; mix them with bodied notes in one batch. Selected position-only
     entries require approved overrides.
     Show final text and get explicit APPROVE before posting; placeholder approval is insufficient.
