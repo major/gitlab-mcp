@@ -64,7 +64,16 @@ class DescriptionEditResult(BaseModel):
     changed_lines: str = Field(default="", exclude_if=lambda value: not value)
     truncated: bool = False
     warning: str = Field(default="", exclude_if=lambda value: not value)
-    description_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    description_hash: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "SHA-256 of the resulting full UTF-8 description, even when the diff is omitted. "
+            "After status=applied, reuse as expected_hash for the next edit. "
+            "For validated previews, this hashes the proposed description, not the current one. "
+            "Omitted for failed or unknown writes."
+        ),
+    )
     base_hash: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,

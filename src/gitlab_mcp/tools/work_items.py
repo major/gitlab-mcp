@@ -201,7 +201,9 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     or omitted. After explicit user `APPROVE`, send identical edits with `expected_hash=base_hash`. GitLab has no
     compare-and-swap, so a concurrent edit may still be overwritten. Writes are never retried. `status` is
     `validated`, `applied`, `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit
-    changed lines.
+    changed lines. Applied results include `description_hash`, the SHA-256 of the full updated UTF-8 description,
+    even when the diff is omitted. Reuse it as `expected_hash` for a follow-up edit without a separate description
+    read. Failed or unknown writes omit the hash; a preview's `description_hash` describes only the proposed text.
     """
     return await _description_edits.edit_merge_request_description(
         get_client(ctx), project, iid, old_text, new_text, return_diff, edits, expected_hash, validate_only
