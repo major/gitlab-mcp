@@ -442,6 +442,7 @@ async def test_repreview_selects_and_extends_batch(review_client: Client, tmp_pa
     assert not result.is_error
     data = result.structured_content
     assert data["validated_count"] == THREE_NOTES
+    assert data["positions_ok"] == [0]
     assert data["notes_summary"] == {
         "src.py": [{"index": 0, "line": 1, "head": "low note"}],
         "general": [{"index": 1, "head": "keep"}, {"index": 2, "head": "new finding"}],
@@ -542,6 +543,7 @@ async def test_repreview_failed_validation_keeps_old_batch(review_client: Client
     assert not result.is_error
     assert "batch_id" not in result.structured_content
     assert result.structured_content["validated_count"] == TWO_POSTS
+    assert result.structured_content["positions_ok"] == [2]
     assert result.structured_content["results"][0]["index"] == 0
     assert result.structured_content["results"][0]["status"] == "failed"
     assert "Reason:" in preview.read_text(encoding="utf-8")
