@@ -9,7 +9,7 @@ import respx
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from gitlab_mcp import mcp
+from gitlab_mcp import create_app, mcp
 
 pytestmark = pytest.mark.usefixtures("gitlab_env")
 
@@ -1273,6 +1273,89 @@ async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
 
 
 @respx.mock
+async def test_summary_groups_identical_displayed_pytest_messages():
+    """Repeated redacted messages group at the first occurrence without hiding other evidence."""
+    # Arrange
+    body = (
+        "FAILED tests/a.py::test_a - token=secret1\n"
+        "FAILED tests/b.py::test_first - AssertionError: missing value\n"
+        "FAILED tests/a.py::test_single - distinct\n"
+        "FAILED tests/a.py::test_b - token=secret2\n"
+        "FAILED tests/b.py::test_second - AssertionError: missing value\n"
+        "FAILED tests/a.py::test_param[has space] - token=secret3\n"
+    )
+    mock_tail(body)
+
+    # Act
+    data = await call_log(view="summary")
+
+    # Assert
+    assert data["text"] == (
+        "FAILED [2 occurrences] - token=[REDACTED] (example: tests/a.py::test_a)\n"
+        "FAILED [2 occurrences] - AssertionError: missing value (example: tests/b.py::test_first)\n"
+        "FAILED tests/a.py::test_single - distinct\n"
+        "FAILED tests/a.py::test_param[has space] - token=[REDACTED]\n"
+    )
+
+
+@respx.mock
+async def test_summary_keeps_ambiguous_lines_and_caps_grouped_output():
+    """Ambiguous node IDs stay unchanged and the character cap keeps the latest evidence."""
+    # Arrange
+    ambiguous = "FAILED tests/a.py::test[one - two] - error\n"
+    body = "FAILED tests/a.py::one - same\n" + ambiguous + "FAILED tests/a.py::two - same\n"
+    mock_tail(body)
+
+    # Act
+    full = await call_log(view="summary")
+    capped = await call_log(view="summary", max_chars=len(ambiguous))
+
+    # Assert
+    assert full["text"] == "FAILED [2 occurrences] - same (example: tests/a.py::one)\n" + ambiguous
+    assert capped["text"] == ambiguous
+    assert capped["truncated"] is True
+
+
+@pytest.mark.parametrize("profile", ["full", "compact"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"search": "secret-value"},
+        {"mode": "secret-value"},
+        {"max_charz": "secret-value"},
+        {"view": "secret-value"},
+        {"max_chars": "secret-value"},
+        {"max_chars": 16001},
+    ],
+)
+@respx.mock
+async def test_log_invalid_arguments_return_safe_schema_help(arguments, profile):
+    """Invalid arguments return safe accepted names without sending a request."""
+    # Arrange / Act
+    async with Client(create_app(profile)) as client:
+        with pytest.raises(ToolError) as exc:
+            await client.call_tool("get_job_log", {"project": PROJECT, "job_id": 42} | arguments)
+
+    # Assert
+    message = str(exc.value)
+    for name in (
+        "project",
+        "job_id",
+        "view",
+        "max_chars",
+        "pattern",
+        "section",
+        "context",
+        "scan_bytes",
+        "byte_offset",
+    ):
+        assert name in message
+    assert "secret-value" not in message
+    assert "max_charz" not in message
+    assert not respx.calls
+
+
+@respx.mock
 async def test_log_views_select_distinct_evidence_and_accept_max_chars():
     """Tail, summary, and two literal searches do not silently reuse the same selection."""
     # Arrange
@@ -1286,12 +1369,8 @@ async def test_log_views_select_distinct_evidence_and_accept_max_chars():
     async with Client(mcp) as client:
         tail = await client.call_tool("get_job_log", arguments)
         summary = await client.call_tool("get_job_log", arguments | {"view": "summary"})
-        early = await client.call_tool(
-            "get_job_log", arguments | {"view": "search", "pattern": "early", "context": 0}
-        )
-        late = await client.call_tool(
-            "get_job_log", arguments | {"view": "search", "pattern": "late", "context": 0}
-        )
+        early = await client.call_tool("get_job_log", arguments | {"view": "search", "pattern": "early", "context": 0})
+        late = await client.call_tool("get_job_log", arguments | {"view": "search", "pattern": "late", "context": 0})
 
     # Assert
     results = [tail, summary, early, late]
@@ -1303,7 +1382,7 @@ async def test_log_views_select_distinct_evidence_and_accept_max_chars():
     ]
     for result in results:
         assert json.loads(result.content[0].text) == result.structured_content
-    assert len(respx.calls) == 6
+    assert len(respx.calls) == 6  # noqa: PLR2004
 
 
 @respx.mock

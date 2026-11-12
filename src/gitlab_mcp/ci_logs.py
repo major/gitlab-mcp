@@ -378,9 +378,10 @@ def _failure_selection(text: str, context: int) -> tuple[str, bool]:
     return "".join(lines[index] for index in sorted(selected)), True
 
 
-def _summary_selection(text: str) -> tuple[str, bool]:
+def _summary_selection(text: str) -> tuple[str, bool]:  # noqa: C901 - select and group related summary evidence together.
     """Select make targets, pytest failures and totals, and recognized terminal error lines.
 
+    Group identical displayed pytest messages after cleanup, with the first node as an example.
     With no marker, fall back to the last few lines so a passing job still shows how it ended 🪙.
     """
     lines = text.splitlines(keepends=True)
@@ -404,6 +405,16 @@ def _summary_selection(text: str) -> tuple[str, bool]:
     if not selected:
         return "".join(lines[-SUMMARY_FALLBACK_LINES:]), False
     selected |= _job_output_above_runner_footer(lines, selected)
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for index in sorted(selected):
+        match = re.fullmatch(r"FAILED (\S+::\S+) - (.+)\n?", lines[index])
+        if match:
+            groups.setdefault(match[2], []).append((index, match[1]))
+    for message, occurrences in groups.items():
+        if len(occurrences) > 1:
+            index, node = occurrences[0]
+            lines[index] = f"FAILED [{len(occurrences)} occurrences] - {message} (example: {node})\n"
+            selected.difference_update(index for index, _ in occurrences[1:])
     return "".join(lines[index] for index in sorted(selected)), True
 
 

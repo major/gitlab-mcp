@@ -127,6 +127,7 @@ MERGE_REQUEST_STATUS_QUERY = """
 query($fullPath: ID!, $iid: String!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
+      iid title state sourceBranch
       diffRefs { headSha }
       headPipeline { status id sha }
       detailedMergeStatus approved resolvableDiscussionsCount resolvedDiscussionsCount
@@ -387,6 +388,10 @@ class MergeRequestDetail(BaseModel):
 class MergeRequestStatus(BaseModel):
     """Required compact status facts for a merge request recheck."""
 
+    iid: int
+    title: str
+    state: str
+    source_branch: str
     head_sha: str
     pipeline_status: str
     latest_pipeline_id: int | None
@@ -995,6 +1000,10 @@ def _to_status(node: dict[str, Any]) -> MergeRequestStatus:
     """Convert the minimal GraphQL response into required status facts."""
     pipeline = node["headPipeline"]
     return MergeRequestStatus(
+        iid=int(node["iid"]),
+        title=node["title"],
+        state=lower_or_empty(node["state"]),
+        source_branch=node["sourceBranch"],
         head_sha=diff_refs_head_sha(node["diffRefs"]),
         pipeline_status=lower_or_empty(pipeline["status"]) if pipeline else "",
         latest_pipeline_id=(
@@ -1474,7 +1483,9 @@ async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional
     ] = False,
     view: Annotated[
         Literal["full", "status"],
-        Field(description="Use status for compact rechecks; it ignores all detail and description options."),
+        Field(
+            description="Status includes MR identity and compact recheck facts; ignores detail and description options."
+        ),
     ] = "full",
 ) -> MergeRequestDetail | MergeRequestDescriptionPage | MergeRequestStatus:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
@@ -1487,7 +1498,7 @@ async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional
     `include_threads=false` skips the index but keeps open, resolved, and comment-only counts. Skip thread reads when
     all counts are zero. Batch thread reads for several MRs. `line` is a new-file line; `old_line` is a deleted line.
 
-    Use `view=status` for compact rechecks. It ignores detail flags, focus, and description paging.
+    `view=status` includes MR identity and ignores detail and description options.
     After a push, confirm `head_sha` matches the pushed SHA before checking `pipeline_sha` and `pipeline_status`.
     A different pipeline SHA is expected for `pipeline_event_type=merged_result` or `merge_train`, which test merge
     commits; for absent or `detached` event types in the full view it means stale CI. Status omits the event type,

@@ -202,6 +202,7 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
     }
 
 
+@pytest.mark.parametrize("mr_state", ["OPENED", "CLOSED", "MERGED"])
 @pytest.mark.parametrize(
     ("pipeline", "diff_refs", "counts", "approved", "expected"),
     [
@@ -218,11 +219,12 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
 )
 @respx.mock
 async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR0913, PLR0917
-    gitlab_env, pipeline, diff_refs, counts, approved, expected
+    gitlab_env, pipeline, diff_refs, counts, approved, expected, mr_state
 ):
-    """Status returns all seven keys with one minimal request, even with conflicting detail options."""
+    """Status returns identity and recheck facts in one request, even with conflicting detail options."""
     # Arrange
     node = make_mr(
+        state=mr_state,
         headPipeline=pipeline,
         diffRefs=diff_refs,
         approved=approved,
@@ -261,6 +263,10 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
     # Assert
     head, status, pipeline_id, sha, is_approved, open_count = expected
     assert result.structured_content == {
+        "iid": int(node["iid"]),
+        "title": node["title"],
+        "state": mr_state.lower(),
+        "source_branch": node["sourceBranch"],
         "head_sha": head,
         "pipeline_status": status,
         "latest_pipeline_id": pipeline_id,
@@ -275,6 +281,10 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
     assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID)}
     query = json.loads(route.calls.last.request.content)["query"]
     for field in (
+        "iid",
+        "title",
+        "state",
+        "sourceBranch",
         "diffRefs",
         "headSha",
         "headPipeline",
@@ -287,7 +297,7 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
         "resolvedDiscussionsCount",
     ):
         assert re.search(rf"\b{field}\b", query)
-    for field in ("title", "description", "discussions", "approvedBy", "reviewers", "commits", "mergeRequestEventType"):
+    for field in ("description", "discussions", "approvedBy", "reviewers", "commits", "mergeRequestEventType"):
         assert not re.search(rf"\b{field}\b", query)
 
 

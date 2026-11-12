@@ -42,15 +42,30 @@ async def gitlab_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
 
 class CreatePipelineValidationMiddleware(Middleware):
-    """Hide argument validation details for pipeline creation tools."""
+    """Hide sensitive argument validation details for selected tools."""
 
     async def on_call_tool(
         self,
         context: MiddlewareContext[CallToolRequestParams],
         call_next: CallNext[CallToolRequestParams, ToolResult],
     ) -> ToolResult:
-        """Replace pipeline argument validation errors with a tool-specific safe hint."""
+        """Replace selected argument validation errors with a tool-specific safe hint."""
         hints = {"create_pipeline": CREATE_PIPELINE_VALIDATION_ERROR, "start_pipeline": START_PIPELINE_VALIDATION_ERROR}
+        if context.message.name == "get_job_log":
+            tool = await mcp.get_tool("get_job_log")
+            if tool is None:
+                raise ToolError("get_job_log is not registered.")  # noqa: TRY003
+            names = tool.parameters["properties"]
+            hint = (
+                f"Invalid get_job_log arguments. Accepted parameters: {', '.join(names)}. "
+                "Use view='search' with pattern; max_chars is 1..16000."
+            )
+            if set(context.message.arguments or {}) - names.keys():
+                raise ToolError(hint)
+            try:
+                return await call_next(context)
+            except ValidationError:
+                raise ToolError(hint) from None
         if context.message.name not in hints:
             return await call_next(context)
 

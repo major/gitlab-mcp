@@ -542,6 +542,10 @@ async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
         set(status["required"])
         == set(status["properties"])
         == {
+            "iid",
+            "title",
+            "state",
+            "source_branch",
             "head_sha",
             "pipeline_status",
             "latest_pipeline_id",
