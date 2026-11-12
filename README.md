@@ -155,7 +155,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `create_todo` | Create a to-do for a supported target. |
 | `create_work_item_note` | Add a project or group work item comment from inline text or a server-local file. |
 | `delete_snippet` | Delete a personal or project snippet. |
-| `edit_merge_request_description` | Preview and apply exact-text replacements with a hash guard; applied results return `description_hash` for follow-up edits. |
+| `edit_merge_request_description` | Preview and apply guarded text replacements; optionally omit response hashes independently of the diff. |
 | `edit_merge_request_note` | Edit an existing discussion note with a body hash guard and post-write verification. |
 | `edit_work_item_description` | Apply guarded text replacements or edit a selected table cell in a work item description. |
 | `get_current_user` | Return the username and ID of the user who owns the GitLab token. |
@@ -164,7 +164,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `inspect_job` (compact only) | Read job metadata, artifact text, or an artifact tree. |
 | `start_pipeline` (compact only) | Start a ref or merge request pipeline after a SHA preflight. |
 | `get_job_log` | Read a bounded job log view, such as its tail, search results, or failure markers. |
-| `get_merge_request` | Read merge request details, or use the compact status view for rechecks. |
+| `get_merge_request` | Read merge request details, or recheck compact status with an optional head-pipeline stage summary. |
 | `get_merge_request_diff` | List changed files or read selected merge request patches, optionally compared with an earlier version. |
 | `get_merge_request_note` | Read one merge request note body in bounded pages, such as the rest of a cut thread note. |
 | `get_merge_request_threads` | Read review threads and status for one or more merge requests; `state="all"` summarizes resolved threads by default. |
