@@ -40,6 +40,7 @@ READ_ONLY_TOOLS = {
     "list_pipeline_schedules",
     "list_pipelines",
     "list_snippets",
+    "list_todos",
     "list_work_item_notes",
 }
 WRITE_TOOLS = {
@@ -49,6 +50,7 @@ WRITE_TOOLS = {
     "create_merge_request_pipeline",
     "create_pipeline",
     "create_snippet",
+    "create_todo",
     "create_work_item_note",
     "delete_snippet",
     "edit_merge_request_description",
@@ -63,6 +65,7 @@ WRITE_TOOLS = {
     "retry_ci",
     "update_merge_request",
     "update_snippet",
+    "update_todo",
 }
 
 

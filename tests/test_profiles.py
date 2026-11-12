@@ -37,8 +37,8 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
     assert short["read_snippet"].annotations.open_world_hint is True
     size = lambda tool: len(json.dumps([tool.description, tool.input_schema]).encode())  # noqa: E731
     assert size(short["read_snippet"]) < sum(size(full[name]) for name in ("get_snippet", "get_snippet_file"))
-    assert len(full) == 45  # noqa: PLR2004
-    assert len(short) == 39  # noqa: PLR2004
+    assert len(full) == 48  # noqa: PLR2004
+    assert len(short) == 42  # noqa: PLR2004
     assert "create_merge_request_note" in short
     start = short["start_pipeline"]
     assert start.annotations.read_only_hint is False
