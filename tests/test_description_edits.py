@@ -326,6 +326,35 @@ async def test_mr_applied_hash_guards_follow_up_edit(router, return_diff):
     assert [call.request.method for call in router.calls] == ["GET", "PUT", "GET", "PUT"]
 
 
+@pytest.mark.parametrize("return_diff", [True, False])
+async def test_mr_applied_can_omit_hashes_independently_of_diff(router, return_diff):
+    """An applied edit omits hashes without changing its diff or write."""
+    # Arrange
+    put = serve_merge_request(router, "Plan: ship")
+
+    # Act
+    result = await call_tool(
+        "edit_merge_request_description",
+        project=PROJECT,
+        iid=IID,
+        old_text="ship",
+        new_text="launch",
+        return_diff=return_diff,
+        return_hashes=False,
+    )
+
+    # Assert
+    assert result["status"] == "applied"
+    assert result["truncated"] is False
+    assert "description_hash" not in result
+    assert "base_hash" not in result
+    assert ("changed_lines" in result) is return_diff
+    if return_diff:
+        assert result["changed_lines"] == "@@ -1 +1 @@\n-Plan: ship\n+Plan: launch"
+    assert json.loads(put.calls.last.request.content) == {"description": "Plan: launch"}
+    assert [call.request.method for call in router.calls] == ["GET", "PUT"]
+
+
 async def test_large_description_is_written_whole_and_result_stays_small(router):
     """The write keeps every character of a big description, but the result only carries the changed line."""
     # Arrange
@@ -357,7 +386,10 @@ async def test_large_description_is_written_whole_and_result_stays_small(router)
         pytest.param(httpx.Response(403, json={"message": "403 Forbidden"}), "failed", "403", id="permission"),
     ],
 )
-async def test_mr_write_outcome_is_applied_failed_or_unknown_and_never_retried(router, put_reply, status, warning):
+@pytest.mark.parametrize("return_hashes", [True, False])
+async def test_mr_write_outcome_is_applied_failed_or_unknown_and_never_retried(
+    router, put_reply, status, warning, return_hashes
+):
     """A network error or 5xx on the write is `unknown`, a 4xx refusal is `failed`, and the write is sent only once."""
     # Arrange
     put = serve_merge_request(router, "Plan: ship", put=put_reply)
@@ -370,6 +402,7 @@ async def test_mr_write_outcome_is_applied_failed_or_unknown_and_never_retried(r
         old_text="ship",
         new_text="launch",
         return_diff=False,
+        return_hashes=return_hashes,
     )
 
     # Assert
@@ -410,7 +443,8 @@ async def test_mr_batch_applies_sequentially_with_one_read_and_write(router, cou
 
 
 @pytest.mark.parametrize("return_diff", [True, False])
-async def test_mr_preview_reports_sequential_match_lines_and_hashes(router, return_diff):
+@pytest.mark.parametrize("return_hashes", [True, False])
+async def test_mr_preview_reports_sequential_match_lines_and_hashes(router, return_diff, return_hashes):
     """Preview reports each match in the text seen by that edit without writing."""
     # Arrange
     before = "first\ntarget"
@@ -426,12 +460,17 @@ async def test_mr_preview_reports_sequential_match_lines_and_hashes(router, retu
         edits=edits,
         validate_only=True,
         return_diff=return_diff,
+        return_hashes=return_hashes,
     )
 
     # Assert
     assert result["status"] == "validated"
-    assert result["description_hash"] == hashlib.sha256(after.encode()).hexdigest()
-    assert result["base_hash"] == hashlib.sha256(before.encode()).hexdigest()
+    if return_hashes:
+        assert result["description_hash"] == hashlib.sha256(after.encode()).hexdigest()
+        assert result["base_hash"] == hashlib.sha256(before.encode()).hexdigest()
+    else:
+        assert "description_hash" not in result
+        assert "base_hash" not in result
     assert result["edit_lines"] == [1, 3]
     assert result["truncated"] is False
     if return_diff:
@@ -463,7 +502,8 @@ async def test_mr_preview_truncates_large_diff(router):
     assert put.call_count == 0
 
 
-async def test_mr_preview_later_bad_match_never_writes(router):
+@pytest.mark.parametrize("return_hashes", [True, False])
+async def test_mr_preview_later_bad_match_never_writes(router, return_hashes):
     """A later failed preview edit stops the batch before any write."""
     # Arrange
     put = serve_merge_request(router, "first")
@@ -471,27 +511,45 @@ async def test_mr_preview_later_bad_match_never_writes(router):
 
     # Act / Assert
     with pytest.raises(ToolError, match="Edit 2 failed"):
-        await call_tool("edit_merge_request_description", project=PROJECT, iid=IID, edits=edits, validate_only=True)
+        await call_tool(
+            "edit_merge_request_description",
+            project=PROJECT,
+            iid=IID,
+            edits=edits,
+            validate_only=True,
+            return_hashes=return_hashes,
+        )
     assert put.call_count == 0
     assert [call.request.method for call in router.calls] == ["GET"]
 
 
 @pytest.mark.parametrize("matches", [True, False])
-async def test_mr_expected_hash_guards_write(router, matches):
-    """A current hash permits a write and a stale hash stops it after the read."""
+@pytest.mark.parametrize("return_hashes", [True, False])
+@pytest.mark.parametrize("validate_only", [True, False])
+async def test_mr_expected_hash_guards_write(router, matches, return_hashes, validate_only):
+    """A current hash permits an edit or preview and a stale hash stops it after the read."""
     # Arrange
     put = serve_merge_request(router, "one")
     expected_hash = hashlib.sha256(b"one" if matches else b"stale").hexdigest()
-    arguments = {"project": PROJECT, "iid": IID, "old_text": "one", "new_text": "two", "expected_hash": expected_hash}
+    arguments = {
+        "project": PROJECT,
+        "iid": IID,
+        "old_text": "one",
+        "new_text": "two",
+        "expected_hash": expected_hash,
+        "return_hashes": return_hashes,
+        "validate_only": validate_only,
+    }
 
     # Act / Assert
     if matches:
         result = await call_tool("edit_merge_request_description", **arguments)
-        assert result["status"] == "applied"
-        assert "base_hash" not in result
-        assert "edit_lines" not in result
-        assert [call.request.method for call in router.calls] == ["GET", "PUT"]
-        assert put.call_count == 1
+        assert result["status"] == ("validated" if validate_only else "applied")
+        assert ("base_hash" in result) is (validate_only and return_hashes)
+        assert ("description_hash" in result) is return_hashes
+        assert ("edit_lines" in result) is validate_only
+        assert [call.request.method for call in router.calls] == (["GET"] if validate_only else ["GET", "PUT"])
+        assert put.call_count == (0 if validate_only else 1)
     else:
         with pytest.raises(
             ToolError, match=r"expected_hash does not match the current description\. No write was made"
@@ -521,7 +579,9 @@ async def test_mr_null_description_accepts_empty_hash_before_matching(router):
 
 
 @pytest.mark.parametrize("expected_hash", ["A" * 64, "abc"])
-async def test_mr_invalid_hash_fails_before_read(router, expected_hash):
+@pytest.mark.parametrize("return_hashes", [True, False])
+@pytest.mark.parametrize("validate_only", [True, False])
+async def test_mr_invalid_hash_fails_before_read(router, expected_hash, return_hashes, validate_only):
     """Invalid hash formats are rejected before sending any request."""
     # Arrange
     serve_merge_request(router, "one")
@@ -535,6 +595,8 @@ async def test_mr_invalid_hash_fails_before_read(router, expected_hash):
             old_text="one",
             new_text="two",
             expected_hash=expected_hash,
+            return_hashes=return_hashes,
+            validate_only=validate_only,
         )
     assert not router.calls
 

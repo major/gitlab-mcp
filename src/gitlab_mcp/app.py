@@ -86,8 +86,9 @@ mcp = FastMCP(
         "use reply_to_threads for batched replies and post-write approval and auto-merge summaries; "
         "use resolve_open_threads to close every open thread, and "
         "use edit_merge_request_description to update the description; prefer edits=[...] for several changes "
-        "instead of a loop. Preview with validate_only=true, show the user, and after APPROVE send the same edits "
-        "with expected_hash set to the returned base_hash. "
+        "instead of a loop. Preview with validate_only=true and hashes enabled, show the user, and after APPROVE "
+        "send the same edits with expected_hash set to the returned base_hash. A preview with return_hashes=false "
+        "does not return base_hash, so keep hashes enabled for this guarded flow. "
         "For merge request thread triage, use get_merge_request_threads alone for compact status and review threads. "
         'With state="all", resolved threads default to headings; set resolved_view="full" for full notes. '
         "When reading both merge request details and threads, set get_merge_request(include_threads=false) and "
