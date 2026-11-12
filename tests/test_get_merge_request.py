@@ -286,7 +286,7 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
     assert json.loads(result.content[0].text) == result.structured_content
     assert route.call_count == 1
     assert len(respx.calls) == 1
-    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID)}
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includePipelineStages": False}
     query = json.loads(route.calls.last.request.content)["query"]
     for field in (
         "iid",
@@ -307,6 +307,88 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
         assert re.search(rf"\b{field}\b", query)
     for field in ("description", "discussions", "approvedBy", "reviewers", "commits", "mergeRequestEventType"):
         assert not re.search(rf"\b{field}\b", query)
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "rows", "complete"),
+    [
+        (None, "", True),
+        ({"status": "SUCCESS", "stages": None}, "", False),
+        ({"status": "SUCCESS"}, "", False),
+        ({"status": "SUCCESS", "stages": {"nodes": None, "pageInfo": {"hasNextPage": False}}}, "", False),
+        ({"status": "SUCCESS", "stages": {"nodes": [], "pageInfo": {"hasNextPage": False}}}, "", True),
+        ({"status": "SUCCESS", "stages": {"nodes": [], "pageInfo": None}}, "", False),
+        ({"status": "SUCCESS", "stages": {"nodes": [], "pageInfo": {}}}, "", False),
+        ({"status": "SUCCESS", "stages": {"nodes": [], "pageInfo": {"hasNextPage": True}}}, "", False),
+        (
+            {
+                "status": "RUNNING",
+                "stages": {
+                    "nodes": [
+                        {"name": "build\tcompile", "status": "SUCCESS"},
+                        {"name": "test\nunit", "status": "CUSTOM\rVALUE"},
+                        None,
+                        {"name": None, "status": None},
+                        {"name": "deploy", "status": "MANUAL"},
+                    ],
+                    "pageInfo": {"hasNextPage": False},
+                },
+            },
+            "\nbuild compile\tsuccess\ntest unit\tcustom value\n\t\n\t\ndeploy\tmanual",
+            False,
+        ),
+        (
+            {
+                "status": "SUCCESS",
+                "stages": {"nodes": [{"name": "x", "status": "SUCCESS"}] * 100, "pageInfo": {"hasNextPage": False}},
+            },
+            "\nx\tsuccess" * 100,
+            True,
+        ),
+        (
+            {
+                "status": "SUCCESS",
+                "stages": {"nodes": [{"name": "x", "status": "SUCCESS"}] * 101, "pageInfo": {"hasNextPage": False}},
+            },
+            "\nx\tsuccess" * 100,
+            False,
+        ),
+    ],
+)
+@respx.mock
+async def test_status_pipeline_stages_are_bounded_and_report_completeness(gitlab_env, pipeline, rows, complete):
+    """Opt-in stages preserve order and unknown data without claiming a complete result."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr(headPipeline=pipeline)))
+
+    # Act
+    data = await call_tool(view="status", include_pipeline_stages=True)
+
+    # Assert
+    assert data["pipeline_stages"] == "name\tstatus" + rows
+    assert data["pipeline_stages_complete"] is complete
+    assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID), "includePipelineStages": True}
+    query = json.loads(route.calls.last.request.content)["query"]
+    assert "$includePipelineStages: Boolean!" in query
+    assert re.search(r"stages\(first:\s*100\)\s*@include\(if:\s*\$includePipelineStages\)", query)
+    assert "pageInfo { hasNextPage }" in query
+    assert route.call_count == len(respx.calls) == 1
+
+
+@respx.mock
+async def test_full_view_ignores_pipeline_stages_option(gitlab_env):
+    """Requesting stages on the full view leaves its request and result unchanged."""
+    # Arrange
+    route = respx.post(GRAPHQL).mock(return_value=graphql_response(make_mr()))
+
+    # Act
+    data = await call_tool(include_pipeline_stages=True)
+
+    # Assert
+    assert "pipeline_stages" not in data
+    assert "pipeline_stages_complete" not in data
+    assert "includePipelineStages" not in sent_variables(route)
+    assert len(respx.calls) == 1
 
 
 @respx.mock

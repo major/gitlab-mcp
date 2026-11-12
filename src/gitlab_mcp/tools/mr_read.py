@@ -124,12 +124,18 @@ query(
 
 # Status rechecks need no detail metadata or discussion bodies.
 MERGE_REQUEST_STATUS_QUERY = """
-query($fullPath: ID!, $iid: String!) {
+query($fullPath: ID!, $iid: String!, $includePipelineStages: Boolean!) {
   project(fullPath: $fullPath) {
     mergeRequest(iid: $iid) {
       iid title state sourceBranch
       diffRefs { headSha }
-      headPipeline { status id sha }
+      headPipeline {
+        status id sha
+        stages(first: 100) @include(if: $includePipelineStages) {
+          nodes { name status }
+          pageInfo { hasNextPage }
+        }
+      }
       detailedMergeStatus approved resolvableDiscussionsCount resolvedDiscussionsCount
     }
   }
@@ -201,6 +207,8 @@ ISSUE_KEY_MAX_LENGTH = 256
 ISSUE_KEY_MATCH_TIMEOUT = 0.05
 # The open-thread list is capped. Counts stay exact, and `index_complete` says whether the list is whole.
 THREAD_INDEX_CAP = 20
+# Opt-in stage summaries use one bounded connection, never job scans or continuation reads.
+PIPELINE_STAGES_CAP = 100
 
 # A Literal is sent to the agent as an enum, so this type replaces a separate
 # "list states" tool.
@@ -399,6 +407,18 @@ class MergeRequestStatus(BaseModel):
     merge_status: str
     approved: bool
     open_thread_count: int
+    pipeline_stages: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Opt-in TSV: name, status. Pipeline order, lowercase raw statuses, empty cells for unknown values.",
+    )
+    pipeline_stages_complete: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "All stage data was available, not CI success. No head pipeline means a header-only complete table."
+        ),
+    )
 
 
 class MergeRequestDescriptionPage(BaseModel):
@@ -996,9 +1016,34 @@ def _to_thread_counts(node: dict[str, Any]) -> tuple[int, int]:
     return resolvable - resolved, resolved
 
 
-def _to_status(node: dict[str, Any]) -> MergeRequestStatus:
+def _pipeline_stages(pipeline: dict[str, Any] | None) -> tuple[str, bool]:
+    """Render up to 100 stages and report missing or truncated data."""
+    lines = ["name\tstatus"]
+    if pipeline is None:
+        return lines[0], True
+    connection = pipeline.get("stages")
+    if connection is None:
+        return lines[0], False
+    nodes = connection.get("nodes")
+    page_info = connection.get("pageInfo") or {}
+    if nodes is None:
+        return lines[0], False
+    complete = page_info.get("hasNextPage") is False and len(nodes) <= PIPELINE_STAGES_CAP
+    for stage_node in nodes[:PIPELINE_STAGES_CAP]:
+        # A null node or cell is unknown, even though its TSV cell is empty.
+        stage = stage_node or {}
+        name = stage.get("name")
+        status = stage.get("status")
+        if name is None or status is None:
+            complete = False
+        lines.append(f"{_cell(name)}\t{_cell(lower_or_empty(status))}")
+    return "\n".join(lines), complete
+
+
+def _to_status(node: dict[str, Any], *, include_pipeline_stages: bool = False) -> MergeRequestStatus:
     """Convert the minimal GraphQL response into required status facts."""
     pipeline = node["headPipeline"]
+    stages, stages_complete = _pipeline_stages(pipeline) if include_pipeline_stages else (None, None)
     return MergeRequestStatus(
         iid=int(node["iid"]),
         title=node["title"],
@@ -1013,6 +1058,8 @@ def _to_status(node: dict[str, Any]) -> MergeRequestStatus:
         merge_status=lower_or_empty(node["detailedMergeStatus"]),
         approved=node["approved"],
         open_thread_count=_to_thread_counts(node)[0],
+        pipeline_stages=stages,
+        pipeline_stages_complete=stages_complete,
     )
 
 
@@ -1487,6 +1534,10 @@ async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional
             description="Status includes MR identity and compact recheck facts; ignores detail and description options."
         ),
     ] = "full",
+    include_pipeline_stages: Annotated[
+        bool,
+        Field(description="Include up to 100 head pipeline stages in status view; ignored outside status view."),
+    ] = False,
 ) -> MergeRequestDetail | MergeRequestDescriptionPage | MergeRequestStatus:
     """Review merge request status, reviewers, approvals, and CI. Like `glab mr view`.
 
@@ -1495,40 +1546,42 @@ async def get_merge_request(  # noqa: C901, PLR0912, PLR0913, PLR0917 - optional
     Missing fields mean false or empty. `created_at` is YYYY-MM-DD.
 
     `threads.open` IDs go to get_merge_request_threads; `index_complete=false` means a partial index.
-    `include_threads=false` skips the index but keeps open, resolved, and comment-only counts. Skip thread reads when
-    all counts are zero. Batch thread reads for several MRs. `line` is a new-file line; `old_line` is a deleted line.
+    `include_threads=false` skips the index but keeps open, resolved, and comment-only counts. Skip reads if all are
+    zero; batch reads for several MRs. `line` is a new-file line; `old_line` is a deleted line.
 
-    `view=status` includes MR identity and ignores detail and description options.
+    `view=status` ignores detail and description options. `include_pipeline_stages` adds name/status TSV;
+    `pipeline_stages_complete=false` means missing or partial data, not CI success.
     After a push, confirm `head_sha` matches the pushed SHA before checking `pipeline_sha` and `pipeline_status`.
     A different pipeline SHA is expected for `pipeline_event_type=merged_result` or `merge_train`, which test merge
-    commits; for absent or `detached` event types in the full view it means stale CI. Status omits the event type,
-    so use the full view to classify a different pipeline SHA. Missing SHA means unknown, not passed.
+    commits; absent or `detached` event types in the full view mean stale CI. Status omits the event type, so use the
+    full view to classify a different pipeline SHA. Missing SHA means unknown, not passed.
     `latest_pipeline_id` identifies the head pipeline. `include_jobs` adds failed-job TSV; `jobs_complete=false`
     means the scan hit its cap. No head pipeline means no job fetch.
 
     Descriptions are opt-in. With `include_description=true`, follow `next_description_offset` or set
     `description_limit` up to 12000. Nonzero offsets return description-only pages and ignore detail flags. Pages allow
     a final tail up to 25% above the limit. Set `include_description_hash=true` on page one; compare the raw UTF-8
-    SHA-256 `description_hash` (null treated as empty) on later pages and restart if changed.
-    `headings_only` lists ATX headings outside fences. `section` matches case-insensitive exact headings or unique
-    leading words/IDs; a string returns description, a list returns sections. Unknown headings list available ones.
-    Focused reads require a positive limit, reject offsets, and share one total content cap.
-    `find` returns matching lines with 1-based line numbers, code-point offsets usable as `description_offset`, and
-    JSON-encoded text to decode and copy into edit `old_text`; `find_missing` and `find_truncated` report omissions.
+    SHA-256 `description_hash` (null treated as empty) on later pages; restart if changed.
+    `headings_only` lists ATX headings outside fences. `section` matches exact headings case-insensitively or unique
+    leading words/IDs; a string returns description, a list returns sections. Unknown headings list options.
+    Focused reads require a positive limit, reject offsets, and share a content cap.
+    `find` returns matching lines with 1-based line numbers, code-point `description_offset` values, and JSON text to
+    decode and copy into edit `old_text`; `find_missing` and `find_truncated` report omissions.
     It includes `description_hash` for `edit_merge_request_description(expected_hash=...)`.
 
-    `issue_keys` contains up to 100 unique title/raw-description keys. Default extraction skips partial advisory IDs
+    `issue_keys` has up to 100 unique title/raw-description keys. Default extraction skips partial advisory IDs
     such as CVE-2024-1 or RHSA-2026:1234. `issue_key_prefixes` keep partials; `issue_key_pattern` replaces extraction,
     preserves full matches/case, and cannot be combined with prefixes. `issue_keys_truncated` flags limits.
     `include_labels` adds up to 100 labels; `labels_truncated` flags omissions. `blocked_by` lists blocking IIDs;
-    `hidden_blockers` flags invisible blockers. `commits_behind` is open-MR only and omitted if unavailable.
+    `hidden_blockers` flags hidden blockers. `commits_behind` is open-MR only; omitted if unavailable.
     `include_commits` returns the newest 50 commits oldest-first as nine-character SHAs and subjects;
-    `commits_truncated` means older commits were omitted. Use `api_get(resource='mr_commits')` for full messages
-    and trailers.
+    `commits_truncated` flags older omissions. Use `api_get(resource='mr_commits')` for full messages and trailers.
     """
     if view == "status":
-        node = await fetch_merge_request(get_client(ctx), MERGE_REQUEST_STATUS_QUERY, project, iid)
-        return _to_status(node)
+        node = await fetch_merge_request(
+            get_client(ctx), MERGE_REQUEST_STATUS_QUERY, project, iid, includePipelineStages=include_pipeline_stages
+        )
+        return _to_status(node, include_pipeline_stages=include_pipeline_stages)
     _validate_description_options(include_description, description_limit, description_offset, include_description_hash)
     focused = _validate_focus(
         section,
