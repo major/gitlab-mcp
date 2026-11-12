@@ -1273,6 +1273,40 @@ async def test_failures_view_defaults_to_a_256_kib_raw_prefix():
 
 
 @respx.mock
+async def test_log_views_select_distinct_evidence_and_accept_max_chars():
+    """Tail, summary, and two literal searches do not silently reuse the same selection."""
+    # Arrange
+    body = "early needle\nsetup\nerror: broken check\nlate needle\ncleanup\n"
+    mock_tail(body)
+    mock_job()
+    mock_head(body)
+    arguments = {"project": PROJECT, "job_id": 42, "max_chars": 16000}
+
+    # Act
+    async with Client(mcp) as client:
+        tail = await client.call_tool("get_job_log", arguments)
+        summary = await client.call_tool("get_job_log", arguments | {"view": "summary"})
+        early = await client.call_tool(
+            "get_job_log", arguments | {"view": "search", "pattern": "early", "context": 0}
+        )
+        late = await client.call_tool(
+            "get_job_log", arguments | {"view": "search", "pattern": "late", "context": 0}
+        )
+
+    # Assert
+    results = [tail, summary, early, late]
+    assert [result.structured_content["text"] for result in results] == [
+        body,
+        "error: broken check\n",
+        "early needle\n",
+        "late needle\n",
+    ]
+    for result in results:
+        assert json.loads(result.content[0].text) == result.structured_content
+    assert len(respx.calls) == 6
+
+
+@respx.mock
 async def test_summary_selects_make_pytest_block_and_terminal_failure_in_one_tail_request():
     """Summary keeps recognized failure evidence from the last 100 lines in one GraphQL call."""
     # Arrange

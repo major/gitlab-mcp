@@ -269,6 +269,7 @@ async def test_status_view_is_minimal_and_ignores_detail_options(  # noqa: PLR09
         "approved": is_approved,
         "open_thread_count": open_count,
     }
+    assert json.loads(result.content[0].text) == result.structured_content
     assert route.call_count == 1
     assert len(respx.calls) == 1
     assert sent_variables(route) == {"fullPath": PROJECT, "iid": str(IID)}
