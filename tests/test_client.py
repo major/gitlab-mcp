@@ -355,6 +355,24 @@ async def test_mutate_returns_the_payload_on_success(client):
     assert json.loads(route.calls.last.request.content)["variables"] == {"body": "Looks good"}
 
 
+@respx.mock
+async def test_todo_mutation_preserves_numeric_result_and_global_input_id(client):
+    """The shared client preserves GitLab's different input and output ID formats without extra requests."""
+    # Arrange
+    query = "mutation($id: TodoID!) { todoMarkDone(input: {id: $id}) { todo { id state } errors } }"
+    variables = {"id": "gid://gitlab/Todo/123"}
+    payload = {"todo": {"id": "123", "state": "done"}, "errors": []}
+    route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": {"todoMarkDone": payload}}))
+
+    # Act
+    result = await client.mutate(query, variables, "todoMarkDone")
+
+    # Assert
+    assert result == payload
+    assert route.call_count == 1
+    assert json.loads(route.calls.last.request.content) == {"query": query, "variables": variables}
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_message"),
     [
