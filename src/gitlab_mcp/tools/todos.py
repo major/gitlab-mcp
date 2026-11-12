@@ -14,6 +14,7 @@ from gitlab_mcp.ci_common import (
     cell,
     decode_cursor,
     encode_cursor,
+    numeric_gid,
     parse_gid,
     raise_tool_error,
 )
@@ -66,7 +67,9 @@ class TodoWriteResult(BaseModel):
 
 
 def _number(value: object) -> int:
-    """Accept only canonical positive numeric to-do IDs from GitLab."""
+    """Normalize canonical Todo global IDs or positive numeric response IDs."""
+    if isinstance(value, str) and value.startswith("gid://"):
+        return numeric_gid(value, {"Todo"})
     if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r"[1-9][0-9]*", str(value)):
         raise_tool_error("GitLab returned an invalid to-do ID.")
     return int(value)
