@@ -36,12 +36,13 @@ TargetType = Literal[
 Positive = Annotated[int, Field(strict=True, ge=1)]
 PageSize = Annotated[int, Field(strict=True, ge=1, le=100)]
 HEADER = "todo_id\tstate\taction\ttarget_type\tproject\ttarget_id\tname\tcreated\ttarget_url"
+# WorkItem uses a different ID scalar; its alias avoids a GraphQL field-type conflict.
 QUERY = """query($states: [TodoStateEnum!], $projectIds: [ID!], $groupIds: [ID!],
                 $types: [TodoTargetEnum!], $first: Int!, $after: String) {
   currentUser { todos(state: $states, projectId: $projectIds, groupId: $groupIds,
                       type: $types, first: $first, after: $after) {
     nodes { id state action targetType targetUrl createdAt project { fullPath }
-      targetEntity { name ... on Issue { id } ... on MergeRequest { id } ... on WorkItem { id } } }
+      targetEntity { name ... on Issue { id } ... on MergeRequest { id } ... on WorkItem { workItemId: id } } }
     pageInfo { hasNextPage endCursor }
   } }
 }"""
@@ -81,7 +82,7 @@ def _row(node: dict[str, Any]) -> str:
         node.get("action"),
         node.get("targetType"),
         project.get("fullPath"),
-        target.get("id"),
+        target.get("id") or target.get("workItemId"),
         cap(cell(target.get("name")), 200),
         (node.get("createdAt") or "")[:10],
         node.get("targetUrl"),
@@ -103,7 +104,7 @@ async def list_todos(  # noqa: PLR0913, PLR0917
 
     Pending excludes snoozed items; results use GitLab's default ID-descending order. EPIC requires EE.
     TSV target IDs are available only for issues, merge requests and work items; others are blank.
-    Pass next_cursor unchanged with the same filters and limit.
+    Pass next_cursor unchanged with the same filters and limit. Pages are not a snapshot when to-dos change.
     """
     client = get_client(ctx)
     scope = {
@@ -184,7 +185,8 @@ async def create_todo(ctx: Context, target_id: str) -> TodoWriteResult:
     """Create a to-do like `glab api graphql` (GitLab 18.6 baseline).
 
     Pass a target global ID, not a project IID or numeric to-do ID. Supports Issue, MergeRequest,
-    WorkItem, DesignManagement::Design and Epic. Use target_id from list_todos where available.
+    WorkItem, DesignManagement::Design and Epic. Use target_id from list_todos where available,
+    or id from get_work_item for work items.
     No retry occurs. For duplicates or unknown outcomes, check GitLab before retrying.
     """
     model, _ = parse_gid(target_id)
@@ -193,11 +195,11 @@ async def create_todo(ctx: Context, target_id: str) -> TodoWriteResult:
     return await _write(get_client(ctx), "todoCreate", {"targetId": target_id}, "pending")
 
 
-@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True})
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True, "idempotentHint": False})
 async def update_todo(ctx: Context, todo_id: Positive, state: Literal["pending", "done"]) -> TodoWriteResult:
     """Mark a to-do done or restore it, like `glab api graphql` (GitLab 18.6 baseline).
 
-    No retry occurs. For an unknown outcome, check GitLab before retrying.
+    Use the numeric todo_id from list_todos. No retry occurs. For an unknown outcome, check GitLab before retrying.
     """
     return await _write(
         get_client(ctx),

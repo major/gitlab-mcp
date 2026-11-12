@@ -46,6 +46,11 @@ async def test_list_filters(gitlab_env, state, states):
         "after": None,
     }
     assert route.call_count == 1
+    assert "next_cursor" not in result
+    query = json.loads(route.calls[0].request.content)["query"]
+    assert "targetEntity { name ... on Issue { id }" in query
+    assert "... on WorkItem { workItemId: id }" in query
+    assert "body" not in query
 
 
 @pytest.mark.parametrize(
@@ -70,27 +75,13 @@ async def test_write_success(gitlab_env, tool, arguments, field, state):
     # Assert
     assert result == {"status": "created" if tool == "create_todo" else "updated", "todo_id": 5, "state": state}
     assert route.call_count == 1
-
-
-@respx.mock
-async def test_unknown_write(gitlab_env):
-    """An ambiguous mutation response never claims success."""
-    # Arrange
-    route = respx.post(GRAPHQL).mock(return_value=httpx.Response(500))
-    # Act
-    result = await call_tool("create_todo", {"target_id": "gid://gitlab/Issue/2"})
-    # Assert
-    assert result == UNKNOWN
-    assert route.call_count == 1
-
-
-@respx.mock
-async def test_invalid_target(gitlab_env):
-    """Invalid global IDs are rejected before contacting GitLab."""
-    # Act / Assert
-    with pytest.raises(ToolError):
-        await call_tool("create_todo", {"target_id": "gid://gitlab/Issue/02"})
-    assert not respx.calls
+    request = json.loads(route.calls[0].request.content)
+    assert f"{field}(input:" in request["query"]
+    expected_variables = (
+        {"targetId": arguments["target_id"]} if tool == "create_todo" else {"id": "gid://gitlab/Todo/5"}
+    )
+    assert request["variables"] == expected_variables
+    assert ("$targetId: TodoableID!" if tool == "create_todo" else "$id: TodoID!") in request["query"]
 
 
 @pytest.mark.parametrize("model", ["Issue", "MergeRequest", "WorkItem", "DesignManagement::Design", "Epic"])
@@ -178,7 +169,17 @@ async def test_rows_and_scoped_cursor(gitlab_env):
 
 @pytest.mark.parametrize(
     "arguments",
-    [{"limit": 0}, {"limit": 101}, {"limit": True}, {"project_id": True}, {"group_id": 0}, {"cursor": "bad"}],
+    [
+        {"limit": 0},
+        {"limit": 101},
+        {"limit": True},
+        {"project_id": True},
+        {"group_id": 0},
+        {"cursor": "bad"},
+        {"cursor": ""},
+        {"state": "invalid"},
+        {"target_type": "Issue"},
+    ],
 )
 @respx.mock
 async def test_bad_list_arguments(gitlab_env, arguments):
@@ -189,36 +190,57 @@ async def test_bad_list_arguments(gitlab_env, arguments):
     assert not respx.calls
 
 
+@pytest.mark.parametrize("tool", ["create_todo", "update_todo"])
 @pytest.mark.parametrize(
-    "body",
+    "payload",
     [
-        {"errors": [{"message": "oops"}]},
-        {"data": {"todoCreate": None}},
-        {"data": {"todoCreate": {"errors": ["bad"]}}},
-        {"data": {"todoCreate": {"todo": {"id": True, "state": "pending"}}}},
-        {"data": {"todoCreate": {"todo": {"id": "4", "state": "done"}}}},
+        None,
+        {"errors": ["bad"]},
+        {"todo": None, "errors": []},
+        {"todo": {"id": True, "state": "pending"}, "errors": []},
+        {"todo": {"id": "01", "state": "pending"}, "errors": []},
+        {"todo": {"id": "gid://gitlab/Todo/4", "state": "pending"}, "errors": []},
+        {"todo": {"id": "5", "state": "done"}, "errors": []},
+        {"todo": {"id": "5", "state": "pending"}},
+        {"todo": {"id": "5", "state": "pending", "targetUrl": 1}, "errors": []},
     ],
 )
 @respx.mock
-async def test_ambiguous_payload(gitlab_env, body):
-    """GraphQL errors and invalid confirmations produce an unknown outcome."""
+async def test_ambiguous_payload(gitlab_env, tool, payload):
+    """Missing, mismatched, and malformed confirmations never imply write success."""
     # Arrange
+    field = "todoCreate" if tool == "create_todo" else "todoRestore"
+    body = {"data": {field: payload}}
     route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=body))
+    arguments = {"target_id": "gid://gitlab/Issue/2"} if tool == "create_todo" else {"todo_id": 5, "state": "pending"}
     # Act
-    result = await call_tool("create_todo", {"target_id": "gid://gitlab/Issue/2"})
+    result = await call_tool(tool, arguments)
     # Assert
     assert result == UNKNOWN
     assert route.call_count == 1
 
 
-@pytest.mark.parametrize("status", [408, 500, 503])
+@pytest.mark.parametrize("tool", ["create_todo", "update_todo"])
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.ConnectError("connection lost"),
+        httpx.Response(408),
+        httpx.Response(500),
+        httpx.Response(503),
+        httpx.Response(200, text="not json"),
+        httpx.Response(200, json={"errors": [{"message": "oops"}]}),
+        httpx.Response(200, json={"data": None}),
+    ],
+)
 @respx.mock
-async def test_ambiguous_http(gitlab_env, status):
-    """Timeout and server HTTP errors do not confirm a write."""
+async def test_uncertain_write_is_never_retried(gitlab_env, tool, response):
+    """Transport, server, and unreadable GraphQL responses never confirm a write."""
     # Arrange
-    route = respx.post(GRAPHQL).mock(return_value=httpx.Response(status))
+    route = respx.post(GRAPHQL).mock(side_effect=[response])
+    arguments = {"target_id": "gid://gitlab/Issue/2"} if tool == "create_todo" else {"todo_id": 1, "state": "done"}
     # Act / Assert
-    assert await call_tool("update_todo", {"todo_id": 1, "state": "done"}) == UNKNOWN
+    assert await call_tool(tool, arguments) == UNKNOWN
     assert route.call_count == 1
 
 
@@ -230,4 +252,93 @@ async def test_explicit_http_rejection(gitlab_env):
     # Act / Assert
     with pytest.raises(ToolError, match="403"):
         await call_tool("update_todo", {"todo_id": 1, "state": "done"})
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("create_todo", {"target_id": "gid://gitlab/Issue/02"}),
+        ("create_todo", {"target_id": "gid://gitlab/Issue/0"}),
+        ("create_todo", {"target_id": "gid://gitlab/Todo/1"}),
+        ("create_todo", {"target_id": "2"}),
+        ("update_todo", {"todo_id": True, "state": "done"}),
+        ("update_todo", {"todo_id": 0, "state": "done"}),
+        ("update_todo", {"todo_id": "1", "state": "done"}),
+        ("update_todo", {"todo_id": 1, "state": "all"}),
+    ],
+)
+@respx.mock
+async def test_invalid_write_arguments(gitlab_env, tool, arguments):
+    """Invalid target IDs, strict numeric IDs, and update states cannot reach GitLab."""
+    # Act / Assert
+    with pytest.raises(ToolError):
+        await call_tool(tool, arguments)
+    assert not respx.calls
+
+
+@pytest.mark.parametrize("end_cursor", [None, "", " ", 1])
+@respx.mock
+async def test_more_rows_require_a_usable_cursor(gitlab_env, end_cursor):
+    """A page cannot silently claim completion when its continuation is unavailable."""
+    # Arrange
+    body = {"currentUser": {"todos": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": end_cursor}}}}
+    route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
+    # Act / Assert
+    with pytest.raises(ToolError, match="invalid to-do page"):
+        await call_tool("list_todos")
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_unavailable_target_preserves_the_row_and_page_bound(gitlab_env):
+    """Null targets keep their row, while excess rows are rejected rather than silently cut."""
+    # Arrange
+    node = {"id": "5", "state": "done", "project": {"fullPath": "group/project"}, "targetEntity": None}
+    body = {"currentUser": {"todos": {"nodes": [node], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+    route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
+    async with Client(mcp) as client:
+        # Act
+        result = await call_tool("list_todos", {"limit": 1}, client=client)
+        # Assert
+        row = result["todos"].splitlines()[1].split("\t")
+        assert row == ["5", "done", "", "", "group/project", "", "", "", ""]
+        assert "next_cursor" not in result
+        body["currentUser"]["todos"]["nodes"].append(node)
+        route.mock(return_value=httpx.Response(200, json={"data": body}))
+        with pytest.raises(ToolError, match="invalid to-do page"):
+            await call_tool("list_todos", {"limit": 1}, client=client)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"id": "gid://gitlab/Issue/5", "name": "Issue"},
+        {"id": "gid://gitlab/MergeRequest/5", "name": "Merge request"},
+        {"workItemId": "gid://gitlab/WorkItem/5", "name": "Work item"},
+    ],
+)
+@respx.mock
+async def test_target_id_fragments_share_one_tsv_column(gitlab_env, target):
+    """The aliased work-item scalar maps to the same column as issue and merge-request IDs."""
+    # Arrange
+    node = {"id": "5", "targetEntity": target}
+    body = {"currentUser": {"todos": {"nodes": [node], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+    respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
+    # Act
+    result = await call_tool("list_todos")
+    # Assert
+    row = result["todos"].splitlines()[1].split("\t")
+    assert row[5] == target.get("id", target.get("workItemId"))
+    assert row[6] == target["name"]
+
+
+@respx.mock
+async def test_update_cannot_confirm_a_different_todo(gitlab_env):
+    """A valid numeric ID for another to-do does not confirm the requested update."""
+    # Arrange
+    body = {"data": {"todoMarkDone": {"todo": {"id": "2", "state": "done"}, "errors": []}}}
+    route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json=body))
+    # Act / Assert
+    assert await call_tool("update_todo", {"todo_id": 1, "state": "done"}) == UNKNOWN
     assert route.call_count == 1
