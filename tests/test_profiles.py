@@ -47,6 +47,15 @@ async def test_compact_inventory_and_schema_budget(gitlab_env):
     assert start.annotations.open_world_hint is True
     assert start.output_schema == full["create_pipeline"].output_schema
     assert size(start) < sum(size(full[name]) for name in ("create_pipeline", "create_merge_request_pipeline"))
+    for name, option, default in (
+        ("get_merge_request", "include_pipeline_stages", False),
+        ("edit_merge_request_description", "return_hashes", True),
+    ):
+        assert (short[name].input_schema, short[name].output_schema) == (
+            full[name].input_schema,
+            full[name].output_schema,
+        )
+        assert short[name].input_schema["properties"][option]["default"] is default
     for tool in short.values():
         text = json.dumps([tool.description, tool.input_schema, tool.output_schema])
         assert not re.search(r"\b(?:create_pipeline|create_merge_request_pipeline)\b", text)

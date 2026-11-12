@@ -189,8 +189,15 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     ] = None,
     validate_only: Annotated[
         bool,
-        Field(description="True checks every replacement and returns the preview with base_hash, without writing."),
+        Field(description="True checks every replacement and returns a preview without writing."),
     ] = False,
+    return_hashes: Annotated[
+        bool,
+        Field(
+            description="False omits both hashes independently of return_diff. Keep true for a preview base_hash "
+            "and the approval/guarded write flow. Defaults to true."
+        ),
+    ] = True,
 ) -> _description_edits.DescriptionEditResult:
     """Replace exact text, like a guarded `glab api --method PUT projects/:id/merge_requests/:iid`.
 
@@ -201,12 +208,24 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     or omitted. After explicit user `APPROVE`, send identical edits with `expected_hash=base_hash`. GitLab has no
     compare-and-swap, so a concurrent edit may still be overwritten. Writes are never retried. `status` is
     `validated`, `applied`, `failed`, or `unknown`; re-read before retrying unknown. Set `return_diff=false` to omit
-    changed lines. Applied results include `description_hash`, the SHA-256 of the full updated UTF-8 description,
-    even when the diff is omitted. Reuse it as `expected_hash` for a follow-up edit without a separate description
-    read. Failed or unknown writes omit the hash; a preview's `description_hash` describes only the proposed text.
+    changed lines. By default, applied results include `description_hash`, the SHA-256 of the full updated UTF-8
+    description, even when the diff is omitted. Reuse it as `expected_hash` for a follow-up edit without a separate
+    description read. Set `return_hashes=false` to omit both hashes independently of `return_diff`. A hashless preview
+    has no `base_hash`, so keep hashes for the approval and guarded write flow. `expected_hash` is checked regardless
+    of `return_hashes`. Failed or unknown writes omit the hash; a preview's `description_hash`, when returned,
+    describes only the proposed text.
     """
     return await _description_edits.edit_merge_request_description(
-        get_client(ctx), project, iid, old_text, new_text, return_diff, edits, expected_hash, validate_only
+        get_client(ctx),
+        project,
+        iid,
+        old_text,
+        new_text,
+        return_diff,
+        edits,
+        expected_hash,
+        validate_only,
+        return_hashes=return_hashes,
     )
 
 

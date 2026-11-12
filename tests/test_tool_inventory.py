@@ -360,6 +360,7 @@ async def test_write_tools_are_marked_as_writes(tools, name):
                 "description_limit",
                 "description_offset",
                 "include_description_hash",
+                "include_pipeline_stages",
             },
         ),
         ("get_merge_request_threads", {"project"}, {"iid", "iids", "include_mr_status"}),
@@ -386,7 +387,11 @@ async def test_write_tools_are_marked_as_writes(tools, name):
                 "diff_limit",
             },
         ),
-        ("edit_merge_request_description", {"project", "iid"}, {"old_text", "new_text", "return_diff", "edits"}),
+        (
+            "edit_merge_request_description",
+            {"project", "iid"},
+            {"old_text", "new_text", "return_diff", "edits", "return_hashes"},
+        ),
         (
             "edit_merge_request_note",
             {"project", "iid", "thread_id", "note_id", "expected_hash"},
@@ -538,23 +543,20 @@ async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
     assert schema["type"] == "object"
     assert set(branches) == {"MergeRequestDetail", "MergeRequestDescriptionPage", "MergeRequestStatus"}
     status = branches["MergeRequestStatus"]
-    assert (
-        set(status["required"])
-        == set(status["properties"])
-        == {
-            "iid",
-            "title",
-            "state",
-            "source_branch",
-            "head_sha",
-            "pipeline_status",
-            "latest_pipeline_id",
-            "pipeline_sha",
-            "merge_status",
-            "approved",
-            "open_thread_count",
-        }
-    )
+    assert set(status["required"]) == {
+        "iid",
+        "title",
+        "state",
+        "source_branch",
+        "head_sha",
+        "pipeline_status",
+        "latest_pipeline_id",
+        "pipeline_sha",
+        "merge_status",
+        "approved",
+        "open_thread_count",
+    }
+    assert set(status["properties"]) == set(status["required"]) | {"pipeline_stages", "pipeline_stages_complete"}
     assert {"iid", "title", "state", "source_branch", "target_branch", "approved"} <= set(detail["required"])
     assert "description_hash" in detail["properties"]
     assert "description_hash" not in detail["required"]
@@ -568,6 +570,7 @@ async def test_get_merge_request_has_unwrapped_object_output_schema(tools):
         "description_hash",
     }
     assert tools["get_merge_request"].input_schema["properties"]["include_description_hash"]["default"] is False
+    assert tools["get_merge_request"].input_schema["properties"]["include_pipeline_stages"]["default"] is False
 
 
 @pytest.mark.parametrize(

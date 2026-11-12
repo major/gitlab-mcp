@@ -56,8 +56,9 @@ class DescriptionEditResult(BaseModel):
     `changed_lines` is a zero-context unified diff of the whole description, so
     its `@@` headers carry real line numbers. It is filled for applied writes and
     previews. `truncated` is true when the diff was cut to its requested character
-    limit. `description_hash` is the SHA-256 hash of the resulting description.
-    Previews also include the base hash and each edit's match line.
+    limit. When hashes are returned, `description_hash` is the SHA-256 hash of
+    the resulting description and previews also include the base hash. Previews
+    include each edit's match line even when hashes are omitted.
     """
 
     status: Literal["applied", "failed", "unknown", "validated"]
@@ -68,16 +69,19 @@ class DescriptionEditResult(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
         description=(
-            "SHA-256 of the resulting full UTF-8 description, even when the diff is omitted. "
+            "SHA-256 of the resulting full UTF-8 description, when hashes are requested, even if the diff is omitted. "
             "After status=applied, reuse as expected_hash for the next edit. "
             "For validated previews, this hashes the proposed description, not the current one. "
-            "Omitted for failed or unknown writes."
+            "Omitted for failed or unknown writes and when return_hashes is false."
         ),
     )
     base_hash: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
-        description="SHA-256 of the description the edits were checked against; pass it as expected_hash on the write",
+        description=(
+            "SHA-256 of the description checked in a preview, when hashes are requested; "
+            "pass it as expected_hash on the write."
+        ),
     )
     edit_lines: list[int] | None = Field(
         default=None,
@@ -202,15 +206,22 @@ def _unknown_result(exc: ToolError) -> DescriptionEditResult:
     return DescriptionEditResult(status="unknown", warning=f"{str(exc).rstrip('.')}. {UNKNOWN_WARNING}")
 
 
-async def _write_edit(
-    write: Awaitable[object], before: str, after: str, return_diff: bool, diff_limit: int = DIFF_CAP
+async def _write_edit(  # noqa: PLR0913 - preserve positional options for the shared work-item caller.
+    write: Awaitable[object],
+    before: str,
+    after: str,
+    return_diff: bool,
+    diff_limit: int = DIFF_CAP,
+    *,
+    return_hashes: bool = True,
 ) -> DescriptionEditResult:
     """Send one write once and turn its outcome into a result. Writes are never retried.
 
     A network error or a 5xx can happen after GitLab saved the change, so those
     are `unknown`. A 4xx or a GraphQL payload error means GitLab refused the
     change, so it is `failed`. When `return_diff` is false or `diff_limit` is
-    zero, changed lines are not computed.
+    zero, changed lines are not computed. When `return_hashes` is false, the
+    resulting description hash is not computed.
     """
     try:
         await write
@@ -227,7 +238,7 @@ async def _write_edit(
         status="applied",
         changed_lines=changed,
         truncated=truncated,
-        description_hash=hashlib.sha256(after.encode("utf-8")).hexdigest(),
+        description_hash=hashlib.sha256(after.encode("utf-8")).hexdigest() if return_hashes else None,
     )
 
 
@@ -241,14 +252,18 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
     edits: list[DescriptionReplacement] | None = None,
     expected_hash: str | None = None,
     validate_only: bool = False,
+    return_hashes: bool = True,
 ) -> DescriptionEditResult:
     """Apply one or more exact replacements to a merge request's description.
 
     The full description is read first, so nothing is cut before the write. A null
     description counts as empty. Set `return_diff` to false to omit changed lines.
     With `validate_only`, every replacement is checked and a `validated` preview is
-    returned with `base_hash` and `edit_lines`, but nothing is written. Pass
-    `expected_hash` (for example a preview's `base_hash`) to refuse a stale read.
+    returned with `edit_lines`, but nothing is written. Hashes are returned by
+    default independently of `return_diff`; a hashless preview has no `base_hash`.
+    Keep hashes for the approval and guarded write flow. Pass `expected_hash`
+    (for example a preview's `base_hash`) to refuse a stale read, even when
+    `return_hashes` is false.
 
     Raises:
         ToolError: Before any write, when `old_text` is empty, equals `new_text`,
@@ -284,11 +299,17 @@ async def edit_merge_request_description(  # noqa: PLR0913, PLR0917 - each argum
             status="validated",
             changed_lines=changed,
             truncated=truncated,
-            description_hash=hashlib.sha256(after.encode("utf-8")).hexdigest(),
-            base_hash=hashlib.sha256(before.encode("utf-8")).hexdigest(),
+            description_hash=hashlib.sha256(after.encode("utf-8")).hexdigest() if return_hashes else None,
+            base_hash=hashlib.sha256(before.encode("utf-8")).hexdigest() if return_hashes else None,
             edit_lines=edit_lines,
         )
-    return await _write_edit(client.request("PUT", path, json={"description": after}), before, after, return_diff)
+    return await _write_edit(
+        client.request("PUT", path, json={"description": after}),
+        before,
+        after,
+        return_diff,
+        return_hashes=return_hashes,
+    )
 
 
 async def edit_work_item_description(  # noqa: PLR0913, PLR0917 - each argument is part of the tool API.
