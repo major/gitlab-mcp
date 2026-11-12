@@ -61,21 +61,7 @@ async def test_list_filters(gitlab_env, state, states):
         ("update_todo", {"todo_id": 7, "state": "pending"}, "todoRestore"),
     ],
 )
-@pytest.mark.parametrize(
-    "response_id",
-    [
-        7,
-        "7",
-        pytest.param(
-            "gid://gitlab/Todo/7",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=pytest.RaisesExc(AssertionError, match="Todo response ID should confirm the write"),
-                reason="Todo GIDs are not normalized yet",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("response_id", [7, "7", "gid://gitlab/Todo/7"])
 @respx.mock
 async def test_write_success(gitlab_env, tool, arguments, field, response_id):
     """Writes make one mutation and return the confirmed numeric ID."""
@@ -97,28 +83,10 @@ async def test_write_success(gitlab_env, tool, arguments, field, response_id):
     )
     assert request["variables"] == expected_variables
     assert ("$targetId: TodoableID!" if tool == "create_todo" else "$id: TodoID!") in request["query"]
-    assert result == {
-        "status": "created" if tool == "create_todo" else "updated",
-        "todo_id": TODO_ID,
-        "state": state,
-    }, "Todo response ID should confirm the write"
+    assert result == {"status": "created" if tool == "create_todo" else "updated", "todo_id": TODO_ID, "state": state}
 
 
-@pytest.mark.parametrize(
-    "response_id",
-    [
-        7,
-        "7",
-        pytest.param(
-            "gid://gitlab/Todo/7",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=pytest.RaisesExc(ToolError, match="invalid to-do ID"),
-                reason="Todo GIDs are not normalized yet",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("response_id", [7, "7", "gid://gitlab/Todo/7"])
 @respx.mock
 async def test_list_response_ids(gitlab_env, response_id):
     """Normalize to-do IDs without changing the separate target global ID."""
@@ -152,7 +120,7 @@ async def test_list_response_ids(gitlab_env, response_id):
 async def test_invalid_list_id_rejects_the_whole_page(gitlab_env, node):
     """Invalid or missing IDs cannot be skipped to return a partial page."""
     # Arrange
-    nodes = [{"id": "8"}, node, {"id": "6"}]
+    nodes = [{"id": "gid://gitlab/Todo/8"}, node, {"id": "gid://gitlab/Todo/6"}]
     body = {"currentUser": {"todos": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
     route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
     # Act / Assert
@@ -172,7 +140,7 @@ async def test_create_supported_targets(gitlab_env, model):
             json={
                 "data": {
                     "todoCreate": {
-                        "todo": {"id": 7, "state": "pending", "targetUrl": "https://example.com"},
+                        "todo": {"id": "gid://gitlab/Todo/7", "state": "pending", "targetUrl": "https://example.com"},
                         "errors": [],
                     }
                 }
@@ -206,7 +174,7 @@ async def test_rows_and_scoped_cursor(gitlab_env):
     """Rows are sanitized and cursors only resume matching filters."""
     # Arrange
     node = {
-        "id": "8",
+        "id": "gid://gitlab/Todo/8",
         "state": "pending",
         "action": "assigned",
         "targetType": "COMMIT",
@@ -366,7 +334,14 @@ async def test_invalid_write_arguments(gitlab_env, tool, arguments):
 async def test_more_rows_require_a_usable_cursor(gitlab_env, end_cursor):
     """A page cannot silently claim completion when its continuation is unavailable."""
     # Arrange
-    body = {"currentUser": {"todos": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": end_cursor}}}}
+    body = {
+        "currentUser": {
+            "todos": {
+                "nodes": [{"id": "gid://gitlab/Todo/7"}],
+                "pageInfo": {"hasNextPage": True, "endCursor": end_cursor},
+            }
+        }
+    }
     route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
     # Act / Assert
     with pytest.raises(ToolError, match="invalid to-do page"):
@@ -378,7 +353,12 @@ async def test_more_rows_require_a_usable_cursor(gitlab_env, end_cursor):
 async def test_unavailable_target_preserves_the_row_and_page_bound(gitlab_env):
     """Null targets keep their row, while excess rows are rejected rather than silently cut."""
     # Arrange
-    node = {"id": "5", "state": "done", "project": {"fullPath": "group/project"}, "targetEntity": None}
+    node = {
+        "id": "gid://gitlab/Todo/5",
+        "state": "done",
+        "project": {"fullPath": "group/project"},
+        "targetEntity": None,
+    }
     body = {"currentUser": {"todos": {"nodes": [node], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
     route = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
     async with Client(mcp) as client:
@@ -406,7 +386,7 @@ async def test_unavailable_target_preserves_the_row_and_page_bound(gitlab_env):
 async def test_target_id_fragments_share_one_tsv_column(gitlab_env, target):
     """The aliased work-item scalar maps to the same column as issue and merge-request IDs."""
     # Arrange
-    node = {"id": "5", "targetEntity": target}
+    node = {"id": "gid://gitlab/Todo/5", "targetEntity": target}
     body = {"currentUser": {"todos": {"nodes": [node], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
     respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"data": body}))
     # Act
