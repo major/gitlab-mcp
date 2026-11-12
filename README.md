@@ -152,6 +152,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `create_merge_request_pipeline` | Start a merge request pipeline after checking the MR head SHA, for example after a retarget. |
 | `create_pipeline` | Create a pipeline for a ref after checking its expected commit SHA. |
 | `create_snippet` | Create a personal or project snippet with bounded files. |
+| `create_todo` | Create a to-do for a supported target. |
 | `create_work_item_note` | Add a project or group work item comment from inline text or a server-local file. |
 | `delete_snippet` | Delete a personal or project snippet. |
 | `edit_merge_request_description` | Preview and apply exact-text replacements with a hash guard; applied results return `description_hash` for follow-up edits. |
@@ -184,6 +185,7 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `list_pipeline_schedules` | List one page of a project's pipeline schedules. |
 | `list_pipelines` | List one page of project, merge request, or schedule pipelines. |
 | `list_snippets` | List one page of personal, visible, public, or project snippets. |
+| `list_todos` | List one bounded page of your to-dos. |
 | `list_work_item_notes` | Read a bounded page of human notes and their IDs for a work item. |
 | `post_review_notes` | Validate or post review notes (inline, or loaded from a `body_dir` of front-matter note files), cache bodies and position-only checks in one batch, and preview notes or cached body overrides in server-local Markdown. On a stale head, report what changed and keep the batch for re-validation on the new head. |
 | `reply_to_thread` | Reply to or resolve one merge request review thread. |
@@ -192,3 +194,4 @@ Run `goose session` from a shell with `GITLAB_TOKEN` exported, and optionally `G
 | `retry_ci` | Retry a failed or canceled CI job or pipeline after checking its expected SHA. |
 | `update_merge_request` | Comment on, close, or reopen a merge request, or update its details, people, labels, blockers, approval, or rebase status. |
 | `update_snippet` | Update snippet metadata or file contents. |
+| `update_todo` | Mark a to-do done or restore it. |
