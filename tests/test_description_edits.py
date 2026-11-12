@@ -257,10 +257,11 @@ async def test_mr_edit_can_skip_changed_lines(router):
     )
 
     # Assert
-    assert result["status"] == "applied"
-    assert "changed_lines" not in result
-    assert result["truncated"] is False
-    assert "warning" not in result
+    assert result == {
+        "status": "applied",
+        "truncated": False,
+        "description_hash": hashlib.sha256(b"Plan: launch").hexdigest(),
+    }
     assert json.loads(put.calls.last.request.content) == {"description": "Plan: launch"}
 
 

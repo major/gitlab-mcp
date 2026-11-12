@@ -207,7 +207,15 @@ async def test_default_raw_result_remains_unwrapped(gitlab_env):
     ("pipeline", "diff_refs", "counts", "approved", "expected"),
     [
         (
-            {"id": "gid://gitlab/Ci::Pipeline/123", "status": "SUCCESS", "sha": "pipe"},
+            {
+                "id": "gid://gitlab/Ci::Pipeline/123",
+                "status": "SUCCESS",
+                "sha": "pipe",
+                "stages": {
+                    "nodes": [{"name": "test", "status": "success"}],
+                    "pageInfo": {"hasNextPage": False},
+                },
+            },
             {"headSha": HEAD_SHA},
             (5, 2),
             True,
