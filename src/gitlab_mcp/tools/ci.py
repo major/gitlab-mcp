@@ -456,7 +456,8 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
         Field(
             description=(
                 "tail keeps the last lines; summary selects make, pytest summary, and terminal failure evidence from "
-                "the last 100 lines; head keeps the first; section scans a bounded prefix; search finds a literal "
+                "the last 100 lines, grouping identical displayed pytest messages with an example node; head keeps "
+                "the first; section scans a bounded prefix; search finds a literal "
                 "in a bounded raw trace window; failures finds common error markers in a bounded window."
             ),
         ),
@@ -515,7 +516,8 @@ async def get_job_log(  # noqa: PLR0913, PLR0917 - each argument is one selectio
     `tail` and `summary` each make one GraphQL request for only the last 100 summary lines, not the whole log. A
     skipped tail or summary has no log and ends after that request. `summary` selects failing make target lines,
     pytest's short test summary block, standalone `FAILED` lines and final counts, and recognized terminal error lines.
-    It keeps recent selected text within
+    Repeated pytest failures with exactly identical displayed messages after cleanup and masking are grouped by count,
+    with the first node as an example. Counts cover only the visible window. It keeps recent selected text within
     `max_chars`. Earlier failures can be outside the 100-line window even when `truncated` is false, and `found=false`
     means no marker was found in that window, not that the job succeeded. Then `text` is the last 20 lines and a
     hint says so, which is handy for checking how a passing job ended. Otherwise a hint suggests a raw scan when
