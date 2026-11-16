@@ -4,7 +4,7 @@ FastMCP server (stdio) that gives agents GitLab tools. It talks to the GitLab RE
 
 ## Toolchain gotchas ⚠️
 
-- Python **3.15** and uv **0.13.5** are pinned (`.python-version`, `[tool.uv] required-version`). Code uses PEP 810 `lazy from ... import ...`; keep it, it is valid syntax here.
+- Python **3.15** is pinned by `.python-version`. uv must be `>=0.13.5,<0.14.0` (`[tool.uv] required-version`). Code uses PEP 810 `lazy from ... import ...`; keep it, it is valid syntax here.
 - Always run tools through `uv run --locked ...` (matches Makefile and pre-commit). Do not use `pip` or a bare `python`.
 - Ruff selects almost every rule family, with Google docstrings (`D`) enforced. Every function and class needs a docstring. Line length is 120.
 - `ty` runs with `error-on-warning = true` over `src` and `tests`.

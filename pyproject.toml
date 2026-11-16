@@ -158,4 +158,4 @@ show_contexts = true
 
 [tool.uv]
 default-groups = ["dev"]
-required-version = "==0.13.5"
+required-version = ">=0.13.5,<0.14.0"

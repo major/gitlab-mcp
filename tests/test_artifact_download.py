@@ -136,6 +136,21 @@ async def test_artifact_request_uses_identity_encoding_and_private_token(client)
 
 
 @respx.mock
+async def test_artifact_request_identifies_gitlab_mcp_with_repo_url(client):
+    """Artifact downloads send the same User-Agent as API calls."""
+    # Arrange
+    route = respx.get(ARTIFACT_URL).mock(return_value=httpx.Response(200, content=b"artifact"))
+
+    # Act
+    await client.get_artifact_prefix(ARTIFACT_PATH, max_bytes=100)
+
+    # Assert
+    user_agent = route.calls[0].request.headers["User-Agent"]
+    assert user_agent.startswith("gitlab-mcp/")
+    assert "(+https://github.com/major/gitlab-mcp)" in user_agent
+
+
+@respx.mock
 async def test_unicode_gitlab_hostname_uses_canonical_origin_for_authentication(client):
     """Unicode GitLab settings match the HTTPX ASCII hostname and keep authentication on that origin."""
     # Arrange

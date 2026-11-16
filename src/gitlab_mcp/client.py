@@ -9,7 +9,7 @@ from typing import Any, Literal
 import httpx
 from fastmcp.exceptions import ToolError
 
-lazy from gitlab_mcp.config import Settings
+lazy from gitlab_mcp.config import USER_AGENT, Settings
 
 # Friendly hints for the status codes developers hit most often.
 _STATUS_HINTS = {
@@ -211,7 +211,7 @@ class GitLabClient:
         self.settings = settings
         self._http = httpx.AsyncClient(
             base_url=settings.api_url,
-            headers={"PRIVATE-TOKEN": settings.token, "Accept": "application/json"},
+            headers={"PRIVATE-TOKEN": settings.token, "Accept": "application/json", "User-Agent": USER_AGENT},
             timeout=settings.timeout,
         )
 

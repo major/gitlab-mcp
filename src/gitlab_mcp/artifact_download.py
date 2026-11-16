@@ -7,7 +7,7 @@ import httpx
 from fastmcp.exceptions import ToolError
 
 from gitlab_mcp.client import GitLabAPIError, _is_certificate_verification_error
-lazy from gitlab_mcp.config import Settings
+lazy from gitlab_mcp.config import USER_AGENT, Settings
 
 _ERROR_BODY_CAP = 1024
 _MAX_REDIRECTS = 3
@@ -146,7 +146,12 @@ async def _request_hop(
 ) -> tuple[str | None, tuple[bytes, bool] | None]:
     """Send one isolated request and return its redirect location or bounded final body."""
     async with (
-        httpx.AsyncClient(trust_env=True, follow_redirects=False, timeout=settings.timeout) as client,
+        httpx.AsyncClient(
+            trust_env=True,
+            follow_redirects=False,
+            timeout=settings.timeout,
+            headers={"User-Agent": USER_AGENT},
+        ) as client,
         client.stream("GET", current, headers=headers) as response,
     ):
         if response.status_code in _REDIRECT_STATUSES:

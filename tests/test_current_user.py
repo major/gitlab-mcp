@@ -32,6 +32,21 @@ async def test_returns_only_username_and_id(gitlab_env):
     assert data == {"username": "jdoe", "id": 42}
 
 
+@respx.mock
+async def test_requests_identify_gitlab_mcp_with_repo_url(gitlab_env):
+    """The request's User-Agent names this server and its repo so GitLab admins can trace it."""
+    # Arrange
+    route = respx.get(f"{API}/user").mock(return_value=httpx.Response(200, json=USER))
+
+    # Act
+    await call_tool("get_current_user")
+
+    # Assert
+    user_agent = route.calls.last.request.headers["User-Agent"]
+    assert user_agent.startswith("gitlab-mcp/")
+    assert "(+https://github.com/major/gitlab-mcp)" in user_agent
+
+
 @pytest.mark.parametrize(
     ("status", "hint"),
     [(401, "invalid, expired, or revoked"), (403, "scope or permission")],

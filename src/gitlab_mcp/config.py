@@ -4,6 +4,7 @@ Everything comes from environment variables so the server works with
 gitlab.com and self-managed GitLab without needing the `glab` CLI.
 """
 
+import importlib.metadata
 import ipaddress
 import os
 import re
@@ -17,6 +18,8 @@ DEFAULT_URL = "https://gitlab.com"
 _DEFAULT_HTTPS_PORT = 443
 _MAX_HOSTNAME_LENGTH = 253
 _MAX_LABEL_LENGTH = 63
+# 🪪 Every request names this server and its repo, so GitLab admins can trace the traffic.
+USER_AGENT = f"gitlab-mcp/{importlib.metadata.version('gitlab-mcp')} (+https://github.com/major/gitlab-mcp)"
 
 
 class ConfigError(RuntimeError):
