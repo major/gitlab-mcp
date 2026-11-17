@@ -2,6 +2,7 @@
 
 from collections import Counter
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
@@ -185,6 +186,34 @@ def _merge_body(
     return body
 
 
+async def _merge_trains_enabled(client: GitLabClient, project: str) -> bool:
+    """Read whether the project has merge trains on. A failed read raises before any write is sent."""
+    data = await client.get(f"/projects/{quote(project, safe='')}")
+    return bool(data.get("merge_trains_enabled"))
+
+
+async def _queue_on_train(  # noqa: PLR0913, PLR0917 - each argument is one land option.
+    client: GitLabClient,
+    project: str,
+    iid: int,
+    sha: str | None,
+    squash: bool | None,
+    remove_source_branch: bool | None,
+) -> None:
+    """Queue an auto merge through the Merge Train API, so a green head pipeline cannot skip the train.
+
+    🚆 The train API has no option for the source branch, so that choice is set on the MR first. If the
+    train add then fails, the MR keeps the flag, because the update already went through.
+    """
+    if remove_source_branch is not None:
+        update = {"force_remove_source_branch": remove_source_branch}
+        await client.request("PUT", mr_rest_path(project, iid), json=update)
+    body: dict[str, Any] = {"sha": sha, "auto_merge": True}
+    if squash is not None:
+        body["squash"] = squash
+    await client.request("POST", f"/projects/{quote(project, safe='')}/merge_trains/merge_requests/{iid}", json=body)
+
+
 def _land_result(mode: LandMode, node: dict[str, Any]) -> LandResult:
     """Name what GitLab did, from the MR state read back after the write.
 
@@ -272,15 +301,21 @@ async def _land_one(  # noqa: PLR0913, PLR0917 - each argument is one land optio
     squash: bool | None,
     remove_source_branch: bool | None,
 ) -> MergeRequestLanding:
-    """Send one land write, then read the MR back. Raises the write's errors, and never retries a write.
+    """Send one land write, then read the MR back. Raises the read and write errors, and never retries a write.
 
     The caller checks the arguments first. A failed read after an accepted write returns `pending` with a warning,
     so a read problem never looks like a failed merge. 🧾
     """
     path = mr_rest_path(project, iid)
+    # 🚆 GitLab's accept-merge request merges at once when the head pipeline already passed, so an auto land on a
+    # project with trains uses the Merge Train API instead. The project read comes first, so nothing is written
+    # if it fails.
+    via_train = mode == "auto" and await _merge_trains_enabled(client, project)
     try:
         if mode == "cancel":
             await client.request("POST", f"{path}/cancel_merge_when_pipeline_succeeds")
+        elif via_train:
+            await _queue_on_train(client, project, iid, sha, squash, remove_source_branch)
         else:
             await client.request("PUT", f"{path}/merge", json=_merge_body(mode, sha, squash, remove_source_branch))
     except GitLabConnectionError as exc:
@@ -322,7 +357,8 @@ async def land_merge_request(  # noqa: PLR0913, PLR0917 - each argument is a use
 ) -> MergeRequestLanding:
     """Merge a merge request, or cancel a queued merge. Like `glab mr merge`.
 
-    - `auto` (default): join the merge train when the project has one, otherwise merge when checks pass.
+    - `auto` (default): join the merge train when the project has one, through the Merge Train API so a green
+      pipeline cannot skip the train. Otherwise merge when checks pass.
     - `now`: merge right away and skip the train. Use it only when the user asks for it.
     - `cancel`: leave the merge train or cancel auto-merge. Takes no `sha`, `squash`, or `remove_source_branch`.
     - Get `sha` from get_merge_request. GitLab refuses the merge with 409 when the head has moved.
@@ -375,8 +411,8 @@ async def land_merge_requests(  # noqa: PLR0913, PLR0917 - each argument is a us
 ) -> LandBatchResult:
     """Merge or cancel up to 20 merge requests. Like `glab mr merge`. Use a one-item list for one MR.
 
-    - `auto` uses the merge train if enabled, otherwise waits until checks pass. Use `now` to bypass the train ONLY
-      on an explicit user request; a request to merge is not enough.
+    - `auto` uses the merge train if enabled, through the Merge Train API. Otherwise it waits until checks pass.
+      Use `now` to bypass the train ONLY on an explicit user request; a request to merge is not enough.
     - Get each full head `sha` from get_merge_requests; GitLab refuses with 409 if the head has moved.
       `mode`, `squash`, and `remove_source_branch` apply to every item. `cancel` disallows `sha`, `squash`,
       and `remove_source_branch`, including false flags.

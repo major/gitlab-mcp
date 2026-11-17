@@ -17,11 +17,20 @@ MERGE_REQUESTS_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject
 HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"
 OTHER_SHA = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
 PIPELINE_GID = "gid://gitlab/Ci::Pipeline/731"
+PROJECT_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject"
+TRAIN_URL = f"{PROJECT_URL}/merge_trains/merge_requests/2187"
 
 
 def merge_url(iid: int) -> str:
     """Return the REST merge endpoint of one merge request."""
     return f"{MERGE_REQUESTS_URL}/{iid}/merge"
+
+
+def mock_project(*, merge_trains_enabled: bool = False) -> respx.Route:
+    """Mock the project read that auto mode makes to check whether the project has a merge train."""
+    return respx.get(PROJECT_URL).mock(
+        return_value=httpx.Response(200, json={"merge_trains_enabled": merge_trains_enabled})
+    )
 
 
 def make_landing_node(**overrides: Any) -> dict[str, Any]:
@@ -67,6 +76,7 @@ async def call_batch(**arguments: Any) -> dict[str, Any]:
 async def test_every_item_applied_with_train_positions(gitlab_env):
     """Each item lands in order, and each landing names its own position among the active cars."""
     # Arrange
+    mock_project()
     respx.put(merge_url(2187)).mock(return_value=httpx.Response(200, json={}))
     respx.put(merge_url(2188)).mock(return_value=httpx.Response(200, json={}))
     mock_graphql(make_landing_node(), [make_car(2186), make_car(2187), make_car(2188)])
@@ -84,6 +94,7 @@ async def test_every_item_applied_with_train_positions(gitlab_env):
 async def test_refused_item_does_not_stop_later_items(gitlab_env):
     """A 409 on the middle item marks that item failed with GitLab's reason, and the last item still lands."""
     # Arrange
+    mock_project()
     first = respx.put(merge_url(2186)).mock(return_value=httpx.Response(200, json={}))
     refused = respx.put(merge_url(2187)).mock(return_value=httpx.Response(409, json={"message": "Head moved"}))
     last = respx.put(merge_url(2188)).mock(return_value=httpx.Response(200, json={}))
@@ -109,6 +120,7 @@ async def test_refused_item_does_not_stop_later_items(gitlab_env):
 async def test_connection_error_marks_item_unknown_and_is_not_retried(gitlab_env):
     """A connection failure during a write marks that item unknown, and the batch goes on without a retry."""
     # Arrange
+    mock_project()
     broken = respx.put(merge_url(2187)).mock(side_effect=httpx.ConnectError("connection reset"))
     respx.put(merge_url(2188)).mock(return_value=httpx.Response(200, json={}))
     mock_graphql(make_landing_node(), [make_car(2188)])
@@ -164,6 +176,8 @@ async def test_compact_singleton_landing(gitlab_env, case):
     cancel = case == "cancelled"
     url = f"{MERGE_REQUESTS_URL}/2187/cancel_merge_when_pipeline_succeeds" if cancel else merge_url(2187)
     route = respx.post(url) if cancel else respx.put(url)
+    if not cancel:
+        mock_project()
     if case == "unknown":
         route.mock(side_effect=httpx.ConnectError("connection reset"))
     elif case == "refused":
@@ -199,3 +213,21 @@ async def test_compact_singleton_landing(gitlab_env, case):
     assert route.call_count == 1
     if not cancel:
         assert json.loads(route.calls.last.request.content) == {"sha": HEAD_SHA, "auto_merge": True}
+
+
+@respx.mock
+async def test_batch_item_joins_the_train_endpoint_when_trains_enabled(gitlab_env):
+    """A batch item in a project with trains goes through the train endpoint, not the accept-merge request."""
+    # Arrange
+    mock_project(merge_trains_enabled=True)
+    merge = respx.put(merge_url(2187)).mock(return_value=httpx.Response(200, json={}))
+    train = respx.post(TRAIN_URL).mock(return_value=httpx.Response(201, json={}))
+    mock_graphql(make_landing_node(), [make_car(2187)])
+
+    # Act
+    data = await call_batch(items=[{"iid": 2187, "sha": HEAD_SHA}])
+
+    # Assert
+    assert data["results"][0]["status"] == "applied"
+    assert json.loads(train.calls.last.request.content) == {"sha": HEAD_SHA, "auto_merge": True}
+    assert not merge.called
