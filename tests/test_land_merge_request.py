@@ -17,6 +17,8 @@ IID = 2187
 MR_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject/merge_requests/2187"
 MERGE_URL = f"{MR_URL}/merge"
 CANCEL_URL = f"{MR_URL}/cancel_merge_when_pipeline_succeeds"
+PROJECT_URL = "https://gitlab.example.com/api/v4/projects/group%2Fproject"
+TRAIN_URL = f"{PROJECT_URL}/merge_trains/merge_requests/{IID}"
 HEAD_SHA = "6096f2d5a1b2c3d4e5f60718293a4b5c6d7e8f90"  # Full SHA, sent as a guard, so it must reach GitLab intact.
 MERGE_SHA = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432"
 
@@ -47,6 +49,13 @@ def mock_write(mode: str, **response: Any) -> respx.Route:
     return respx.put(MERGE_URL).mock(**response)
 
 
+def mock_project(*, merge_trains_enabled: bool = False) -> respx.Route:
+    """Mock the project read that auto mode makes to check whether the project has a merge train."""
+    return respx.get(PROJECT_URL).mock(
+        return_value=httpx.Response(200, json={"merge_trains_enabled": merge_trains_enabled})
+    )
+
+
 async def call_land(**extra: Any) -> dict:
     """Call land_merge_request through the MCP protocol and return its data."""
     async with Client(mcp) as client:
@@ -75,6 +84,8 @@ async def test_sends_merge_body_and_omits_unset_flags(gitlab_env, mode, squash, 
     # Arrange
     route = respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={"state": "opened"}))
     respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node()))
+    if mode == "auto":
+        mock_project()
 
     # Act
     await call_land(sha=HEAD_SHA, mode=mode, squash=squash, remove_source_branch=remove_source_branch)
@@ -157,6 +168,8 @@ async def test_maps_read_back_state_to_result(gitlab_env, mode, node_fields, exp
     # Arrange
     mock_write(mode, return_value=httpx.Response(200, json={}))
     respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node(**node_fields)))
+    if mode == "auto":
+        mock_project()
 
     # Act
     data = await call_land(mode=mode, sha=None if mode == "cancel" else HEAD_SHA)
@@ -169,6 +182,7 @@ async def test_maps_read_back_state_to_result(gitlab_env, mode, node_fields, exp
 async def test_merge_train_result_names_the_queued_head_and_pipeline(gitlab_env):
     """A queued merge echoes the head SHA and the lowercased pipeline status that GitLab reports for it."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     node = make_landing_node(autoMergeStrategy="MERGE_TRAIN", headPipeline={"status": "RUNNING"})
     respx.post(GRAPHQL).mock(return_value=graphql_response(node))
@@ -196,6 +210,7 @@ async def test_merge_train_result_names_the_queued_head_and_pipeline(gitlab_env)
 async def test_missing_head_sha_or_pipeline_is_left_out(gitlab_env, node_fields, absent_field):
     """A head with no pipeline, or GitLab with no diff refs, leaves that field out instead of guessing."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node(**node_fields)))
 
@@ -210,6 +225,7 @@ async def test_missing_head_sha_or_pipeline_is_left_out(gitlab_env, node_fields,
 async def test_returns_landing_fields_in_lowercase_and_omits_empty_ones(gitlab_env):
     """Strategy and status are lowercased, and empty fields are left out."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     node = make_landing_node(autoMergeStrategy="MERGE_TRAIN")
     respx.post(GRAPHQL).mock(return_value=graphql_response(node))
@@ -255,6 +271,7 @@ async def test_returns_merge_commit_sha_after_merge(gitlab_env):
 async def test_refused_merge_points_to_blockers(gitlab_env, status):
     """Refusal statuses keep GitLab's reason and point to the blockers tool."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(status, json={"message": "Branch cannot be merged"}))
 
     # Act / Assert
@@ -271,6 +288,7 @@ async def test_refused_merge_points_to_blockers(gitlab_env, status):
 async def test_other_api_errors_pass_through_without_hint(gitlab_env, status):
     """Other API errors keep GitLab's reason and get no blockers hint."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(status, json={"message": "Nope"}))
 
     # Act / Assert
@@ -286,6 +304,8 @@ async def test_connection_error_during_write_reports_unknown_outcome(gitlab_env,
     # Arrange
     mock_write(mode, side_effect=httpx.ConnectError("connection reset"))
     graphql = respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node()))
+    if mode == "auto":
+        mock_project()
 
     # Act / Assert
     with pytest.raises(ToolError, match=r"outcome is unknown\. Check get_merge_request before retrying\.") as exc_info:
@@ -307,6 +327,7 @@ async def test_connection_error_during_write_reports_unknown_outcome(gitlab_env,
 async def test_failed_read_back_returns_pending_with_warning(gitlab_env, reread):
     """A failed read after an accepted write returns pending with a warning."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     respx.post(GRAPHQL).mock(**reread)
 
@@ -365,6 +386,7 @@ def graphql_bodies(route: respx.Route, marker: str) -> list[dict[str, Any]]:
 async def test_merge_train_result_reports_position_among_active_cars(gitlab_env, pipeline_gid, expected_pipeline_id):
     """The MR is second of three active cars, so its position is 2 and its car status and pipeline come along."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     cars = [
         make_car(2186, status="MERGING"),
@@ -387,6 +409,7 @@ async def test_merge_train_result_reports_position_among_active_cars(gitlab_env,
 async def test_mr_missing_from_active_cars_leaves_train_fields_out(gitlab_env):
     """When the MR is not among the active cars, the result has no train fields and no warning."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     cars = [make_car(2186), make_car(2188)]
     mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), make_train_page(*cars))
@@ -418,6 +441,7 @@ async def test_mr_missing_from_active_cars_leaves_train_fields_out(gitlab_env):
 async def test_failed_position_read_keeps_the_landing_with_a_warning(gitlab_env, train_reply):
     """A failed position read leaves the land result intact and says the position is missing."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), train_reply)
 
@@ -448,6 +472,8 @@ async def test_non_train_results_do_not_read_the_train(gitlab_env, mode, node_fi
     # Arrange
     mock_write(mode, return_value=httpx.Response(200, json={}))
     graphql = mock_graphql(make_landing_node(**node_fields), make_train_page(make_car(IID)))
+    if mode == "auto":
+        mock_project()
 
     # Act
     await call_land(mode=mode, sha=None if mode == "cancel" else HEAD_SHA)
@@ -461,6 +487,7 @@ async def test_non_train_results_do_not_read_the_train(gitlab_env, mode, node_fi
 async def test_ci_wait_with_no_head_pipeline_warns_and_keeps_the_train_warning(gitlab_env):
     """A train MR stuck in ci_must_pass with no head pipeline says to start one, even when the train read fails."""
     # Arrange
+    mock_project()
     respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
     node = make_landing_node(
         detailedMergeStatus="CI_MUST_PASS", autoMergeStrategy="ADD_TO_MERGE_TRAIN_WHEN_CHECKS_PASS", headPipeline=None
@@ -474,3 +501,102 @@ async def test_ci_wait_with_no_head_pipeline_warns_and_keeps_the_train_warning(g
     assert data["result"] == "merge_train"
     assert "start a merge request pipeline, not a branch pipeline" in data["warning"]
     assert data["warning"].endswith("The merge train position could not be read. Check list_merge_train.")
+
+
+@respx.mock
+async def test_auto_with_trains_queues_on_the_train_endpoint(gitlab_env):
+    """With trains enabled, auto joins the train through its API, so a green head pipeline cannot skip it."""
+    # Arrange
+    mock_project(merge_trains_enabled=True)
+    train = respx.post(TRAIN_URL).mock(return_value=httpx.Response(201, json={}))
+    merge = respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    cars = [make_car(2186), make_car(IID), make_car(2188)]
+    mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), make_train_page(*cars))
+
+    # Act
+    data = await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert json.loads(train.calls.last.request.content) == {"sha": HEAD_SHA, "auto_merge": True}
+    assert not merge.called
+    assert data["result"] == "merge_train"
+    assert data["train_position"] == EXPECTED_POSITION
+
+
+@pytest.mark.parametrize(
+    ("squash", "expected_body"),
+    [
+        (True, {"sha": HEAD_SHA, "auto_merge": True, "squash": True}),
+        (None, {"sha": HEAD_SHA, "auto_merge": True}),
+    ],
+    ids=["squash-true", "squash-omitted"],
+)
+@respx.mock
+async def test_train_body_sends_squash_only_when_set(gitlab_env, squash, expected_body):
+    """The train body carries squash only when the caller set it, so the project default applies otherwise."""
+    # Arrange
+    mock_project(merge_trains_enabled=True)
+    train = respx.post(TRAIN_URL).mock(return_value=httpx.Response(201, json={}))
+    mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), make_train_page(make_car(IID)))
+
+    # Act
+    await call_land(sha=HEAD_SHA, squash=squash)
+
+    # Assert
+    assert json.loads(train.calls.last.request.content) == expected_body
+
+
+@respx.mock
+async def test_remove_source_branch_is_set_on_the_mr_before_the_train_post(gitlab_env):
+    """The train API cannot remove the source branch, so the flag goes on the MR first, before the train request."""
+    # Arrange
+    mock_project(merge_trains_enabled=True)
+    respx.put(MR_URL).mock(return_value=httpx.Response(200, json={}))
+    respx.post(TRAIN_URL).mock(return_value=httpx.Response(201, json={}))
+    mock_graphql(make_landing_node(autoMergeStrategy="MERGE_TRAIN"), make_train_page(make_car(IID)))
+
+    # Act
+    await call_land(sha=HEAD_SHA, remove_source_branch=True)
+
+    # Assert
+    requests = [(call.request.method, str(call.request.url)) for call in respx.calls]
+    update_index = requests.index(("PUT", MR_URL))
+    assert requests.index(("POST", TRAIN_URL)) > update_index
+    assert json.loads(respx.calls[update_index].request.content) == {"force_remove_source_branch": True}
+
+
+@respx.mock
+async def test_auto_with_trains_disabled_keeps_the_merge_endpoint(gitlab_env):
+    """Without a merge train, auto sends the accept-merge request with auto_merge and no train request."""
+    # Arrange
+    mock_project(merge_trains_enabled=False)
+    merge = respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    train = respx.post(TRAIN_URL).mock(return_value=httpx.Response(201, json={}))
+    respx.post(GRAPHQL).mock(
+        return_value=graphql_response(make_landing_node(autoMergeStrategy="MERGE_WHEN_CHECKS_PASS"))
+    )
+
+    # Act
+    await call_land(sha=HEAD_SHA)
+
+    # Assert
+    assert json.loads(merge.calls.last.request.content) == {"sha": HEAD_SHA, "auto_merge": True}
+    assert not train.called
+
+
+@respx.mock
+async def test_now_skips_the_train_and_the_project_read(gitlab_env):
+    """Mode now never asks about the train: no project read, no train request, and no auto_merge."""
+    # Arrange
+    project = mock_project(merge_trains_enabled=True)
+    merge = respx.put(MERGE_URL).mock(return_value=httpx.Response(200, json={}))
+    train = respx.post(TRAIN_URL).mock(return_value=httpx.Response(201, json={}))
+    respx.post(GRAPHQL).mock(return_value=graphql_response(make_landing_node()))
+
+    # Act
+    await call_land(sha=HEAD_SHA, mode="now")
+
+    # Assert
+    assert json.loads(merge.calls.last.request.content) == {"sha": HEAD_SHA}
+    assert not project.called
+    assert not train.called
