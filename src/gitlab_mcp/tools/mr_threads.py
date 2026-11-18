@@ -254,8 +254,12 @@ class ThreadReplyRequest(BaseModel):
 
     iid: Iid = Field(description="Merge request IID containing this thread.")
     thread_id: str = Field(description="Discussion ID, or a full GitLab discussion GID.")
-    body: str | None = Field(default=None, description="Reply text. Omit only when resolving the thread.")
-    resolve: bool = Field(default=False, description="Resolve after replying, or resolve without a reply.")
+    body: str | None = Field(default=None, description="Reply text. Omit only when resolving or reopening the thread.")
+    resolve: bool | None = Field(
+        default=None,
+        description="True resolves after replying, or alone. False reopens after replying, or alone. "
+        "Omit to leave the state unchanged.",
+    )
 
     @model_validator(mode="after")
     def validate_reply(self) -> ThreadReplyRequest:
@@ -266,8 +270,8 @@ class ThreadReplyRequest(BaseModel):
             raise ValueError("body must not be empty or whitespace")  # noqa: TRY003
         if self.body is not None and has_truncation_marker(self.body):
             raise ValueError(TRUNCATION_MARKER_ERROR)
-        if self.body is None and not self.resolve:
-            raise ValueError("Provide a reply body or set resolve=True")  # noqa: TRY003
+        if self.body is None and self.resolve is None:
+            raise ValueError("Provide a reply body or set resolve=True or resolve=False")  # noqa: TRY003
         return self
 
 
@@ -907,17 +911,52 @@ def _last_resolve_positions(replies: list[ThreadReplyRequest]) -> dict[int, int]
     return {reply.iid: position for position, reply in enumerate(replies) if reply.resolve}
 
 
+def _resolved_from_discussion(discussion: object) -> bool | None:
+    """Return the thread's resolved state from a discussion payload, or None when it cannot be known.
+
+    A thread is resolved only when every resolvable note is resolved. Plain notes are ignored. A malformed payload,
+    or one with no resolvable notes, gives None so the caller leaves the field out.
+    """
+    notes = discussion.get("notes") if isinstance(discussion, dict) else None
+    if not isinstance(notes, list):
+        return None
+    resolvable_states: list[bool] = []
+    for note in notes:
+        if not isinstance(note, dict) or not isinstance(note.get("resolvable"), bool):
+            return None
+        # 🧵 Only resolvable notes carry a resolved flag that counts toward the thread state.
+        if note["resolvable"]:
+            if not isinstance(note.get("resolved"), bool):
+                return None
+            resolvable_states.append(note["resolved"])
+    return all(resolvable_states) if resolvable_states else None
+
+
+async def _read_thread_resolved(client: GitLabClient, discussion_path: str) -> bool | None:
+    """Read the thread's resolved state once, after a reply. A failed read returns None and never warns.
+
+    The reply already succeeded, so a failed read must not change that result. ValueError covers a body that is not
+    valid JSON.
+    """
+    try:
+        discussion = await client.get(discussion_path)
+    except ToolError, ValueError:
+        return None
+    return _resolved_from_discussion(discussion)
+
+
 async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write outcomes and the user-facing inputs.
     client: GitLabClient,
     project: str,
     iid: int,
     thread_id: str,
     body: str | None,
-    resolve: bool,
+    resolve: bool | None,
 ) -> ThreadReplyResult:
-    """Post the reply and resolve the thread, without reading the thread count afterward.
+    """Post the reply, then resolve, reopen, or read the thread state, without reading the thread count afterward.
 
-    The public tools add the count. A batch reads it once per MR instead of once per item.
+    `resolve=None` leaves the state unchanged. The public tools add the count. A batch reads it once per MR instead
+    of once per item.
     """
     bare_thread_id = bare_id(thread_id)
     if not bare_thread_id.strip():
@@ -926,8 +965,8 @@ async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write 
         raise ToolError("body must not be empty or whitespace.")  # noqa: TRY003
     if body is not None and has_truncation_marker(body):
         raise ToolError(TRUNCATION_MARKER_ERROR)
-    if body is None and not resolve:
-        raise ToolError("Provide a reply body or set resolve=True.")  # noqa: TRY003
+    if body is None and resolve is None:
+        raise ToolError("Provide a reply body or set resolve=True or resolve=False.")  # noqa: TRY003
 
     discussion_path = f"{mr_rest_path(project, iid)}/discussions/{quote(bare_thread_id, safe='')}"
     note_id: int | None = None
@@ -941,32 +980,37 @@ async def _write_thread_reply(  # noqa: C901, PLR0913, PLR0917 - distinct write 
             ) from exc
         note_id = note.get("id") if isinstance(note, dict) else None
 
-    if resolve:
-        try:
-            await client.request("PUT", discussion_path, json={"resolved": True})
-        except GitLabConnectionError as exc:
-            if body is None:
-                raise ToolError(  # noqa: TRY003
-                    f"{exc} Resolution outcome is unknown. Check get_merge_request_threads before retrying."
-                ) from exc
-            return ThreadReplyResult(
-                thread_id=bare_thread_id,
-                note_id=note_id,
-                warning=(
-                    f"Reply was posted (note ID {note_id}) but resolution outcome is unknown: {exc} "
-                    "Check get_merge_request_threads before retrying. Do not repost the reply."
-                ),
-            )
-        except ToolError as exc:
-            if body is None:
-                raise
-            return ThreadReplyResult(
-                thread_id=bare_thread_id,
-                note_id=note_id,
-                warning=f"Reply was posted (note ID {note_id}) but resolution failed: {exc} Do not repost the reply.",
-            )
+    if resolve is None:
+        resolved = await _read_thread_resolved(client, discussion_path)
+        return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=resolved)
 
-    return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=True if resolve else None)
+    # 🔁 Resolve and reopen share one write. Only the wording and the target state differ.
+    action = "resolution" if resolve else "reopen"
+    try:
+        await client.request("PUT", discussion_path, json={"resolved": resolve})
+    except GitLabConnectionError as exc:
+        if body is None:
+            raise ToolError(  # noqa: TRY003
+                f"{exc} {action.capitalize()} outcome is unknown. Check get_merge_request_threads before retrying."
+            ) from exc
+        return ThreadReplyResult(
+            thread_id=bare_thread_id,
+            note_id=note_id,
+            warning=(
+                f"Reply was posted (note ID {note_id}) but {action} outcome is unknown: {exc} "
+                "Check get_merge_request_threads before retrying. Do not repost the reply."
+            ),
+        )
+    except ToolError as exc:
+        if body is None:
+            raise
+        return ThreadReplyResult(
+            thread_id=bare_thread_id,
+            note_id=note_id,
+            warning=f"Reply was posted (note ID {note_id}) but {action} failed: {exc} Do not repost the reply.",
+        )
+
+    return ThreadReplyResult(thread_id=bare_thread_id, note_id=note_id, resolved=resolve)
 
 
 def _is_uncertain_write_error(exc: ToolError) -> bool:
@@ -1011,22 +1055,27 @@ async def reply_to_thread(  # noqa: PLR0913, PLR0917 - user-facing inputs.
     thread_id: str,
     body: Annotated[str | None, Field(description="Reply text. Omit only when resolving the thread.")] = None,
     resolve: Annotated[
-        bool,
-        Field(description="Resolve the thread after a successful reply, or resolve it alone."),
-    ] = False,
+        bool | None,
+        Field(
+            description="True resolves the thread after a successful reply, or resolves it alone. False reopens it. "
+            "Omit to leave the state unchanged."
+        ),
+    ] = None,
 ) -> ThreadReplyResult:
-    """Reply to or resolve a review thread. Like `glab mr note create --reply` and `glab mr note resolve`.
+    """Reply to, resolve, or reopen a review thread. Like `glab mr note create --reply` and `glab mr note resolve`.
 
     Bodies containing truncation markers are rejected.
-    Get user approval before posting a reply or resolving a thread. A missing body is allowed only with `resolve=True`.
-    `resolve=False` leaves the current resolution state unchanged and never reopens a thread. Replying and resolving
-    are separate GitLab writes. If resolution fails after a reply, the result says not to repost the reply.
+    Get user approval before posting a reply or changing a thread's state. A missing body is allowed only with
+    `resolve=True` or `resolve=False`. `resolve=True` resolves the thread, `resolve=False` reopens it, and omitting
+    `resolve` leaves its state unchanged. Without `resolve`, `resolved` is the state read after the reply, and it is
+    left out if that read fails. Replying and changing state are separate GitLab writes. If the state change fails
+    after a reply, the result says not to repost the reply.
     After a successful resolve, `open_threads` is the MR's open thread count after the write. It is left out if that
     count cannot be read.
     """
     client = get_client(ctx)
     outcome = await _write_thread_reply(client, project, iid, thread_id, body, resolve)
-    if outcome.resolved:
+    if resolve and outcome.resolved:
         outcome.open_threads = await _read_open_threads(client, project, iid)
     return outcome
 
@@ -1052,10 +1101,12 @@ async def reply_to_threads(
     Bodies containing truncation markers are rejected. Malformed input rejects the whole batch before writes;
     runtime failures are reported per item.
     Like `glab mr note create --reply` and `glab mr note resolve`. Use a one-item list for one thread. Get explicit
-    APPROVE before replying or resolving. A missing body requires `resolve=true`; `resolve=false` does not reopen.
-    Reply and resolution are separate writes, in that order. Items run sequentially; failure does not stop later
+    APPROVE before replying or resolving. A missing body requires `resolve=true` or `resolve=false`; `resolve=false`
+    reopens the thread.
+    Reply and state change are separate writes, in that order. Items run sequentially; failure does not stop later
     items or roll back writes. Writes are never retried. Check each status, warning, and `note_id`. If a reply was
-    posted but resolution failed or is unknown, do not repost the whole item; check GitLab before proceeding.
+    posted but the resolve or reopen failed or is unknown, do not repost the whole item; check GitLab before proceeding.
+    `resolved` is true or false when the state is known, and null otherwise. Omit `resolve` to leave the state as is.
 
     Each result includes `note_id` when a reply was posted, including when a later resolution fails or is unknown.
     Resolve-only results do not include a note ID.
@@ -1091,8 +1142,8 @@ async def reply_to_threads(
         warning = outcome.warning
         uncertain_resolution = bool(re.search(r"GitLab returned HTTP (?:408|5\d\d)\b", warning))
         if uncertain_resolution:
-            # The single tool reports all resolution ToolErrors as failures, but a timeout or 5xx can hide a write.
-            warning = warning.replace("resolution failed:", "resolution outcome is unknown:")
+            # The single tool reports all state-change ToolErrors as failures, but a timeout or 5xx can hide a write.
+            warning = re.sub(r"\b(resolution|reopen) failed:", r"\1 outcome is unknown:", warning)
         if uncertain_resolution or "outcome is unknown" in warning.lower():
             status: ThreadReplyBatchStatus = "unknown"
         elif warning:

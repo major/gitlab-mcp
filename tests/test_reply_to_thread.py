@@ -80,6 +80,8 @@ async def test_compact_singleton_reply_batch(gitlab_env, mode):
         return_value=httpx.Response(200, json={"resolved": True}) if mode != "unknown" else None,
     )
     status = respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 1))
+    if mode == "reply":
+        respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     item = {"iid": IID, "thread_id": "thread-1"}
     if mode != "resolve":
         item["body"] = "Reply"
@@ -88,7 +90,11 @@ async def test_compact_singleton_reply_batch(gitlab_env, mode):
     # Act
     result = await call_reply_batch([item], app=create_app("compact"))
     # Assert
-    expected = (["POST"] if mode != "resolve" else []) + (["PUT"] if mode != "reply" else []) + ["POST"]
+    expected = {
+        "reply": ["POST", "GET", "POST"],
+        "resolve": ["PUT", "POST"],
+        "unknown": ["POST", "PUT", "POST"],
+    }[mode]
     assert [call.request.method for call in respx.calls] == expected
     assert note.call_count == (mode != "resolve")
     assert resolve.call_count == (mode != "reply")
@@ -138,6 +144,7 @@ async def test_reply_accepts_normal_prose_and_fenced_paths(gitlab_env, body):
     # Arrange
     route = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": 321}))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply(body=body)
 
@@ -167,6 +174,7 @@ async def test_posts_reply_and_returns_only_the_note_id(gitlab_env):
     # Arrange
     note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": 321, "body": "secret"}))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply(body="A useful reply")
 
@@ -255,12 +263,105 @@ async def test_reply_without_resolve_keeps_shape_and_skips_the_count(gitlab_env)
     respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
     counts = respx.post(GRAPHQL).mock(return_value=count_response(1, 0))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply(body="Reply only")
 
     # Assert
     assert result == {"thread_id": "thread-1", "note_id": NOTE_ID}
     assert counts.call_count == 0
+
+
+@respx.mock
+async def test_reply_with_resolve_false_posts_then_reopens(gitlab_env):
+    """A reply with resolve=False posts the note first, then reopens the thread."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    reopen = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"resolved": False}))
+
+    # Act
+    result = await call_reply(body="Please fix this", resolve=False)
+
+    # Assert
+    assert [call.request.method for call in respx.calls] == ["POST", "PUT"]
+    assert note.calls.last.request.read() == b'{"body":"Please fix this"}'
+    assert reopen.calls.last.request.read() == b'{"resolved":false}'
+    assert result == {"thread_id": "thread-1", "note_id": NOTE_ID, "resolved": False}
+
+
+@respx.mock
+async def test_resolve_false_without_body_reopens_without_a_note(gitlab_env):
+    """A missing body allows reopening, the same way it allows resolving."""
+    # Arrange
+    reopen = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"resolved": False}))
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+
+    # Act
+    result = await call_reply(body=None, resolve=False)
+
+    # Assert
+    assert reopen.calls.last.request.read() == b'{"resolved":false}'
+    assert note.call_count == 0
+    assert result == {"thread_id": "thread-1", "resolved": False}
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "expected"),
+    [
+        (200, {"notes": [{"resolvable": False}, {"resolvable": True, "resolved": True}]}, True),
+        (200, {"notes": [{"resolvable": True, "resolved": True}, {"resolvable": True, "resolved": False}]}, False),
+        (500, {"message": "Server error"}, None),
+        (200, {"notes": "not a list"}, None),
+        (200, {"notes": ["not a note"]}, None),
+        (200, {"notes": [{"resolvable": True}]}, None),
+    ],
+    ids=["resolved", "one-unresolved-note", "read-fails", "malformed-list", "malformed-note", "missing-resolved"],
+)
+@respx.mock
+async def test_reply_without_resolve_reports_thread_state_after_the_post(gitlab_env, status, payload, expected):
+    """With resolve omitted, a reply leaves the thread alone and reports its state from one best-effort read."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    thread = respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(status, json=payload))
+
+    # Act
+    result = await call_reply(body="Reply only")
+
+    # Assert
+    assert [call.request.method for call in respx.calls] == ["POST", "GET"]
+    assert note.call_count == thread.call_count == 1
+    expected_result = {"thread_id": "thread-1", "note_id": NOTE_ID}
+    if expected is not None:
+        expected_result["resolved"] = expected
+    assert result == expected_result
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_warning"),
+    [
+        ({"side_effect": httpx.ConnectError("connection reset")}, "reopen outcome is unknown"),
+        ({"return_value": httpx.Response(403, json={"message": "Cannot reopen"})}, "reopen failed"),
+    ],
+    ids=["connection-error", "api-error"],
+)
+@respx.mock
+async def test_reopen_failure_after_reply_returns_warning_without_reposting(gitlab_env, failure, expected_warning):
+    """A failed reopen after a posted reply returns the note ID and a warning, without retrying the reply."""
+    # Arrange
+    note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    reopen = respx.put(DISCUSSION_URL).mock(**failure)
+
+    # Act
+    result = await call_reply(body="Reply", resolve=False)
+
+    # Assert
+    assert note.call_count == reopen.call_count == 1
+    assert result["note_id"] == NOTE_ID
+    warning = result["warning"].lower()
+    assert "reply was posted" in warning
+    assert expected_warning in warning
+    assert "do not repost" in warning
+    assert "resolved" not in result
 
 
 @pytest.mark.parametrize(
@@ -290,7 +391,7 @@ async def test_failed_count_read_omits_open_threads_without_failing_the_write(gi
     ("arguments", "message"),
     [
         ({"body": "   "}, "body"),
-        ({"body": None}, "reply body"),
+        ({"body": None}, "resolve=False"),
         ({"thread_id": ""}, "thread_id"),
         ({"thread_id": "   "}, "thread_id"),
     ],
@@ -314,6 +415,7 @@ async def test_full_gid_and_unsafe_components_are_encoded(gitlab_env):
         API + "/projects/group%2Fnested%20project/merge_requests/2187/discussions/" + "id%2Fwith%3Fquery/notes"
     )
     route = respx.post(expected_url).mock(return_value=httpx.Response(201, json={"id": 456}))
+    respx.get(expected_url.removesuffix("/notes")).mock(return_value=httpx.Response(200, json={"notes": []}))
 
     # Act
     async with Client(mcp) as client:
@@ -464,6 +566,10 @@ async def test_batch_continues_after_success_failure_and_unknown_write(gitlab_en
         ]
     ]
     respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
+    for iid in (2187, 2190):  # Only the applied replies read the thread back.
+        respx.get(API + f"/projects/group%2Fproject/merge_requests/{iid}/discussions/thread").mock(
+            return_value=httpx.Response(200, json={"notes": []})
+        )
     replies = [{"iid": iid, "thread_id": "thread", "body": f"reply {iid}"} for iid in (2187, 2188, 2189, 2190)]
 
     # Act
@@ -592,6 +698,9 @@ async def test_batch_connection_error_is_unknown_and_later_items_continue(gitlab
     success = respx.post(API + "/projects/group%2Fproject/merge_requests/2188/discussions/thread/notes").mock(
         return_value=httpx.Response(201, json={"id": 12})
     )
+    respx.get(API + "/projects/group%2Fproject/merge_requests/2188/discussions/thread").mock(
+        return_value=httpx.Response(200, json={"notes": []})
+    )
     respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
 
     # Act
@@ -642,6 +751,34 @@ async def test_batch_retains_reply_id_after_resolution_connection_error(gitlab_e
     assert result["results"][0]["note_id"] == NOTE_ID
     assert "do not repost" in result["results"][0]["warning"].lower()
     assert note.call_count == resolve.call_count == status.call_count == 1
+
+
+@respx.mock
+async def test_batch_reopen_reports_applied_and_5xx_as_unknown(gitlab_env):
+    """A reopen item reports resolved False, and a 5xx reopen after a reply is unknown without a retry."""
+    # Arrange
+    other_thread = API + f"{MR_PATH}/discussions/thread-2"
+    reopen = respx.put(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"resolved": False}))
+    note = respx.post(other_thread + "/notes").mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
+    failed = respx.put(other_thread).mock(return_value=httpx.Response(503, json={"message": "Server error"}))
+    respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0))
+
+    # Act
+    result = await call_reply_batch(
+        [
+            {"iid": IID, "thread_id": "thread-1", "resolve": False},
+            {"iid": IID, "thread_id": "thread-2", "body": "Please fix", "resolve": False},
+        ]
+    )
+
+    # Assert
+    assert [(row["thread_id"], row["status"], row["resolved"]) for row in result["results"]] == [
+        ("thread-1", "applied", False),
+        ("thread-2", "unknown", None),
+    ]
+    assert result["results"][1]["note_id"] == NOTE_ID
+    assert "do not repost" in result["results"][1]["warning"].lower()
+    assert reopen.call_count == note.call_count == failed.call_count == 1
 
 
 @respx.mock
@@ -740,6 +877,7 @@ async def test_batch_includes_false_zero_and_cleared_auto_merge_status(gitlab_en
         return_value=reply_status_response(1, 0, approved=False, approvals_left=0, auto_merge_strategy=None)
     )
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -763,6 +901,7 @@ async def test_batch_omits_nullable_approvals_left(gitlab_env):
     respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
     respx.post(GRAPHQL).mock(return_value=reply_status_response(1, 0, approvals_left=None))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -800,6 +939,7 @@ async def test_ce_unsupported_approvals_left_falls_back_for_status(gitlab_env):
     )
     status = respx.post(GRAPHQL).mock(side_effect=lambda request: next(responses))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -827,6 +967,7 @@ async def test_arbitrary_graphql_error_does_not_retry_status_query(gitlab_env):
     note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
     status = respx.post(GRAPHQL).mock(return_value=httpx.Response(200, json={"errors": [{"message": "Access denied"}]}))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -854,6 +995,7 @@ async def test_fallback_read_failure_keeps_successful_write(gitlab_env):
     )
     respx.post(GRAPHQL).mock(side_effect=lambda request: next(responses))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -887,6 +1029,7 @@ async def test_missing_auto_merge_strategy_is_omitted_not_cleared(gitlab_env):
         )
     )
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -923,6 +1066,7 @@ async def test_invalid_status_values_are_omitted_without_changing_write_result(
         return_value=httpx.Response(200, json={"data": {"project": {"mergeRequest": node}}})
     )
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -982,6 +1126,7 @@ async def test_batch_status_or_count_read_failures_keep_successful_writes(gitlab
         response = httpx.Response(403, json={"message": "Status not available"})
     status = respx.post(GRAPHQL).mock(return_value=response)
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
@@ -1007,6 +1152,7 @@ async def test_plain_reply_still_reads_merge_request_summary(gitlab_env):
     note = respx.post(NOTES_URL).mock(return_value=httpx.Response(201, json={"id": NOTE_ID}))
     status = respx.post(GRAPHQL).mock(return_value=reply_status_response(4, 1, auto_merge_strategy="MERGE"))
 
+    respx.get(DISCUSSION_URL).mock(return_value=httpx.Response(200, json={"notes": []}))
     # Act
     result = await call_reply_batch([{"iid": IID, "thread_id": "thread-1", "body": "Reply"}])
 
